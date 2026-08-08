@@ -1,0 +1,39 @@
+# Android / Gradle build output
+.gradle/
+.kotlin/
+build/
+*/build/
+
+# Local machine configuration
+local.properties
+
+# IDE workspace files
+.idea/
+*.iml
+
+# Logs, crash dumps, and profiling artifacts
+*.log
+*.logcat
+*.hprof
+hs_err_pid*
+replay_pid*
+
+# Generated packaged artifacts
+*.apk
+*.ap_
+*.aab
+*.dex
+
+# Signing keys and local secrets
+*.jks
+*.keystore
+*.pem
+*.p12
+*.der
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local agent transcripts / scratch output
+docs/agents-chat/
