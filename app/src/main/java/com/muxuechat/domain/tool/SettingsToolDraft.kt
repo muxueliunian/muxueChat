@@ -1,5 +1,6 @@
 package com.muxuechat.domain.tool
 
+import com.muxuechat.domain.model.ProtagonistDraft
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.WorldSettingDraft
 import com.muxuechat.domain.model.WritingStyleProfileDraft
@@ -18,6 +19,8 @@ data class SettingsToolDraft(
     val roleCard: RoleCardDraft? = null,
     val worldSetting: WorldSettingDraft? = null,
     val writingStyle: WritingStyleProfileDraft? = null,
+    /** 主角只能存进会话的 RP 设置，因此它不为空时 [conversationId] 必须存在才能保存。 */
+    val protagonist: ProtagonistDraft? = null,
     /** 本地校验时发现并修正的问题，展示给用户，让他知道模型给的值被调整过。 */
     val warnings: List<String> = emptyList(),
     val createdAtMillis: Long,
@@ -26,6 +29,7 @@ data class SettingsToolDraft(
         get() = roleCard?.name
             ?: worldSetting?.title
             ?: writingStyle?.name
+            ?: protagonist?.name
             ?: "未命名"
 
     val typeLabel: String
@@ -33,5 +37,6 @@ data class SettingsToolDraft(
             SettingsTool.CREATE_ROLE_CARD -> "角色卡"
             SettingsTool.CREATE_WORLD_SETTING -> "世界观"
             SettingsTool.CREATE_WRITING_STYLE -> "文风"
+            SettingsTool.CREATE_PROTAGONIST -> "主角"
         }
 }

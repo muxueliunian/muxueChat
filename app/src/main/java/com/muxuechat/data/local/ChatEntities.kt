@@ -1,5 +1,6 @@
 package com.muxuechat.data.local
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
@@ -10,7 +11,9 @@ import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.ConversationTokenUsage
 import com.muxuechat.domain.model.Conversation
 import com.muxuechat.domain.model.MessageStatus
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.RpEntry
 import com.muxuechat.domain.model.RpMarkerMode
 import com.muxuechat.domain.model.RpMetric
 import com.muxuechat.domain.model.RpMetricDefinition
@@ -18,9 +21,11 @@ import com.muxuechat.domain.model.RpMessageMetadata
 import com.muxuechat.domain.model.RpNarrativePerspective
 import com.muxuechat.domain.model.RpPlotSuggestionPerspective
 import com.muxuechat.domain.model.RpStatusPanel
+import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.model.WorldSetting
 import com.muxuechat.domain.model.WritingStyleProfile
 import com.muxuechat.domain.context.ContextSummaryState
+import com.muxuechat.domain.rp.RpEntryCodec
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -96,7 +101,15 @@ data class RoleCardEntity(
     val userIdentity: String,
     val openingMessage: String,
     val boundaries: String,
+    /**
+     * v9 的数值定义。**已停用为取证材料**：唯一读源是 [entriesJson]。
+     *
+     * 保存时仍同步写入数值词条的旧形状——entriesJson 万一被写坏，这里是就地恢复的材料；
+     * 迁移时解不出来的坏 JSON 也原样留在这一列，不会被覆盖成空串（§8.5）。
+     * 与主角三列一起等 RP-3 收尾后删除。
+     */
     val metricDefinitionsJson: String,
+    @ColumnInfo(defaultValue = "[]") val entriesJson: String = "[]",
     val createdAtMillis: Long,
     val updatedAtMillis: Long,
 ) {
@@ -109,9 +122,7 @@ data class RoleCardEntity(
         userIdentity = userIdentity,
         openingMessage = openingMessage,
         boundaries = boundaries,
-        metricDefinitions = runCatching {
-            entityJson.decodeFromString<List<RpMetricDefinition>>(metricDefinitionsJson)
-        }.getOrDefault(emptyList()),
+        entries = RpEntryCodec.decodeEntries(entriesJson).entries,
         createdAtMillis = createdAtMillis,
         updatedAtMillis = updatedAtMillis,
     )
@@ -261,8 +272,20 @@ fun ConversationTokenUsage.toEntity() = ConversationTokenUsageEntity(
             childColumns = ["writingStyleId"],
             onDelete = ForeignKey.SET_NULL,
         ),
+        // 删除主角档案后会话自动解绑，与角色卡一致。数值的清理由 applyBindingTransition 负责。
+        ForeignKey(
+            entity = ProtagonistProfileEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["protagonistProfileId"],
+            onDelete = ForeignKey.SET_NULL,
+        ),
     ],
-    indices = [Index("roleCardId"), Index("worldSettingId"), Index("writingStyleId")],
+    indices = [
+        Index("roleCardId"),
+        Index("worldSettingId"),
+        Index("writingStyleId"),
+        Index("protagonistProfileId"),
+    ],
 )
 data class ConversationRpSettingsEntity(
     @PrimaryKey val conversationId: String,
@@ -270,6 +293,9 @@ data class ConversationRpSettingsEntity(
     val roleCardId: String?,
     val worldSettingId: String?,
     val writingStyleId: String? = null,
+    val protagonistProfileId: String? = null,
+    /** 本会话有效的数值定义快照（R6 / R10），见 [RpMetricSnapshot]。 */
+    @ColumnInfo(defaultValue = "[]") val metricSnapshotJson: String = "[]",
     val protagonistName: String,
     val protagonistDescription: String,
     val protagonistInitialState: String,
@@ -285,6 +311,8 @@ data class ConversationRpSettingsEntity(
         roleCardId = roleCardId,
         worldSettingId = worldSettingId,
         writingStyleId = writingStyleId,
+        protagonistProfileId = protagonistProfileId,
+        metricSnapshot = RpEntryCodec.decodeSnapshot(metricSnapshotJson).entries,
         protagonistName = protagonistName,
         protagonistDescription = protagonistDescription,
         protagonistInitialState = protagonistInitialState,
@@ -394,6 +422,7 @@ fun RoleCard.toEntity() = RoleCardEntity(
     openingMessage = openingMessage,
     boundaries = boundaries,
     metricDefinitionsJson = entityJson.encodeToString(metricDefinitions),
+    entriesJson = RpEntryCodec.encodeEntries(entries),
     createdAtMillis = createdAtMillis,
     updatedAtMillis = updatedAtMillis,
 )
@@ -412,6 +441,8 @@ fun ConversationRpSettings.toEntity() = ConversationRpSettingsEntity(
     roleCardId = roleCardId,
     worldSettingId = worldSettingId,
     writingStyleId = writingStyleId,
+    protagonistProfileId = protagonistProfileId,
+    metricSnapshotJson = RpEntryCodec.encodeSnapshot(metricSnapshot),
     protagonistName = protagonistName,
     protagonistDescription = protagonistDescription,
     protagonistInitialState = protagonistInitialState,
@@ -440,6 +471,94 @@ fun RpMessageMetadata.toEntity() = MessageRpMetadataEntity(
     relationship = statusPanelSnapshot?.relationship.orEmpty(),
     scene = statusPanelSnapshot?.scene.orEmpty(),
     rawJson = statusPanelSnapshot?.rawJson.orEmpty(),
+    createdAtMillis = createdAtMillis,
+    updatedAtMillis = updatedAtMillis,
+)
+
+@Entity(tableName = "protagonist_profiles")
+data class ProtagonistProfileEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val description: String,
+    val entriesJson: String,
+    val createdAtMillis: Long,
+    val updatedAtMillis: Long,
+) {
+    fun toDomain() = ProtagonistProfile(
+        id = id,
+        name = name,
+        description = description,
+        entries = RpEntryCodec.decodeEntries(entriesJson).entries,
+        createdAtMillis = createdAtMillis,
+        updatedAtMillis = updatedAtMillis,
+    )
+}
+
+@Entity(tableName = "supporting_characters")
+data class SupportingCharacterEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val description: String,
+    val entriesJson: String,
+    val createdAtMillis: Long,
+    val updatedAtMillis: Long,
+) {
+    /** 数值词条对配角没有意义，解码后直接丢弃——脏数据不该变成状态条。 */
+    fun toDomain() = SupportingCharacter(
+        id = id,
+        name = name,
+        description = description,
+        entries = RpEntryCodec.decodeEntries(entriesJson).entries.filterIsInstance<RpEntry.Text>(),
+        createdAtMillis = createdAtMillis,
+        updatedAtMillis = updatedAtMillis,
+    )
+}
+
+/**
+ * 会话与配角的多对多关联。
+ *
+ * 复合主键让「同一个配角重复加进同一个会话」在库层面就不可能发生，
+ * 不必在 Repository 里再写一遍去重。
+ */
+@Entity(
+    tableName = "conversation_supporting_characters",
+    primaryKeys = ["conversationId", "supportingCharacterId"],
+    foreignKeys = [
+        ForeignKey(
+            entity = ConversationEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conversationId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+        ForeignKey(
+            entity = SupportingCharacterEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["supportingCharacterId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [Index("supportingCharacterId")],
+)
+data class ConversationSupportingCharacterEntity(
+    val conversationId: String,
+    val supportingCharacterId: String,
+    val orderIndex: Int,
+)
+
+fun ProtagonistProfile.toEntity() = ProtagonistProfileEntity(
+    id = id,
+    name = name,
+    description = description,
+    entriesJson = RpEntryCodec.encodeEntries(entries),
+    createdAtMillis = createdAtMillis,
+    updatedAtMillis = updatedAtMillis,
+)
+
+fun SupportingCharacter.toEntity() = SupportingCharacterEntity(
+    id = id,
+    name = name,
+    description = description,
+    entriesJson = RpEntryCodec.encodeEntries(entries),
     createdAtMillis = createdAtMillis,
     updatedAtMillis = updatedAtMillis,
 )

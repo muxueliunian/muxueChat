@@ -70,6 +70,7 @@ class HistoryReplacementTransactionTest {
             completedAssistant = staging.copy(status = MessageStatus.COMPLETED, updatedAtMillis = 5),
             rpStatusPanel = panel("新场景", updatedAt = 5).toEntity(),
             updatedAtMillis = 5,
+            expectedStatusPanel = panel("旧场景", updatedAt = 3).toEntity(),
         )
 
         assertEquals("新问题", dao.getMessage(firstUser.id)?.content)

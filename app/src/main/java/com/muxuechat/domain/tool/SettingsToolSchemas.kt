@@ -9,7 +9,7 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
 /**
- * 三个设定工具的 JSON Schema。
+ * 设定工具的 JSON Schema。
  *
  * 注意这里**不使用** DeepSeek 的 strict 模式：它要求把 base_url 换成 `/beta`，
  * 为一个功能改全局地址不划算。因此 schema 只是给模型的提示，
@@ -30,12 +30,18 @@ object SettingsToolSchemas {
             "根据用户提供的需求描述或资料，创建一份叙事文风设定草稿。" +
                 "文风描述整段正文如何书写（叙事视角、时态、节奏、描写密度、对白比例、禁用表达），" +
                 "不是某个角色如何说话。草稿会先展示给用户预览和修改，用户确认后才会保存。"
+
+        SettingsTool.CREATE_PROTAGONIST ->
+            "根据用户提供的需求描述或资料，创建角色扮演中**玩家自己扮演的主角**的设定草稿。" +
+                "主角属于当前会话，保存时会写进这个会话的 RP 设置，因此没有会话时无法保存。" +
+                "草稿会先展示给用户预览和修改，用户确认后才会保存。"
     }
 
     fun parametersOf(tool: SettingsTool): JsonObject = when (tool) {
         SettingsTool.CREATE_ROLE_CARD -> roleCardSchema()
         SettingsTool.CREATE_WORLD_SETTING -> worldSettingSchema()
         SettingsTool.CREATE_WRITING_STYLE -> writingStyleSchema()
+        SettingsTool.CREATE_PROTAGONIST -> protagonistSchema()
     }
 
     private fun roleCardSchema(): JsonObject = buildJsonObject {
@@ -88,6 +94,22 @@ object SettingsToolSchemas {
                 "content",
                 "文风要求正文：叙事视角与人称、时态、句子节奏、描写密度、对白与叙述的比例、" +
                     "常用与禁用的表达方式。写成可执行的写作指令，不要写成评论。",
+            )
+        }
+        putJsonArray("required") { add("name") }
+    }
+
+    private fun protagonistSchema(): JsonObject = buildJsonObject {
+        put("type", "object")
+        putJsonObject("properties") {
+            stringProperty("name", "主角名字，也就是玩家在剧情里的称呼。必填，简短。")
+            stringProperty(
+                "description",
+                "主角是谁：身份、性格、外貌、经历、与角色的关系。写玩家扮演的这个人，不要写对手角色。",
+            )
+            stringProperty(
+                "initial_state",
+                "开场时主角的处境：身在何处、带着什么、身心状态、刚发生过什么。只写起点，不要写后续剧情。",
             )
         }
         putJsonArray("required") { add("name") }

@@ -50,6 +50,7 @@ import com.muxuechat.domain.model.WritingStyleProfileDraft
 import com.muxuechat.domain.context.ContextCompressionMode
 import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.prompt.AttachmentFormat
+import com.muxuechat.domain.model.ProtagonistDraft
 import com.muxuechat.domain.tool.SettingsToolDraft
 import com.muxuechat.domain.usecase.ClearConversationUseCase
 import com.muxuechat.domain.usecase.DeleteConversationUseCase
@@ -765,8 +766,9 @@ class ChatViewModel(
                         isRpEnabled = true,
                         roleCardId = saved.id,
                         worldSettingId = activeRpSettings.worldSettingId,
-                        // 这里只改角色卡绑定，文风绑定原样带回，不能靠默认值。
+                        // 这里只改角色卡绑定，文风与主角绑定原样带回，不能靠默认值。
                         writingStyleId = activeRpSettings.writingStyleId,
+                        protagonistProfileId = activeRpSettings.protagonistProfileId,
                     )
                 }
                 shouldApplyToCurrentConversation
@@ -878,6 +880,10 @@ class ChatViewModel(
                     roleCardId = roleCardId,
                     worldSettingId = worldSettingId,
                     writingStyleId = writingStyleId,
+                    // RP 设置界面还没有主角档案选择器（RP-3），先原样带回当前绑定。
+                    protagonistProfileId = uiState.value.activeRpSettings
+                        ?.takeIf { it.conversationId == conversationId }
+                        ?.protagonistProfileId,
                     protagonistName = protagonistName,
                     protagonistDescription = protagonistDescription,
                     protagonistInitialState = protagonistInitialState,
@@ -944,14 +950,17 @@ class ChatViewModel(
     }
 
     /**
-     * 确认保存草稿。三类设定走同一个事务，失败不会留下半成品。
+     * 确认保存草稿。各类设定走同一个事务，失败不会留下半成品。
      * 保存成功后才把草稿从待确认区移除。
+     *
+     * 主角没有独立实体，只能写进会话的 RP 设置，因此它必须绑定当前会话（预览界面已强制勾选）。
      */
     fun confirmSettingsDraft(
         draftId: String,
         roleCard: RoleCardDraft?,
         worldSetting: WorldSettingDraft?,
         writingStyle: WritingStyleProfileDraft?,
+        protagonist: ProtagonistDraft?,
         bindToConversation: Boolean,
     ) {
         if (transient.value.isSavingSettingsDraft) return
@@ -963,7 +972,9 @@ class ChatViewModel(
                     roleCard = roleCard,
                     worldSetting = worldSetting,
                     writingStyle = writingStyle,
-                    bindToConversationId = activeConversationId.value.takeIf { bindToConversation },
+                    protagonist = protagonist,
+                    bindToConversationId = activeConversationId.value
+                        .takeIf { bindToConversation || protagonist != null },
                 )
             }.onSuccess { saved ->
                 chatRepository.discardSettingsToolDraft(draftId)
@@ -971,6 +982,7 @@ class ChatViewModel(
                     saved.roleCard?.let { "角色卡" },
                     saved.worldSetting?.let { "世界观" },
                     saved.writingStyle?.let { "文风" },
+                    "主角".takeIf { saved.protagonistProfile != null },
                 ).joinToString("、")
                 transient.update {
                     it.copy(

@@ -677,7 +677,7 @@ private fun ProviderToolCallingSection(
         SettingsRow(
             title = "启用标准工具调用",
             subtitle = if (provider.toolCallingEnabled) {
-                "会发送 tools 与 tool_choice；非 RP 聊天可创建角色卡、世界观和文风草稿"
+                "会发送 tools 与 tool_choice；非 RP 聊天可创建角色卡、世界观、文风和主角草稿"
             } else {
                 "默认关闭，兼容仅支持普通聊天的反代"
             },

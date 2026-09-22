@@ -1,5 +1,6 @@
 package com.muxuechat.domain.prompt
 
+import com.muxuechat.domain.rp.RpEffectiveDefinitions
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.DeepSeekModels
@@ -308,8 +309,8 @@ class PromptComposer {
         if (hasUserPrompt) {
             appendLine(DEFERENCE_NOTICE)
         }
-        appendLine("你附带了 create_role_card、create_world_setting、create_writing_style 三个工具，")
-        appendLine("仅在用户明确要求创建角色卡、世界观或文风时才调用，其余情况当它们不存在。")
+        appendLine("你附带了 create_role_card、create_world_setting、create_writing_style、create_protagonist 四个工具，")
+        appendLine("仅在用户明确要求创建角色卡、世界观、文风或主角设定时才调用，其余情况当它们不存在。")
         appendLine("它们只是可用功能，不是你的身份或用途，不要主动提及或把话题往这上面引。")
         appendLine("工具产出的是草稿，由用户在界面上确认；调用后一句话说明即可，不要复述草稿内容。")
     }.trim()
@@ -513,7 +514,7 @@ class PromptComposer {
     }
 
     private fun StringBuilder.appendMetricDefinitions(context: PromptContext) {
-        val definitions = context.roleCard?.metricDefinitions.orEmpty()
+        val definitions = context.metricDefinitions()
         appendLine()
         appendLine("### 状态栏定义")
         if (definitions.isEmpty()) {
@@ -537,7 +538,7 @@ class PromptComposer {
 
     private fun buildCurrentMetricLines(context: PromptContext): List<String> {
         val panel = context.statusPanel ?: return emptyList()
-        val definitions = context.roleCard?.metricDefinitions.orEmpty()
+        val definitions = context.metricDefinitions()
         if (definitions.isEmpty()) {
             return emptyList()
         }
@@ -551,10 +552,18 @@ class PromptComposer {
 
     private fun buildStateBlockExample(context: PromptContext): String =
         RpStateBlockFormat.stateBlockExample(
-            definitions = context.roleCard?.metricDefinitions.orEmpty(),
+            definitions = context.metricDefinitions(),
             panel = null,
             useCurrentValues = false,
         )
+
+    /**
+     * 本会话有效的数值定义，名字是带归属前缀的 wireName。
+     * 只从会话快照取，不读实时角色卡：改档案不影响已绑定的会话（R6）。
+     * RP 未绑定角色卡时不发状态条，与之前「没有角色卡就没有定义」的行为一致。
+     */
+    private fun PromptContext.metricDefinitions(): List<RpMetricDefinition> =
+        if (roleCard == null) emptyList() else RpEffectiveDefinitions.of(rpSettings)
 
     private fun StringBuilder.appendSection(title: String, content: String) {
         val trimmed = content.trim()

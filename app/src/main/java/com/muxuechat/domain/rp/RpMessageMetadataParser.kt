@@ -1,6 +1,5 @@
 package com.muxuechat.domain.rp
 
-import com.muxuechat.domain.model.RpMetric
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -53,34 +52,11 @@ class RpMessageMetadataParser(
         return cleaned.substringOrNull(start, end + 1)
     }
 
-    private fun JsonObject.toStatusPanelDraft(): RpStatusPanelDraft {
-        val metrics = this["metrics"]
-            ?.asJsonArrayOrNull()
-            ?.mapNotNull { it.asJsonObjectOrNull()?.toMetricOrNull() }
-            .orEmpty()
-        return RpStatusPanelDraft(
-            metrics = metrics,
-            relationship = this["relationship"].stringValue(),
-            scene = this["scene"].stringValue(),
-            rawJson = toString(),
-        )
-    }
-
-    private fun JsonObject.toMetricOrNull(): RpMetric? {
-        val name = this["name"].stringValue().ifBlank { return null }
-        val min = this["min"].intValue(default = 0)
-        val max = this["max"].intValue(default = 100).let { if (it > min) it else min + 1 }
-        val value = this["value"].intValue(default = min).coerceIn(min, max)
-        return RpMetric(name = name, value = value, min = min, max = max)
-    }
+    private fun JsonObject.toStatusPanelDraft(): RpStatusPanelDraft =
+        RpStatusDraftDecoder.decode(this, rawJson = toString())
 
     private fun JsonElement?.stringValue(): String =
         (this as? JsonPrimitive)?.contentOrNull.orEmpty()
-
-    private fun JsonElement?.intValue(default: Int): Int {
-        val text = (this as? JsonPrimitive)?.contentOrNull ?: return default
-        return INTEGER_REGEX.find(text)?.value?.toIntOrNull() ?: default
-    }
 
     private fun JsonElement.asJsonArrayOrNull(): JsonArray? =
         runCatching { jsonArray }.getOrNull()
@@ -99,6 +75,5 @@ class RpMessageMetadataParser(
             pattern = """<muxue_meta>(.*?)</muxue_meta>""",
             options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         )
-        val INTEGER_REGEX = Regex("""-?\d+""")
     }
 }

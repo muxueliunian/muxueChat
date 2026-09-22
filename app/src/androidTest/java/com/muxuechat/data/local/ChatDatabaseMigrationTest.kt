@@ -10,6 +10,8 @@ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.muxuechat.domain.model.RpEntry
+import com.muxuechat.domain.rp.RpEntryCodec
 import java.lang.reflect.Modifier
 import java.util.UUID
 import org.junit.After
@@ -29,18 +31,18 @@ import org.junit.runner.RunWith
  * 这能验证迁移 SQL 的连续性、数据保留和最终 Room schema，但不能替代来自已发布版本的
  * 原始 schema/identity hash。证据与边界见 docs/ROOM_MIGRATION_TEST_NOTES.md。
  *
- * 例外是 8→9：8.json 与 9.json 都是 Room 真实导出的 schema，因此另有一个
- * [MigrationTestHelper] 用例按导出 schema 建库并做真实升级校验。
+ * 例外是 8→9 与 9→10：8.json、9.json、10.json 都是 Room 真实导出的 schema，
+ * 因此另有 [MigrationTestHelper] 用例按导出 schema 建库并做真实升级校验。
  */
 @RunWith(AndroidJUnit4::class)
 class ChatDatabaseMigrationTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val databaseNames = mutableSetOf<String>()
     private val migrations: List<Migration> by lazy {
-        (1..8).map { startVersion -> findProductionMigration(startVersion, startVersion + 1) }
+        (1..9).map { startVersion -> findProductionMigration(startVersion, startVersion + 1) }
     }
 
-    /** 只用于 8→9：从测试 APK assets 中读取 Room 导出的 8.json / 9.json。 */
+    /** 只用于 8→9 与 9→10：从测试 APK assets 中读取 Room 导出的 schema。 */
     @get:Rule
     val exportedSchemaHelper = MigrationTestHelper(
         InstrumentationRegistry.getInstrumentation(),
@@ -371,6 +373,11 @@ class ChatDatabaseMigrationTest {
             assertEquals(13102L, queryLong(db, "SELECT promptTokens FROM conversation_token_usage"))
 
             // 只拿到 total 的上游也要能存进来，不能被非空约束挡住。
+            // 外键是开着的：用量行必须挂在真实存在的会话上。
+            db.execSQL(
+                "INSERT INTO conversations (id, title, createdAtMillis, updatedAtMillis) " +
+                    "VALUES ('conversation-2', '另一个会话', 1, 1)",
+            )
             db.execSQL(
                 "INSERT INTO conversation_token_usage " +
                     "(conversationId, providerKey, model, promptTokens, completionTokens, totalTokens, " +
@@ -404,7 +411,7 @@ class ChatDatabaseMigrationTest {
     }
 
     @Test
-    fun migrate1To9_opensWithRoomV9ValidationAndPreservesCoreRows() {
+    fun migrate1To10_opensWithRoomV10ValidationAndPreservesCoreRows() {
         val name = newDatabaseName("full-path")
         createReconstructedDatabase(name, 1).use { helper ->
             insertCoreConversationAndMessage(helper.writableDatabase)
@@ -416,17 +423,190 @@ class ChatDatabaseMigrationTest {
             .build()
         try {
             val db = roomDatabase.openHelper.writableDatabase
-            // 成功打开已经触发 ChatDatabase_Impl 对 v9 表、列、索引和外键的完整校验。
-            assertEquals(9L, queryLong(db, "PRAGMA user_version"))
+            // 成功打开已经触发 ChatDatabase_Impl 对 v10 表、列、索引和外键的完整校验。
+            assertEquals(10L, queryLong(db, "PRAGMA user_version"))
             assertEquals("历史会话", queryString(db, "SELECT title FROM conversations WHERE id = 'conversation'"))
             assertEquals("历史消息", queryString(db, "SELECT content FROM messages WHERE id = 'message'"))
             assertFalse(tableExists(db, "conversation_rp_settings_new"))
             assertTrue(tableExists(db, "writing_style_profiles"))
             assertTrue(tableExists(db, "conversation_context"))
             assertTrue(tableExists(db, "conversation_token_usage"))
+            assertTrue(tableExists(db, "protagonist_profiles"))
+            assertTrue(tableExists(db, "supporting_characters"))
+            assertTrue(tableExists(db, "conversation_supporting_characters"))
         } finally {
             roomDatabase.close()
         }
+    }
+
+    /**
+     * v9 → v10（RP-1）：按导出 schema 建库，真实升级并对照 10.json 校验。
+     *
+     * 覆盖 RP_ACTOR_PLAN §10.1 的迁移保真：坏 JSON、旧名本身含「::」、主角字段全空 / 部分空、
+     * 内容相同的两个会话不去重、暂停中的绑定也回填快照、rawJson 原样保留，
+     * 以及最关键的——角色卡绑定不得因表结构调整被 SET_NULL 清掉。
+     */
+    @Test
+    fun migrate9To10_fromExportedV9Schema_validatesAndPreservesRpData() {
+        val name = newDatabaseName("exported-9-10")
+        exportedSchemaHelper.createDatabase(name, 9).use { db -> seedV9RpData(db) }
+
+        exportedSchemaHelper.runMigrationsAndValidate(
+            name,
+            10,
+            true,
+            findProductionMigration(9, 10),
+        ).use { db ->
+            // 角色卡绑定原样保留：role_cards 是父表，若被整表重建会触发 SET_NULL。
+            assertEquals("card", queryNullableString(db, settingsColumn("active", "roleCardId")))
+            assertEquals("card", queryNullableString(db, settingsColumn("paused", "roleCardId")))
+
+            // §8.2 数值 → 词条：id 原样保留；旧列不动，坏 JSON 的原文仍在。
+            val entries = RpEntryCodec.decodeEntries(queryString(db, "SELECT entriesJson FROM role_cards WHERE id = 'card'"))
+            assertEquals(listOf("trust", "odd"), entries.entries.map { it.id })
+            assertEquals(listOf("信任", "主角::体力"), entries.entries.map { it.name })
+            assertEquals(V9_CARD_METRICS, queryString(db, "SELECT metricDefinitionsJson FROM role_cards WHERE id = 'card'"))
+            assertEquals("[]", queryString(db, "SELECT entriesJson FROM role_cards WHERE id = 'broken-card'"))
+            assertEquals("{坏掉的", queryString(db, "SELECT metricDefinitionsJson FROM role_cards WHERE id = 'broken-card'"))
+
+            // §8.1 主角 → 档案：每个有内容的会话一条，不去重；全空的不生成。
+            assertEquals(3, rowCount(db, "protagonist_profiles"))
+            assertNull(queryNullableString(db, settingsColumn("paused", "protagonistProfileId")))
+            val activeProfile = queryString(db, settingsColumn("active", "protagonistProfileId"))
+            val twinProfile = queryString(db, settingsColumn("twin", "protagonistProfileId"))
+            assertTrue(activeProfile != twinProfile)
+            assertEquals("沈昭", queryString(db, "SELECT name FROM protagonist_profiles WHERE id = '$activeProfile'"))
+            assertEquals("外地来的记者", queryString(db, "SELECT description FROM protagonist_profiles WHERE id = '$activeProfile'"))
+            val profileEntries = RpEntryCodec.decodeEntries(
+                queryString(db, "SELECT entriesJson FROM protagonist_profiles WHERE id = '$activeProfile'"),
+            ).entries
+            assertEquals(listOf(RpEntry.Text(profileEntries.single().id, "初始状态", "刚下火车")), profileEntries)
+            // 姓名为空但有描述：按升级顺序取兜底名。
+            val namelessProfile = queryString(db, settingsColumn("nameless", "protagonistProfileId"))
+            assertEquals("主角3", queryString(db, "SELECT name FROM protagonist_profiles WHERE id = '$namelessProfile'"))
+            // 旧三列保留为取证材料。
+            assertEquals("沈昭", queryString(db, settingsColumn("active", "protagonistName")))
+
+            // §8.3 两张表的状态名都迁移，含原名本身带「::」的；rawJson 与时间戳不动。
+            val panel = queryString(db, "SELECT metricsJson FROM rp_status_panels WHERE conversationId = 'active'")
+            assertTrue(panel, panel.contains("\"name\":\"角色::信任\""))
+            assertTrue(panel, panel.contains("\"name\":\"角色::主角::体力\""))
+            assertTrue(panel, panel.contains("\"value\":7"))
+            assertEquals("{\"原文\":\"信任\"}", queryString(db, "SELECT rawJson FROM rp_status_panels WHERE conversationId = 'active'"))
+            val history = queryString(db, "SELECT metricsJson FROM message_rp_metadata WHERE messageId = 'reply'")
+            assertTrue(history, history.contains("\"name\":\"角色::信任\""))
+            assertEquals(20L, queryLong(db, "SELECT updatedAtMillis FROM message_rp_metadata WHERE messageId = 'reply'"))
+
+            // §8.4 回填快照：启用与暂停中的绑定都有；wireName 与迁移后的状态名一致。
+            val activeSnapshot = RpEntryCodec.decodeSnapshot(queryString(db, settingsColumn("active", "metricSnapshotJson"))).entries
+            assertEquals(listOf("角色::信任", "角色::主角::体力"), activeSnapshot.map { it.wireName })
+            assertEquals(listOf("trust", "odd"), activeSnapshot.map { it.entryId })
+            assertEquals(listOf("信任", "主角::体力"), activeSnapshot.map { it.displayName })
+            assertEquals(2, RpEntryCodec.decodeSnapshot(queryString(db, settingsColumn("paused", "metricSnapshotJson"))).entries.size)
+            assertEquals("[]", queryString(db, settingsColumn("nameless", "metricSnapshotJson")))
+
+            assertForeignKey(db, "conversation_rp_settings", "protagonistProfileId", "protagonist_profiles", "id", "SET NULL")
+            assertForeignKey(db, "conversation_rp_settings", "roleCardId", "role_cards", "id", "SET NULL")
+            assertForeignKey(
+                db, "conversation_supporting_characters", "supportingCharacterId",
+                "supporting_characters", "id", "CASCADE",
+            )
+            assertFalse(tableExists(db, "conversation_rp_settings_new"))
+        }
+    }
+
+    /** 升级后删主角档案：新外键按 v10 结构生效，只解绑主角，角色卡绑定不受牵连。 */
+    @Test
+    fun migrate9To10_thenDeletingProtagonistProfile_unbindsViaForeignKey() {
+        val name = newDatabaseName("exported-9-10-fk")
+        exportedSchemaHelper.createDatabase(name, 9).use { db -> seedV9RpData(db) }
+
+        exportedSchemaHelper.runMigrationsAndValidate(name, 10, true, findProductionMigration(9, 10)).use { db ->
+            db.execSQL("PRAGMA foreign_keys = ON")
+            val profile = queryString(db, settingsColumn("active", "protagonistProfileId"))
+            db.execSQL("DELETE FROM protagonist_profiles WHERE id = ?", arrayOf<Any?>(profile))
+
+            assertNull(queryNullableString(db, settingsColumn("active", "protagonistProfileId")))
+            assertEquals("card", queryNullableString(db, settingsColumn("active", "roleCardId")))
+        }
+    }
+
+    private fun settingsColumn(conversationId: String, column: String) =
+        "SELECT `$column` FROM conversation_rp_settings WHERE conversationId = '$conversationId'"
+
+    /** v9 形状的 RP 数据。时间戳决定主角兜底名的序号：active=1、twin=2、nameless=3。 */
+    private fun seedV9RpData(db: SupportSQLiteDatabase) {
+        listOf("active", "paused", "twin", "nameless").forEachIndexed { index, id ->
+            db.execSQL(
+                "INSERT INTO conversations (id, title, createdAtMillis, updatedAtMillis) VALUES (?, ?, 1, ?)",
+                arrayOf<Any?>(id, "会话$id", index + 1L),
+            )
+        }
+        db.execSQL(
+            "INSERT INTO role_cards (id, name, description, persona, speakingStyle, userIdentity, " +
+                "openingMessage, boundaries, metricDefinitionsJson, createdAtMillis, updatedAtMillis) " +
+                "VALUES (?, '角色', '', '', '', '', '', '', ?, 1, 1)",
+            arrayOf<Any?>("card", V9_CARD_METRICS),
+        )
+        db.execSQL(
+            "INSERT INTO role_cards (id, name, description, persona, speakingStyle, userIdentity, " +
+                "openingMessage, boundaries, metricDefinitionsJson, createdAtMillis, updatedAtMillis) " +
+                "VALUES ('broken-card', '坏卡', '', '', '', '', '', '', '{坏掉的', 1, 1)",
+        )
+        insertV9Settings(db, "active", roleCardId = "card", enabled = true, updatedAt = 1,
+            protagonist = Triple("沈昭", "外地来的记者", "刚下火车"))
+        insertV9Settings(db, "paused", roleCardId = "card", enabled = false, updatedAt = 4,
+            protagonist = Triple("", "", ""))
+        // 与 active 内容完全相同：必须生成独立档案，而不是合并成共享对象。
+        insertV9Settings(db, "twin", roleCardId = null, enabled = false, updatedAt = 2,
+            protagonist = Triple("沈昭", "外地来的记者", "刚下火车"))
+        insertV9Settings(db, "nameless", roleCardId = null, enabled = false, updatedAt = 3,
+            protagonist = Triple("", "只有描述", ""))
+
+        db.execSQL(
+            "INSERT INTO rp_status_panels (conversationId, metricsJson, relationship, scene, rawJson, updatedAtMillis) " +
+                "VALUES ('active', ?, '熟识', '吧台', ?, 30)",
+            arrayOf<Any?>(
+                """[{"name":"信任","value":7,"min":0,"max":10},{"name":"主角::体力","value":3,"min":0,"max":10}]""",
+                "{\"原文\":\"信任\"}",
+            ),
+        )
+        db.execSQL(
+            "INSERT INTO messages (id, conversationId, role, content, reasoningContent, status, " +
+                "errorMessage, createdAtMillis, updatedAtMillis) " +
+                "VALUES ('reply', 'active', 'ASSISTANT', '正文', NULL, 'COMPLETED', NULL, 10, 10)",
+        )
+        db.execSQL(
+            "INSERT INTO message_rp_metadata (messageId, conversationId, optionsJson, innerThought, " +
+                "metricsJson, relationship, scene, rawJson, createdAtMillis, updatedAtMillis) " +
+                "VALUES ('reply', 'active', '[]', '', ?, '熟识', '吧台', '{}', 10, 20)",
+            arrayOf<Any?>("""[{"name":"信任","value":5,"min":0,"max":10}]"""),
+        )
+    }
+
+    private fun insertV9Settings(
+        db: SupportSQLiteDatabase,
+        conversationId: String,
+        roleCardId: String?,
+        enabled: Boolean,
+        updatedAt: Long,
+        protagonist: Triple<String, String, String>,
+    ) {
+        db.execSQL(
+            "INSERT INTO conversation_rp_settings (conversationId, isRpEnabled, roleCardId, worldSettingId, " +
+                "writingStyleId, protagonistName, protagonistDescription, protagonistInitialState, " +
+                "narrativeMinChars, narrativePerspective, plotSuggestionPerspective, rpMarkerMode, updatedAtMillis) " +
+                "VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, 0, 'PROTAGONIST_SECOND_PERSON', 'PROTAGONIST', 'DISABLED', ?)",
+            arrayOf<Any?>(
+                conversationId,
+                if (enabled) 1 else 0,
+                roleCardId,
+                protagonist.first,
+                protagonist.second,
+                protagonist.third,
+                updatedAt,
+            ),
+        )
     }
 
     private fun withReconstructedDatabase(
@@ -806,6 +986,12 @@ class ChatDatabaseMigrationTest {
         val defaultValue: String?,
         val primaryKey: Boolean,
     )
+
+    private companion object {
+        const val V9_CARD_METRICS =
+            "[{\"id\":\"trust\",\"name\":\"信任\",\"minValue\":0,\"maxValue\":10,\"initialValue\":2}," +
+                "{\"id\":\"odd\",\"name\":\"主角::体力\",\"minValue\":0,\"maxValue\":10,\"initialValue\":1}]"
+    }
 
     private data class ForeignKey(
         val fromColumn: String,

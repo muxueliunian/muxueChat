@@ -12,7 +12,6 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -123,13 +122,14 @@ class ConversationTokenUsageDaoTest {
             ),
             expectedRpSettings = null,
             expectedRoleCard = null,
+            expectedStatusPanel = null,
             rpStatusPanel = null,
             rpMetadataSnapshot = null,
             tokenUsage = usage(promptTokens = 13_102, completionTokens = 816, totalTokens = 13_918),
             updatedAtMillis = 20,
         )
 
-        assertTrue(committed)
+        assertEquals(RpStateCommitResult.APPLIED, committed)
         assertEquals(MessageStatus.COMPLETED, dao.getMessage("assistant-1")?.status)
         assertEquals(13_102, dao.getConversationTokenUsage(CONVERSATION_ID)?.promptTokens)
     }
@@ -146,6 +146,7 @@ class ConversationTokenUsageDaoTest {
             completedAssistant = streaming.copy(status = MessageStatus.COMPLETED, updatedAtMillis = 20),
             expectedRpSettings = null,
             expectedRoleCard = null,
+            expectedStatusPanel = null,
             rpStatusPanel = null,
             rpMetadataSnapshot = null,
             tokenUsage = null,
@@ -191,7 +192,7 @@ class ConversationTokenUsageDaoTest {
             updatedAtMillis = 30,
         )
 
-        assertTrue(committed)
+        assertEquals(RpStateCommitResult.APPLIED, committed)
         assertNull(dao.getConversationContext(CONVERSATION_ID))
         assertNotNull(dao.getConversationTokenUsage(CONVERSATION_ID))
         assertEquals(777, dao.getConversationTokenUsage(CONVERSATION_ID)?.promptTokens)

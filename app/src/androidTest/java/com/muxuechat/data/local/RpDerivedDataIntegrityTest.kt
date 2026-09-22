@@ -10,6 +10,7 @@ import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RpMetric
 import com.muxuechat.domain.model.RpMetricDefinition
+import com.muxuechat.domain.model.toNumericEntry
 import com.muxuechat.domain.model.RpStatusPanel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -79,6 +80,7 @@ class RpDerivedDataIntegrityTest {
             expectedMessage = oldAssistant,
             expectedRpSettings = rpSettings,
             expectedRoleCard = roleCard,
+            expectedStatusPanel = null,
             metadata = metadata(oldAssistant.id, "旧轮内心", "旧轮网络面板", 30),
             statusPanel = panel("旧轮网络面板", 30),
             missingStateMessage = null,
@@ -102,6 +104,7 @@ class RpDerivedDataIntegrityTest {
             expectedMessage = assistant,
             expectedRpSettings = rpSettings,
             expectedRoleCard = roleCard,
+            expectedStatusPanel = null,
             metadata = fallbackSnapshot,
             statusPanel = fallbackPanel,
             missingStateMessage = null,
@@ -127,6 +130,7 @@ class RpDerivedDataIntegrityTest {
             expectedMessage = expected,
             expectedRpSettings = rpSettings,
             expectedRoleCard = roleCard,
+            expectedStatusPanel = null,
             metadata = metadata(expected.id, "迟到结果", "迟到面板", 30),
             statusPanel = panel("迟到面板", 30),
             missingStateMessage = null,
@@ -153,13 +157,14 @@ class RpDerivedDataIntegrityTest {
             completedAssistant = completed,
             expectedRpSettings = rpSettings,
             expectedRoleCard = roleCard,
+            expectedStatusPanel = null,
             rpStatusPanel = localPanel,
             rpMetadataSnapshot = localSnapshot,
             tokenUsage = null,
             updatedAtMillis = 20,
         )
 
-        assertTrue(rpSnapshotCurrent)
+        assertEquals(RpStateCommitResult.APPLIED, rpSnapshotCurrent)
         assertEquals(MessageStatus.COMPLETED, dao.getMessage(completed.id)?.status)
         assertEquals("本地状态", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
         assertEquals(
@@ -184,13 +189,14 @@ class RpDerivedDataIntegrityTest {
             completedAssistant = completed,
             expectedRpSettings = rpSettings,
             expectedRoleCard = roleCard,
+            expectedStatusPanel = currentPanel,
             rpStatusPanel = null,
             rpMetadataSnapshot = currentSnapshot,
             tokenUsage = null,
             updatedAtMillis = 20,
         )
 
-        assertTrue(rpSnapshotCurrent)
+        assertEquals(RpStateCommitResult.APPLIED, rpSnapshotCurrent)
         assertEquals("沿用的当前状态", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
         assertEquals(
             "沿用的当前状态",
@@ -219,34 +225,17 @@ class RpDerivedDataIntegrityTest {
             completedAssistant = completed,
             expectedRpSettings = oldSettings,
             expectedRoleCard = oldRoleCard,
+            expectedStatusPanel = null,
             rpStatusPanel = panel("旧角色迟到状态", 30),
             rpMetadataSnapshot = oldSnapshot,
             tokenUsage = null,
             updatedAtMillis = 30,
         )
 
-        assertFalse(rpSnapshotCurrent)
+        assertEquals(RpStateCommitResult.CONFIGURATION_CHANGED, rpSnapshotCurrent)
         assertEquals(MessageStatus.COMPLETED, dao.getMessage(completed.id)?.status)
         assertEquals("新角色当前状态", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
         assertTrue(dao.observeMessageRpMetadata(CONVERSATION_ID).first().isEmpty())
-    }
-
-    @Test
-    fun clearingStatusSnapshots_preservesInnerThoughtAndOptions() = runBlocking {
-        seedRpConversation()
-        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
-        dao.upsertMessage(assistant)
-        dao.upsertMessageRpMetadata(metadata(assistant.id, "仍可展示的内心", "旧状态", 10))
-
-        assertEquals(1, dao.clearMessageRpStatusSnapshots(CONVERSATION_ID, 20))
-
-        val saved = dao.observeMessageRpMetadata(CONVERSATION_ID).first().single()
-        assertEquals("仍可展示的内心", saved.innerThought)
-        assertEquals("[\"继续\"]", saved.optionsJson)
-        assertEquals("[]", saved.metricsJson)
-        assertEquals("", saved.relationship)
-        assertEquals("", saved.scene)
-        assertEquals("", saved.rawJson)
     }
 
     @Test
@@ -281,7 +270,7 @@ class RpDerivedDataIntegrityTest {
             rpMetadataSnapshot = metadata(completed.id, "", "旧角色迟到状态", 30).copy(optionsJson = "[]"),
         )
 
-        assertFalse(rpSnapshotCurrent)
+        assertEquals(RpStateCommitResult.CONFIGURATION_CHANGED, rpSnapshotCurrent)
         assertNull(dao.getMessage(oldAssistant.id))
         assertEquals(MessageStatus.COMPLETED, dao.getMessage(completed.id)?.status)
         assertEquals("新角色当前状态", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
@@ -340,6 +329,348 @@ class RpDerivedDataIntegrityTest {
         assertEquals(50L, dao.getConversation(CONVERSATION_ID)?.updatedAtMillis)
     }
 
+    // ---------- 面板提交守卫（RP_ACTOR_PLAN 第 5 节） ----------
+
+    /**
+     * 补写期间面板被连续改了两次（模拟 RP-3 的手动修正），迟到的补写不得把面板写回旧轮结果；
+     * 剧情建议照常保存，而这条回复的历史快照要记录库里的真实面板，否则回滚会撤销那两次修改。
+     */
+    @Test
+    fun lateEnrichment_afterPanelEditedTwice_keepsEditsAndSnapshotsThem() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
+        dao.upsertMessage(assistant)
+        val capturedPanel = panel("补写开始时", 10)
+        dao.upsertRpStatusPanel(capturedPanel)
+        dao.upsertRpStatusPanel(panel("第一次修正", 20))
+        dao.upsertRpStatusPanel(panel("第二次修正", 21))
+
+        val committed = dao.commitRpEnrichment(
+            expectedMessage = assistant,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = capturedPanel,
+            metadata = metadata(assistant.id, "迟到内心", "迟到面板", 30),
+            statusPanel = panel("迟到面板", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+        )
+
+        assertTrue(committed)
+        assertEquals("第二次修正", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
+        val saved = dao.observeMessageRpMetadata(CONVERSATION_ID).first().single()
+        assertEquals("迟到内心", saved.innerThought)
+        assertEquals("[\"继续\"]", saved.optionsJson)
+        assertEquals("第二次修正", saved.scene)
+    }
+
+    /**
+     * 用户在补写期间就发了下一句：下一轮已经按补写前的面板冻结输入，旧补写不得再动面板，
+     * 否则下一轮提交会因「面板变了」而丢掉它自己的状态更新。
+     */
+    @Test
+    fun enrichment_afterNextUserMessage_onlySavesOwnSnapshot() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
+        dao.upsertMessage(assistant)
+        val currentPanel = panel("当前", 10)
+        dao.upsertRpStatusPanel(currentPanel)
+        dao.upsertMessage(message("next-user", ChatRole.USER, "下一句", 20))
+
+        val committed = dao.commitRpEnrichment(
+            expectedMessage = assistant,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = currentPanel,
+            metadata = metadata(assistant.id, "内心", "补写结果", 30),
+            statusPanel = panel("补写结果", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+        )
+
+        assertTrue(committed)
+        assertEquals(currentPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        assertEquals("补写结果", dao.observeMessageRpMetadata(CONVERSATION_ID).first().single().scene)
+    }
+
+    /**
+     * 面板被修正后用户又发了下一句、下一句还没完成：本条已不是最新对话消息，
+     * 但它之后的真实状态仍是修正后的面板，快照必须记它，否则从这里回滚会撤销那次修正。
+     */
+    @Test
+    fun lateEnrichment_panelEditedThenNextUserMessage_snapshotsEditedPanel() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
+        dao.upsertMessage(assistant)
+        val capturedPanel = panel("补写开始时", 10)
+        dao.upsertRpStatusPanel(capturedPanel)
+        val editedPanel = panel("手动修正", 15)
+        dao.upsertRpStatusPanel(editedPanel)
+        dao.upsertMessage(message("next-user", ChatRole.USER, "下一句", 20))
+
+        val committed = dao.commitRpEnrichment(
+            expectedMessage = assistant,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = capturedPanel,
+            metadata = metadata(assistant.id, "迟到内心", "迟到面板", 30),
+            statusPanel = panel("迟到面板", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+        )
+
+        assertTrue(committed)
+        assertEquals(editedPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        val saved = dao.observeMessageRpMetadata(CONVERSATION_ID).first().single()
+        assertEquals("迟到内心", saved.innerThought)
+        assertEquals("手动修正", saved.scene)
+    }
+
+    /**
+     * 下一轮回复已先于本条补写完成并写了面板：面板变化来自后一轮，
+     * 不能记进本条快照，否则从本条回滚会回到后一轮之后的状态。
+     */
+    @Test
+    fun lateEnrichment_afterNextReplyCommitted_keepsOwnSnapshot() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
+        dao.upsertMessage(assistant)
+        val capturedPanel = panel("补写开始时", 10)
+        dao.upsertRpStatusPanel(capturedPanel)
+        dao.upsertMessage(message("next-user", ChatRole.USER, "下一句", 20))
+        dao.upsertMessage(message("next-assistant", ChatRole.ASSISTANT, "下一轮", 25))
+        dao.upsertRpStatusPanel(panel("下一轮状态", 25))
+
+        val committed = dao.commitRpEnrichment(
+            expectedMessage = assistant,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = capturedPanel,
+            metadata = metadata(assistant.id, "迟到内心", "本条补写状态", 30),
+            statusPanel = panel("本条补写状态", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+        )
+
+        assertTrue(committed)
+        assertEquals("下一轮状态", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
+        assertEquals(
+            "本条补写状态",
+            dao.observeMessageRpMetadata(CONVERSATION_ID).first().single { it.messageId == assistant.id }.scene,
+        )
+    }
+
+    @Test
+    fun normalCompletion_afterPanelChanged_commitsBodyButKeepsPanel() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val capturedPanel = panel("请求开始时", 10)
+        dao.upsertRpStatusPanel(capturedPanel)
+        val streaming = message("assistant", ChatRole.ASSISTANT, "正文", 10).copy(
+            status = MessageStatus.STREAMING,
+        )
+        dao.upsertMessage(streaming)
+        dao.upsertRpStatusPanel(panel("生成期间修正", 15))
+
+        val completed = streaming.copy(status = MessageStatus.COMPLETED, updatedAtMillis = 20)
+        val result = dao.completeAssistantAndApplyRpState(
+            completedAssistant = completed,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = capturedPanel,
+            rpStatusPanel = panel("旧正文的状态", 20),
+            rpMetadataSnapshot = metadata(completed.id, "", "旧正文的状态", 20).copy(optionsJson = "[]"),
+            tokenUsage = null,
+            updatedAtMillis = 20,
+        )
+
+        assertEquals(RpStateCommitResult.STATUS_PANEL_CHANGED, result)
+        assertEquals(MessageStatus.COMPLETED, dao.getMessage(completed.id)?.status)
+        assertEquals("生成期间修正", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
+        assertEquals("生成期间修正", dao.observeMessageRpMetadata(CONVERSATION_ID).first().single().scene)
+    }
+
+    @Test
+    fun historyReplacement_afterPanelChanged_switchesBodyButKeepsPanel() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val oldAssistant = message("assistant-old", ChatRole.ASSISTANT, "旧正文", 10)
+        dao.upsertMessage(oldAssistant)
+        val capturedPanel = panel("请求开始时", 10)
+        dao.upsertRpStatusPanel(capturedPanel)
+        val expectedMessages = dao.getMessages(CONVERSATION_ID)
+        val staging = message("history-replacement:new", ChatRole.ASSISTANT, "新正文", 20).copy(
+            status = MessageStatus.STREAMING,
+        )
+        dao.upsertMessage(staging)
+        dao.upsertRpStatusPanel(panel("生成期间修正", 15))
+
+        val completed = staging.copy(status = MessageStatus.COMPLETED, updatedAtMillis = 30)
+        val result = dao.commitHistoryReplacement(
+            conversationId = CONVERSATION_ID,
+            expectedMessages = expectedMessages,
+            obsoleteMessageIds = listOf(oldAssistant.id),
+            editedUserMessage = null,
+            completedAssistant = completed,
+            rpStatusPanel = panel("回滚后的新状态", 30),
+            updatedAtMillis = 30,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = capturedPanel,
+            rpMetadataSnapshot = metadata(completed.id, "", "回滚后的新状态", 30).copy(optionsJson = "[]"),
+        )
+
+        assertEquals(RpStateCommitResult.STATUS_PANEL_CHANGED, result)
+        assertNull(dao.getMessage(oldAssistant.id))
+        assertEquals("生成期间修正", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
+        // 新回复的历史快照记录库里的真实面板，否则从它回滚会撤销那次修正。
+        assertEquals("生成期间修正", dao.observeMessageRpMetadata(CONVERSATION_ID).first().single().scene)
+    }
+
+    /**
+     * 下一轮已经失败：它不会再提交，补写不必为它让路。否则用户接着直接发新消息时，
+     * 新一轮取的是补写前的面板，这次补写的状态就悄悄丢了。
+     */
+    @Test
+    fun enrichment_afterNextReplyFailed_stillUpdatesPanel() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
+        dao.upsertMessage(assistant)
+        val currentPanel = panel("当前", 10)
+        dao.upsertRpStatusPanel(currentPanel)
+        dao.upsertMessage(message("next-user", ChatRole.USER, "下一句", 20))
+        dao.upsertMessage(
+            message("next-assistant", ChatRole.ASSISTANT, "", 21).copy(status = MessageStatus.FAILED),
+        )
+
+        val committed = dao.commitRpEnrichment(
+            expectedMessage = assistant,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = currentPanel,
+            metadata = metadata(assistant.id, "内心", "补写结果", 30),
+            statusPanel = panel("补写结果", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+        )
+
+        assertTrue(committed)
+        assertEquals("补写结果", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
+    }
+
+    /** 失败之后用户又发了一句、还没回复：新一轮已冻结面板，补写仍要让路。 */
+    @Test
+    fun enrichment_afterFailedReplyThenNewUserMessage_onlySavesOwnSnapshot() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
+        dao.upsertMessage(assistant)
+        val currentPanel = panel("当前", 10)
+        dao.upsertRpStatusPanel(currentPanel)
+        dao.upsertMessage(message("next-user", ChatRole.USER, "下一句", 20))
+        dao.upsertMessage(
+            message("next-assistant", ChatRole.ASSISTANT, "", 21).copy(status = MessageStatus.CANCELLED),
+        )
+        dao.upsertMessage(message("another-user", ChatRole.USER, "再一句", 22))
+
+        dao.commitRpEnrichment(
+            expectedMessage = assistant,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = currentPanel,
+            metadata = metadata(assistant.id, "内心", "补写结果", 30),
+            statusPanel = panel("补写结果", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+        )
+
+        assertEquals(currentPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        assertEquals("补写结果", dao.observeMessageRpMetadata(CONVERSATION_ID).first().single().scene)
+    }
+
+    /** 之后还有一条正在生成的回复（含历史替换的临时行）：同样要让路。 */
+    @Test
+    fun enrichment_withLaterReplyStreaming_doesNotTouchPanel() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val assistant = message("assistant", ChatRole.ASSISTANT, "正文", 10)
+        dao.upsertMessage(assistant)
+        val currentPanel = panel("当前", 10)
+        dao.upsertRpStatusPanel(currentPanel)
+        dao.upsertMessage(
+            message("history-replacement:later", ChatRole.ASSISTANT, "", 20)
+                .copy(status = MessageStatus.STREAMING),
+        )
+
+        dao.commitRpEnrichment(
+            expectedMessage = assistant,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = currentPanel,
+            metadata = metadata(assistant.id, "内心", "补写结果", 30),
+            statusPanel = panel("补写结果", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+        )
+
+        assertEquals(currentPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+    }
+
+    /** RP 暂停时重新生成没有 RP 状态可写，面板必须原样保留，而不是被当成「清空」。 */
+    @Test
+    fun historyReplacement_withoutRpState_keepsPausedPanel() = runBlocking {
+        val (rpSettings, _) = seedRpConversation()
+        val paused = rpSettings.copy(isRpEnabled = false, updatedAtMillis = 5)
+        dao.upsertConversationRpSettings(paused)
+        val pausedPanel = panel("暂停前", 5)
+        dao.upsertRpStatusPanel(pausedPanel)
+        val oldAssistant = message("assistant-old", ChatRole.ASSISTANT, "旧正文", 10)
+        dao.upsertMessage(oldAssistant)
+        val expectedMessages = dao.getMessages(CONVERSATION_ID)
+        val staging = message("history-replacement:new", ChatRole.ASSISTANT, "新正文", 20).copy(
+            status = MessageStatus.STREAMING,
+        )
+        dao.upsertMessage(staging)
+
+        val result = dao.commitHistoryReplacement(
+            conversationId = CONVERSATION_ID,
+            expectedMessages = expectedMessages,
+            obsoleteMessageIds = listOf(oldAssistant.id),
+            editedUserMessage = null,
+            completedAssistant = staging.copy(status = MessageStatus.COMPLETED, updatedAtMillis = 30),
+            rpStatusPanel = null,
+            updatedAtMillis = 30,
+            expectedRpSettings = paused,
+            expectedRoleCard = null,
+            expectedStatusPanel = pausedPanel,
+        )
+
+        assertEquals(RpStateCommitResult.APPLIED, result)
+        assertEquals(pausedPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+    }
+
+    @Test
+    fun assistantEdit_withoutRollbackPanel_keepsPausedPanel() = runBlocking {
+        val (rpSettings, _) = seedRpConversation()
+        val paused = rpSettings.copy(isRpEnabled = false, updatedAtMillis = 5)
+        dao.upsertConversationRpSettings(paused)
+        val pausedPanel = panel("暂停前", 5)
+        dao.upsertRpStatusPanel(pausedPanel)
+        val assistant = message("assistant", ChatRole.ASSISTANT, "待编辑", 10)
+        dao.upsertMessage(assistant)
+
+        val committed = dao.editAssistantAndInvalidateDerivedData(
+            expectedMessages = dao.getMessages(CONVERSATION_ID),
+            editedMessage = assistant.copy(content = "人工改写", updatedAtMillis = 20),
+            expectedRpSettings = paused,
+            expectedRoleCard = null,
+            affectedAssistantMessageIds = listOf(assistant.id),
+            downstreamCompletedAssistantIds = emptyList(),
+            rollbackStatusPanel = null,
+            downstreamNotice = "派生信息已失效",
+            updatedAtMillis = 20,
+        )
+
+        assertTrue(committed)
+        assertEquals(pausedPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+    }
+
     private suspend fun seedRpConversation(): Pair<ConversationRpSettingsEntity, RoleCardEntity> {
         dao.upsertConversation(ConversationEntity(CONVERSATION_ID, "会话", 1, 1))
         val roleCard = RoleCard(
@@ -351,7 +682,7 @@ class RpDerivedDataIntegrityTest {
             userIdentity = "",
             openingMessage = "",
             boundaries = "",
-            metricDefinitions = listOf(RpMetricDefinition("trust", "信任", minValue = 0, maxValue = 10)),
+            entries = listOf(RpMetricDefinition("trust", "信任", minValue = 0, maxValue = 10).toNumericEntry()),
             createdAtMillis = 1,
             updatedAtMillis = 1,
         ).toEntity()

@@ -1,5 +1,6 @@
 package com.muxuechat.domain.rp
 
+import com.muxuechat.domain.model.RpEntryOwner
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.RpStatusPanel
 
@@ -12,6 +13,19 @@ import com.muxuechat.domain.model.RpStatusPanel
 object RpStateBlockFormat {
     const val TAG_OPEN = "<muxue_state>"
     const val TAG_CLOSE = "</muxue_state>"
+
+    /**
+     * 数值名的归属前缀分隔符（R11）。
+     *
+     * 用 `::` 而不是 `.`：`.` 在数值名里很可能自然出现（`Lv.`、`H.P.`、小数），
+     * 用它会让校验频繁误伤。**不宣称 `::` 的模型复现率更高**——没有实测支持，
+     * 稳定性靠 entryId 身份与失败保值兜底，不靠分隔符。
+     */
+    const val WIRE_NAME_SEPARATOR = "::"
+
+    /** 把显示名加上归属前缀，得到发给模型、也写进 metricsJson 的名字。 */
+    fun wireNameOf(owner: RpEntryOwner, displayName: String): String =
+        "${owner.wirePrefix}$WIRE_NAME_SEPARATOR$displayName"
 
     private const val BACKSPACE = '\u0008'
     private const val FORM_FEED = '\u000C'

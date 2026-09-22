@@ -6,6 +6,7 @@ import androidx.room.migration.Migration
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
+import java.util.UUID
 
 @Database(
     entities = [
@@ -19,8 +20,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         WritingStyleProfileEntity::class,
         ConversationContextEntity::class,
         ConversationTokenUsageEntity::class,
+        ProtagonistProfileEntity::class,
+        SupportingCharacterEntity::class,
+        ConversationSupportingCharacterEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = true,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -44,6 +48,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_6_7)
                     .addMigrations(MIGRATION_7_8)
                     .addMigrations(MIGRATION_8_9)
+                    .addMigrations(MIGRATION_9_10)
                     .addCallback(STARTUP_GENERATION_RECOVERY_CALLBACK)
                     .build()
                     .also { instance = it }
@@ -321,6 +326,273 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v10：RP 角色体系的数据层（RP-1）。
+         *
+         * 六步的顺序不能换：新表要先于引用它的外键建好；
+         * `conversation_rp_settings` 要先重建出新列，主角档案才有地方回填 id。
+         *
+         * `role_cards` 用 ADD COLUMN 而不是整表重建——它是
+         * `conversation_rp_settings.roleCardId` 的**父表**，DROP 会触发 SET_NULL，
+         * 把所有会话的角色卡绑定悄悄清空（§8.5）。代价是旧的 `metricDefinitionsJson`
+         * 留在表里，但那本来就是想要的：坏 JSON 的原文因此不会丢。
+         *
+         * 状态名迁移只改 `metricsJson`，**不碰 `rawJson`**：rawJson 是模型当时原话的留档，
+         * 代码里只当「这条有没有状态」的非空标记用，从不回解；改写它等于伪造记录。
+         */
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val now = System.currentTimeMillis()
+                createRpActorTables(db)
+                migrateRoleCardEntries(db)
+                rebuildConversationRpSettingsForV10(db)
+                migrateProtagonistProfiles(db, now)
+                prefixLegacyMetricNames(db)
+                backfillMetricSnapshots(db)
+            }
+        }
+
+        private fun createRpActorTables(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `protagonist_profiles` (
+                    `id` TEXT NOT NULL,
+                    `name` TEXT NOT NULL,
+                    `description` TEXT NOT NULL,
+                    `entriesJson` TEXT NOT NULL,
+                    `createdAtMillis` INTEGER NOT NULL,
+                    `updatedAtMillis` INTEGER NOT NULL,
+                    PRIMARY KEY(`id`)
+                )
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `supporting_characters` (
+                    `id` TEXT NOT NULL,
+                    `name` TEXT NOT NULL,
+                    `description` TEXT NOT NULL,
+                    `entriesJson` TEXT NOT NULL,
+                    `createdAtMillis` INTEGER NOT NULL,
+                    `updatedAtMillis` INTEGER NOT NULL,
+                    PRIMARY KEY(`id`)
+                )
+                """.trimIndent(),
+            )
+            // 复合主键让「同一个配角重复加进同一个会话」在库层面不可能发生。
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `conversation_supporting_characters` (
+                    `conversationId` TEXT NOT NULL,
+                    `supportingCharacterId` TEXT NOT NULL,
+                    `orderIndex` INTEGER NOT NULL,
+                    PRIMARY KEY(`conversationId`, `supportingCharacterId`),
+                    FOREIGN KEY(`conversationId`) REFERENCES `conversations`(`id`)
+                        ON UPDATE NO ACTION ON DELETE CASCADE,
+                    FOREIGN KEY(`supportingCharacterId`) REFERENCES `supporting_characters`(`id`)
+                        ON UPDATE NO ACTION ON DELETE CASCADE
+                )
+                """.trimIndent(),
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS " +
+                    "`index_conversation_supporting_characters_supportingCharacterId` " +
+                    "ON `conversation_supporting_characters` (`supportingCharacterId`)",
+            )
+        }
+
+        /** 角色卡数值 → 词条（§8.2）。`id` 原样保留，它是改名后找回原值的唯一依据。 */
+        private fun migrateRoleCardEntries(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `role_cards` ADD COLUMN `entriesJson` TEXT NOT NULL DEFAULT '[]'")
+
+            // 先读完再写：游标遍历期间修改同一张表没有行为保证。
+            val rows = mutableListOf<Pair<String, String>>()
+            db.query("SELECT `id`, `metricDefinitionsJson` FROM `role_cards`").use { cursor ->
+                while (cursor.moveToNext()) {
+                    rows += cursor.getString(0) to cursor.getString(1).orEmpty()
+                }
+            }
+            rows.forEach { (id, raw) ->
+                val converted = RpMigrationV10.metricDefinitionsToEntriesJson(raw)
+                db.execSQL(
+                    "UPDATE `role_cards` SET `entriesJson` = ? WHERE `id` = ?",
+                    arrayOf(converted.json, id),
+                )
+            }
+        }
+
+        /**
+         * 重建 `conversation_rp_settings`，加入主角档案外键与定义快照列。
+         *
+         * 和 v8 一样必须整表重建而不是 ALTER：SQLite 无法给已有表补外键约束。
+         * 它是子表，DROP 不会触发任何父表动作。
+         */
+        private fun rebuildConversationRpSettingsForV10(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `conversation_rp_settings_new` (
+                    `conversationId` TEXT NOT NULL,
+                    `isRpEnabled` INTEGER NOT NULL,
+                    `roleCardId` TEXT,
+                    `worldSettingId` TEXT,
+                    `writingStyleId` TEXT,
+                    `protagonistProfileId` TEXT,
+                    `metricSnapshotJson` TEXT NOT NULL DEFAULT '[]',
+                    `protagonistName` TEXT NOT NULL,
+                    `protagonistDescription` TEXT NOT NULL,
+                    `protagonistInitialState` TEXT NOT NULL,
+                    `narrativeMinChars` INTEGER NOT NULL,
+                    `narrativePerspective` TEXT NOT NULL,
+                    `plotSuggestionPerspective` TEXT NOT NULL,
+                    `rpMarkerMode` TEXT NOT NULL,
+                    `updatedAtMillis` INTEGER NOT NULL,
+                    PRIMARY KEY(`conversationId`),
+                    FOREIGN KEY(`conversationId`) REFERENCES `conversations`(`id`)
+                        ON UPDATE NO ACTION ON DELETE CASCADE,
+                    FOREIGN KEY(`roleCardId`) REFERENCES `role_cards`(`id`)
+                        ON UPDATE NO ACTION ON DELETE SET NULL,
+                    FOREIGN KEY(`worldSettingId`) REFERENCES `world_settings`(`id`)
+                        ON UPDATE NO ACTION ON DELETE SET NULL,
+                    FOREIGN KEY(`writingStyleId`) REFERENCES `writing_style_profiles`(`id`)
+                        ON UPDATE NO ACTION ON DELETE SET NULL,
+                    FOREIGN KEY(`protagonistProfileId`) REFERENCES `protagonist_profiles`(`id`)
+                        ON UPDATE NO ACTION ON DELETE SET NULL
+                )
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                INSERT INTO `conversation_rp_settings_new` (
+                    `conversationId`, `isRpEnabled`, `roleCardId`, `worldSettingId`, `writingStyleId`,
+                    `protagonistProfileId`, `metricSnapshotJson`,
+                    `protagonistName`, `protagonistDescription`, `protagonistInitialState`,
+                    `narrativeMinChars`, `narrativePerspective`, `plotSuggestionPerspective`,
+                    `rpMarkerMode`, `updatedAtMillis`
+                )
+                SELECT
+                    `conversationId`, `isRpEnabled`, `roleCardId`, `worldSettingId`, `writingStyleId`,
+                    NULL, '[]',
+                    `protagonistName`, `protagonistDescription`, `protagonistInitialState`,
+                    `narrativeMinChars`, `narrativePerspective`, `plotSuggestionPerspective`,
+                    `rpMarkerMode`, `updatedAtMillis`
+                FROM `conversation_rp_settings`
+                """.trimIndent(),
+            )
+            db.execSQL("DROP TABLE `conversation_rp_settings`")
+            db.execSQL("ALTER TABLE `conversation_rp_settings_new` RENAME TO `conversation_rp_settings`")
+            listOf("roleCardId", "worldSettingId", "writingStyleId", "protagonistProfileId").forEach { column ->
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversation_rp_settings_$column` " +
+                        "ON `conversation_rp_settings` (`$column`)",
+                )
+            }
+        }
+
+        /**
+         * 主角三字段 → 独立档案（§8.1）。
+         *
+         * **每个会话生成一条独立档案，不按内容去重**：旧三字段是会话私有数据，
+         * 按内容合并会把它们变成共享对象，此后改一处会影响多个会话——那是语义变更，
+         * 不是去重优化。合并留给用户显式执行。
+         */
+        private fun migrateProtagonistProfiles(db: SupportSQLiteDatabase, now: Long) {
+            val rows = mutableListOf<LegacyProtagonist>()
+            db.query(
+                "SELECT `conversationId`, `protagonistName`, `protagonistDescription`, " +
+                    "`protagonistInitialState` FROM `conversation_rp_settings` " +
+                    "ORDER BY `updatedAtMillis` ASC, `conversationId` ASC",
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    rows += LegacyProtagonist(
+                        conversationId = cursor.getString(0),
+                        name = cursor.getString(1).orEmpty(),
+                        description = cursor.getString(2).orEmpty(),
+                        initialState = cursor.getString(3).orEmpty(),
+                    )
+                }
+            }
+
+            var ordinal = 0
+            rows.forEach { row ->
+                if (!RpMigrationV10.hasProtagonistContent(row.name, row.description, row.initialState)) {
+                    return@forEach
+                }
+                ordinal++
+                val profileId = UUID.randomUUID().toString()
+                db.execSQL(
+                    "INSERT INTO `protagonist_profiles` " +
+                        "(`id`, `name`, `description`, `entriesJson`, `createdAtMillis`, `updatedAtMillis`) " +
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                    arrayOf(
+                        profileId,
+                        RpMigrationV10.protagonistNameOrFallback(row.name, ordinal),
+                        row.description,
+                        RpMigrationV10.protagonistEntriesJson(row.initialState),
+                        now,
+                        now,
+                    ),
+                )
+                db.execSQL(
+                    "UPDATE `conversation_rp_settings` SET `protagonistProfileId` = ? WHERE `conversationId` = ?",
+                    arrayOf(profileId, row.conversationId),
+                )
+            }
+        }
+
+        /**
+         * 状态名迁移（§8.3）：**两张表都要改**，v1 只写了面板，这是最容易造成线上事故的遗漏。
+         *
+         * 不改 `updatedAtMillis`——这是格式迁移，不是内容变化，动时间戳会让界面
+         * 看起来像是用户改过什么。
+         */
+        private fun prefixLegacyMetricNames(db: SupportSQLiteDatabase) {
+            rewriteMetricNames(db, table = "rp_status_panels", keyColumn = "conversationId")
+            rewriteMetricNames(db, table = "message_rp_metadata", keyColumn = "messageId")
+        }
+
+        private fun rewriteMetricNames(db: SupportSQLiteDatabase, table: String, keyColumn: String) {
+            val rows = mutableListOf<Pair<String, String>>()
+            db.query("SELECT `$keyColumn`, `metricsJson` FROM `$table`").use { cursor ->
+                while (cursor.moveToNext()) {
+                    rows += cursor.getString(0) to cursor.getString(1).orEmpty()
+                }
+            }
+            rows.forEach { (key, raw) ->
+                val rewritten = RpMigrationV10.prefixLegacyMetricNames(raw)
+                if (rewritten == raw) return@forEach
+                db.execSQL(
+                    "UPDATE `$table` SET `metricsJson` = ? WHERE `$keyColumn` = ?",
+                    arrayOf(rewritten, key),
+                )
+            }
+        }
+
+        /**
+         * 回填定义快照（§8.4）。
+         *
+         * 只能冻结**升级当刻**的角色卡定义，不是还原当初绑定时的定义——v9 没存过历史定义。
+         *
+         * 对**所有绑定了角色卡的会话**回填，而不只是 `isRpEnabled` 的：暂停 RP 会保留快照
+         * （§4），若只给启用中的会话回填，暂停中的会话恢复后就没有定义可用。
+         */
+        private fun backfillMetricSnapshots(db: SupportSQLiteDatabase) {
+            val rows = mutableListOf<Pair<String, String>>()
+            db.query(
+                "SELECT s.`conversationId`, c.`entriesJson` FROM `conversation_rp_settings` s " +
+                    "INNER JOIN `role_cards` c ON c.`id` = s.`roleCardId`",
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    rows += cursor.getString(0) to cursor.getString(1).orEmpty()
+                }
+            }
+            rows.forEach { (conversationId, entriesJson) ->
+                db.execSQL(
+                    "UPDATE `conversation_rp_settings` SET `metricSnapshotJson` = ? WHERE `conversationId` = ?",
+                    arrayOf(RpMigrationV10.roleCardSnapshotJson(entriesJson), conversationId),
+                )
+            }
+        }
+
         private val MIGRATION_6_7 = object : Migration(6, 7) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
@@ -336,3 +608,11 @@ abstract class ChatDatabase : RoomDatabase() {
         }
     }
 }
+
+/** 迁移期间从 v9 三字段读出的主角内容。 */
+private data class LegacyProtagonist(
+    val conversationId: String,
+    val name: String,
+    val description: String,
+    val initialState: String,
+)

@@ -9,6 +9,7 @@ import com.muxuechat.domain.model.ChatRole
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.toNumericEntry
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpMetric
 import com.muxuechat.domain.model.RpMetricDefinition
@@ -117,7 +118,7 @@ class ChatDaoIntegrityTest {
         dao.upsertRpStatusPanel(statusPanel(firstConversation.id))
         dao.upsertRpStatusPanel(statusPanel(secondConversation.id))
 
-        dao.deleteRoleCardAndResetBindings(firstRoleCard.id, updatedAtMillis = 50)
+        RpRepositoryImpl(database, dao) { 50L }.deleteRoleCard(firstRoleCard.id)
 
         assertNull(dao.getRoleCard(firstRoleCard.id))
         val resetSettings = dao.getConversationRpSettings(firstConversation.id)
@@ -171,7 +172,8 @@ class ChatDaoIntegrityTest {
     }
 
     @Test
-    fun rpSettingsSemanticChange_sameTimestamp_invalidatesOnlyStatusSnapshot() = runBlocking {
+    /** 与数值无关的设置（这里是主角名）不影响历史快照；旧实现会在任何设置改动时全部清空。 */
+    fun rpSettingsUnrelatedChange_keepsHistoryStatusSnapshot() = runBlocking {
         val conversation = conversation("conversation-a")
         val roleCard = roleCard("role-a")
         val assistant = message("message-a", conversation.id)
@@ -195,6 +197,7 @@ class ChatDaoIntegrityTest {
             roleCardId = roleCard.id,
             worldSettingId = null,
             writingStyleId = null,
+            protagonistProfileId = null,
             protagonistName = "同毫秒修改后的主角",
             protagonistDescription = null,
             protagonistInitialState = null,
@@ -207,14 +210,17 @@ class ChatDaoIntegrityTest {
         val saved = dao.observeMessageRpMetadata(conversation.id).first().single()
         assertEquals("想法", saved.innerThought)
         assertEquals("[\"继续\"]", saved.optionsJson)
-        assertEquals("[]", saved.metricsJson)
-        assertEquals("", saved.relationship)
-        assertEquals("", saved.scene)
-        assertEquals("", saved.rawJson)
+        assertEquals("[{\"name\":\"信任\",\"value\":4,\"min\":0,\"max\":10}]", saved.metricsJson)
+        assertEquals("熟识", saved.relationship)
+        assertEquals("庭院", saved.scene)
     }
 
+    /**
+     * 改角色卡的状态条定义**不影响**已绑定的会话（R6）；在会话里显式同步后，
+     * 面板与历史快照按 entryId 对齐到新定义——暂停中的会话同样适用。
+     */
     @Test
-    fun editRoleCardMetrics_normalizesPanelsWithoutBreakingBindings() = runBlocking {
+    fun editRoleCardMetrics_isFrozenUntilExplicitSync() = runBlocking {
         val enabledConversation = conversation("conversation-a")
         val disabledConversation = conversation("conversation-b")
         val originalRoleCard = roleCard(
@@ -227,16 +233,16 @@ class ChatDaoIntegrityTest {
         dao.upsertConversation(enabledConversation)
         dao.upsertConversation(disabledConversation)
         dao.upsertRoleCard(originalRoleCard)
-        dao.upsertConversationRpSettings(rpSettings(enabledConversation.id, originalRoleCard.id))
-        dao.upsertConversationRpSettings(
-            rpSettings(disabledConversation.id, originalRoleCard.id).copy(isRpEnabled = false),
-        )
+        val repository = RpRepositoryImpl(database, dao) { 100L }
+        bindRoleCard(repository, enabledConversation.id, originalRoleCard.id, isRpEnabled = true)
+        bindRoleCard(repository, disabledConversation.id, originalRoleCard.id, isRpEnabled = false)
+
         val historicalAssistant = message("message-role-edit", enabledConversation.id)
         dao.upsertMessage(historicalAssistant)
         dao.upsertMessageRpMetadata(
             messageMetadata(historicalAssistant.id, enabledConversation.id).copy(
                 optionsJson = "[\"继续\"]",
-                metricsJson = "[{\"name\":\"信任\",\"value\":9,\"min\":0,\"max\":10}]",
+                metricsJson = "[{\"name\":\"角色::信任\",\"value\":9,\"min\":0,\"max\":10}]",
                 relationship = "熟识",
                 scene = "庭院",
                 rawJson = "{}",
@@ -246,14 +252,13 @@ class ChatDaoIntegrityTest {
             statusPanel(
                 conversationId = enabledConversation.id,
                 metrics = listOf(
-                    RpMetric(name = "信任", value = 9, min = 0, max = 10),
-                    RpMetric(name = "旧指标", value = 7, min = 0, max = 10),
+                    RpMetric(name = "角色::信任", value = 9, min = 0, max = 10),
+                    RpMetric(name = "角色::旧指标", value = 7, min = 0, max = 10),
                 ),
             ),
         )
-        dao.upsertRpStatusPanel(statusPanel(disabledConversation.id))
+        val panelBeforeEdit = dao.getRpStatusPanel(enabledConversation.id)
 
-        val repository = RpRepositoryImpl(database, dao) { 100L }
         val savedRoleCard = repository.saveRoleCard(
             id = originalRoleCard.id,
             draft = RoleCardDraft(
@@ -268,24 +273,60 @@ class ChatDaoIntegrityTest {
         assertEquals(10L, savedRoleCard.createdAtMillis)
         assertEquals(100L, savedRoleCard.updatedAtMillis)
         assertEquals(originalRoleCard.id, dao.getConversationRpSettings(enabledConversation.id)?.roleCardId)
+        // 冻结：改卡不动已绑定会话的面板。
+        assertEquals(panelBeforeEdit, dao.getRpStatusPanel(enabledConversation.id))
+
+        assertTrue(repository.syncMetricDefinitionsFromProfiles(enabledConversation.id))
+        assertTrue(repository.syncMetricDefinitionsFromProfiles(disabledConversation.id))
+
         val normalized = dao.getRpStatusPanel(enabledConversation.id)!!.toDomain()
         assertEquals(
             listOf(
-                RpMetric(name = "信任", value = 5, min = 0, max = 5),
-                RpMetric(name = "勇气", value = 3, min = 0, max = 10),
+                RpMetric(name = "角色::信任", value = 5, min = 0, max = 5),
+                RpMetric(name = "角色::勇气", value = 3, min = 0, max = 10),
             ),
             normalized.metrics,
         )
         assertEquals("熟识", normalized.relationship)
         assertEquals("庭院", normalized.scene)
-        assertNull(dao.getRpStatusPanel(disabledConversation.id))
+        // 暂停中的会话同样对齐，而不是删掉面板：重新开启后接着用。
+        assertEquals(
+            listOf("角色::信任", "角色::勇气"),
+            dao.getRpStatusPanel(disabledConversation.id)?.toDomain()?.metrics?.map { it.name },
+        )
         val historicalMetadata = dao.observeMessageRpMetadata(enabledConversation.id).first().single()
         assertEquals("想法", historicalMetadata.innerThought)
         assertEquals("[\"继续\"]", historicalMetadata.optionsJson)
-        assertEquals("[]", historicalMetadata.metricsJson)
-        assertEquals("", historicalMetadata.relationship)
-        assertEquals("", historicalMetadata.scene)
-        assertEquals("", historicalMetadata.rawJson)
+        // 历史快照按同一规则迁移，而不是作废：否则第一次重新生成就会回落初始值。
+        assertEquals(
+            listOf(
+                RpMetric(name = "角色::信任", value = 5, min = 0, max = 5),
+                RpMetric(name = "角色::勇气", value = 3, min = 0, max = 10),
+            ),
+            historicalMetadata.toDomain().statusPanelSnapshot?.metrics,
+        )
+        assertEquals("熟识", historicalMetadata.relationship)
+        assertEquals("庭院", historicalMetadata.scene)
+    }
+
+    private suspend fun bindRoleCard(
+        repository: RpRepositoryImpl,
+        conversationId: String,
+        roleCardId: String,
+        isRpEnabled: Boolean,
+    ) {
+        repository.updateConversationRpSettings(
+            conversationId = conversationId,
+            isRpEnabled = isRpEnabled,
+            roleCardId = roleCardId,
+            worldSettingId = null,
+            writingStyleId = null,
+            protagonistProfileId = null,
+            narrativeMinChars = null,
+            narrativePerspective = null,
+            plotSuggestionPerspective = null,
+            rpMarkerMode = null,
+        )
     }
 
     private fun conversation(id: String) = ConversationEntity(
@@ -319,7 +360,7 @@ class ChatDaoIntegrityTest {
         userIdentity = "",
         openingMessage = "",
         boundaries = "",
-        metricDefinitions = metrics,
+        entries = metrics.map { it.toNumericEntry() },
         createdAtMillis = 10,
         updatedAtMillis = 10,
     ).toEntity()

@@ -103,6 +103,7 @@ fun MuxueChatApp(viewModel: ChatViewModel, xaiAuthViewModel: XaiAuthViewModel) {
                                 roleCard = confirmation.roleCard,
                                 worldSetting = confirmation.worldSetting,
                                 writingStyle = confirmation.writingStyle,
+                                protagonist = confirmation.protagonist,
                                 bindToConversation = confirmation.bindToConversation,
                             )
                         },

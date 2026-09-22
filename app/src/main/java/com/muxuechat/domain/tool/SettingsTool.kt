@@ -9,6 +9,9 @@ enum class SettingsTool(val apiName: String) {
     CREATE_ROLE_CARD("create_role_card"),
     CREATE_WORLD_SETTING("create_world_setting"),
     CREATE_WRITING_STYLE("create_writing_style"),
+
+    /** 主角还不是独立实体，草稿只能保存进某个会话的 RP 设置，见 [com.muxuechat.domain.model.ProtagonistDraft]。 */
+    CREATE_PROTAGONIST("create_protagonist"),
     ;
 
     companion object {

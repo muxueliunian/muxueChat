@@ -1,0 +1,555 @@
+package com.muxuechat.data.repository
+
+import android.content.Context
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.muxuechat.data.local.ChatDao
+import com.muxuechat.data.local.ChatDatabase
+import com.muxuechat.data.local.ConversationEntity
+import com.muxuechat.data.local.MessageEntity
+import com.muxuechat.data.local.MessageRpMetadataEntity
+import com.muxuechat.data.local.toEntity
+import com.muxuechat.domain.model.ChatRole
+import com.muxuechat.domain.model.MessageStatus
+import com.muxuechat.domain.model.ProtagonistDraft
+import com.muxuechat.domain.model.ProtagonistProfileDraft
+import com.muxuechat.domain.model.RoleCardDraft
+import com.muxuechat.domain.model.RpEntry
+import com.muxuechat.domain.model.RpMetric
+import com.muxuechat.domain.model.RpMetricDefinition
+import com.muxuechat.domain.model.RpStatusPanel
+import com.muxuechat.domain.model.WorldSettingDraft
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+
+/**
+ * 会话绑定变化时，定义快照、状态面板与历史快照的转换规则（RP_ACTOR_PLAN 第 4 节）。
+ *
+ * 库里与状态块里的名字都是带归属前缀的 wireName（「角色::好感度」）。
+ */
+@RunWith(AndroidJUnit4::class)
+class RpBindingTransitionTest {
+    private lateinit var database: ChatDatabase
+    private lateinit var dao: ChatDao
+    private lateinit var repository: RpRepositoryImpl
+    private var now = 100L
+
+    @Before
+    fun setUp() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        database = Room.inMemoryDatabaseBuilder(context, ChatDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        dao = database.chatDao()
+        repository = RpRepositoryImpl(database, dao, clock = { now++ })
+    }
+
+    @After
+    fun tearDown() = database.close()
+
+    // ---------- 角色卡组 ----------
+
+    /** 两张卡都有「好感度」不代表是同一个东西：换卡从新卡的初始值开始，关系与场景一并清空。 */
+    @Test
+    fun switchingRoleCard_startsFromNewCardInitialValues() = runBlocking {
+        seedConversation()
+        val cardA = saveCard("A", initialValue = 10)
+        val cardB = saveCard("B", initialValue = 30)
+        bind(cardA)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "A 的场景")
+
+        bind(cardB)
+
+        val panel = panel()
+        assertEquals(listOf(RpMetric(ROLE_WIRE, 30, 0, 100)), panel?.metrics)
+        assertEquals("", panel?.scene)
+    }
+
+    /** 换卡时旧卡的历史快照作废，但内心独白与剧情建议仍可展示，不能跟着删。 */
+    @Test
+    fun switchingRoleCard_clearsOldCardStateButKeepsNarrativeInHistory() = runBlocking {
+        seedConversation()
+        val cardA = saveCard("A", initialValue = 10)
+        val cardB = saveCard("B", initialValue = 30)
+        bind(cardA)
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]""")
+
+        bind(cardB)
+
+        val row = dao.observeMessageRpMetadata(CONVERSATION_ID).first().single()
+        assertEquals("[]", row.metricsJson)
+        assertEquals("", row.scene)
+        assertEquals("仍可展示的内心", row.innerThought)
+        assertEquals("[\"继续\"]", row.optionsJson)
+    }
+
+    /** 暂停不等于重置：面板与历史快照原样保留，重新开启后接着用。 */
+    @Test
+    fun pausingAndResumingRp_keepsPanelAndSnapshots() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "暂停前")
+        val snapshot = """[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]"""
+        seedAssistantWithSnapshot(snapshot)
+
+        bind(card, isRpEnabled = false)
+        assertEquals(77, panel()?.metrics?.single()?.value)
+
+        bind(card, isRpEnabled = true)
+        assertEquals(77, panel()?.metrics?.single()?.value)
+        assertEquals("暂停前", panel()?.scene)
+        assertEquals(snapshot, dao.observeMessageRpMetadata(CONVERSATION_ID).first().single().metricsJson)
+    }
+
+    /** 暂停中换卡：旧卡的数值不得被带进新卡。 */
+    @Test
+    fun switchingRoleCardWhilePaused_doesNotCarryOldValues() = runBlocking {
+        seedConversation()
+        val cardA = saveCard("A", initialValue = 10)
+        val cardB = saveCard("B", initialValue = 30)
+        bind(cardA)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "A 的场景")
+
+        bind(cardA, isRpEnabled = false)
+        bind(cardB, isRpEnabled = false)
+        bind(cardB, isRpEnabled = true)
+
+        assertEquals(listOf(RpMetric(ROLE_WIRE, 30, 0, 100)), panel()?.metrics)
+    }
+
+    /** 与数值无关的设置不动面板：写一次就会刷新时间戳，让在途请求的提交守卫误判面板被改过。 */
+    @Test
+    fun savingUnrelatedSettings_leavesPanelRowUntouched() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        val before = dao.getRpStatusPanel(CONVERSATION_ID)
+
+        repository.updateConversationRpSettings(
+            conversationId = CONVERSATION_ID,
+            isRpEnabled = true,
+            roleCardId = card,
+            worldSettingId = null,
+            writingStyleId = null,
+            protagonistProfileId = null,
+            narrativeMinChars = 300,
+            narrativePerspective = null,
+            plotSuggestionPerspective = null,
+            rpMarkerMode = null,
+        )
+
+        assertEquals(before, dao.getRpStatusPanel(CONVERSATION_ID))
+    }
+
+    /**
+     * 角色卡没有状态条时，面板里是模型自报的状态条。只保存世界观（不换卡）不得把它们清掉。
+     */
+    @Test
+    fun bindingGeneratedWorldSetting_keepsSelfDescribedMetricsOfCardWithoutDefinitions() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10, withMetrics = false)
+        bind(card)
+        setPanel(RpMetric("模型自报", 77, 0, 100), scene = "场景")
+        val before = dao.getRpStatusPanel(CONVERSATION_ID)
+
+        repository.saveGeneratedSettings(
+            roleCard = null,
+            worldSetting = WorldSettingDraft(title = "新世界观"),
+            writingStyle = null,
+            bindToConversationId = CONVERSATION_ID,
+        )
+
+        assertEquals(before, dao.getRpStatusPanel(CONVERSATION_ID))
+    }
+
+    // ---------- 定义快照：改档案不影响已绑定的会话（R6） ----------
+
+    @Test
+    fun bindingRoleCard_snapshotsItsNumericEntries() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+
+        bind(card)
+
+        val item = settings().metricSnapshot.single()
+        assertEquals(METRIC_ID, item.entryId)
+        assertEquals(ROLE_WIRE, item.wireName)
+        assertEquals(METRIC_NAME, item.displayName)
+    }
+
+    @Test
+    fun editingRoleCardMetrics_doesNotTouchBoundConversation() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        val snapshot = """[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]"""
+        seedAssistantWithSnapshot(snapshot)
+        val panelBefore = dao.getRpStatusPanel(CONVERSATION_ID)
+        val settingsBefore = dao.getConversationRpSettings(CONVERSATION_ID)
+
+        repository.saveRoleCard(card, cardDraft("A", metricName = "亲密度", initialValue = 10))
+
+        assertEquals(settingsBefore, dao.getConversationRpSettings(CONVERSATION_ID))
+        assertEquals(panelBefore, dao.getRpStatusPanel(CONVERSATION_ID))
+        assertEquals(snapshot, dao.observeMessageRpMetadata(CONVERSATION_ID).first().single().metricsJson)
+    }
+
+    /** 显式同步：按 entryId 找回原值，改名不归零；面板与历史快照都迁移。 */
+    @Test
+    fun syncAfterRename_keepsValuesByIdentity() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]""")
+        repository.saveRoleCard(card, cardDraft("A", metricName = "亲密度", initialValue = 10))
+
+        assertTrue(repository.syncMetricDefinitionsFromProfiles(CONVERSATION_ID))
+
+        val renamed = "角色::亲密度"
+        assertEquals(renamed, settings().metricSnapshot.single().wireName)
+        assertEquals(listOf(RpMetric(renamed, 77, 0, 100)), panel()?.metrics)
+        assertEquals("场景", panel()?.scene)
+        val history = dao.observeMessageRpMetadata(CONVERSATION_ID).first().single()
+        assertEquals(listOf(RpMetric(renamed, 50, 0, 100)), history.toDomain().statusPanelSnapshot?.metrics)
+    }
+
+    @Test
+    fun syncWhilePaused_alignsPanelToo() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        bind(card, isRpEnabled = false)
+        repository.saveRoleCard(card, cardDraft("A", metricName = "亲密度", initialValue = 10))
+
+        repository.syncMetricDefinitionsFromProfiles(CONVERSATION_ID)
+
+        assertEquals(listOf(RpMetric("角色::亲密度", 77, 0, 100)), panel()?.metrics)
+    }
+
+    @Test
+    fun syncWithoutChanges_writesNothing() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        val settingsBefore = dao.getConversationRpSettings(CONVERSATION_ID)
+        // 只改简介，数值定义没变。
+        repository.saveRoleCard(card, cardDraft("A", description = "改过的简介", initialValue = 10))
+
+        assertFalse(repository.syncMetricDefinitionsFromProfiles(CONVERSATION_ID))
+        assertEquals(settingsBefore, dao.getConversationRpSettings(CONVERSATION_ID))
+    }
+
+    // ---------- 主角组 ----------
+
+    /** 换主角只重置主角组：角色组数值、关系与场景都不动。 */
+    @Test
+    fun switchingProtagonist_resetsOnlyProtagonistGroup() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        val first = saveProfile("沈昭", staminaInitial = 60)
+        val second = saveProfile("陆行", staminaInitial = 90)
+        bind(card, protagonist = first)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), RpMetric(PROTAGONIST_WIRE, 20, 0, 100), scene = "场景")
+
+        bind(card, protagonist = second)
+
+        val panel = panel()
+        assertEquals(
+            listOf(RpMetric(ROLE_WIRE, 77, 0, 100), RpMetric(PROTAGONIST_WIRE, 90, 0, 100)),
+            panel?.metrics,
+        )
+        assertEquals("场景", panel?.scene)
+    }
+
+    /** 删除角色卡只清角色组，**不得连带清主角组**（§4）。 */
+    @Test
+    fun deletingRoleCard_keepsProtagonistGroup() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        val profile = saveProfile("沈昭", staminaInitial = 60)
+        bind(card, protagonist = profile)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), RpMetric(PROTAGONIST_WIRE, 20, 0, 100), scene = "场景")
+
+        repository.deleteRoleCard(card)
+
+        val settings = settings()
+        assertNull(settings.roleCardId)
+        assertFalse(settings.isRpEnabled)
+        assertEquals(profile, settings.protagonistProfileId)
+        assertEquals(listOf(PROTAGONIST_WIRE), settings.metricSnapshot.map { it.wireName })
+        assertEquals(listOf(RpMetric(PROTAGONIST_WIRE, 20, 0, 100)), panel()?.metrics)
+        assertEquals("", panel()?.scene)
+    }
+
+    @Test
+    fun deletingRoleCardWithoutProtagonist_removesPanelButKeepsHistoryRows() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]""")
+
+        repository.deleteRoleCard(card)
+
+        assertNull(dao.getRpStatusPanel(CONVERSATION_ID))
+        assertNull(dao.getRoleCard(card))
+        assertEquals(1, dao.observeMessageRpMetadata(CONVERSATION_ID).first().size)
+    }
+
+    @Test
+    fun deletingProtagonistProfile_keepsRoleGroupAndStory() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        val profile = saveProfile("沈昭", staminaInitial = 60)
+        bind(card, protagonist = profile)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), RpMetric(PROTAGONIST_WIRE, 20, 0, 100), scene = "场景")
+
+        repository.deleteProtagonistProfile(profile)
+
+        val settings = settings()
+        assertNull(settings.protagonistProfileId)
+        assertTrue(settings.isRpEnabled)
+        assertEquals(listOf(RpMetric(ROLE_WIRE, 77, 0, 100)), panel()?.metrics)
+        assertEquals("场景", panel()?.scene)
+    }
+
+    // ---------- 设定生成工具 ----------
+
+    /** 工具建的主角成为独立档案并绑定；旧三字段不再写入，角色卡绑定与面板不动。 */
+    @Test
+    fun savingProtagonistDraft_createsProfileAndBindsIt() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        val before = dao.getRpStatusPanel(CONVERSATION_ID)
+
+        val saved = repository.saveGeneratedSettings(
+            roleCard = null,
+            worldSetting = null,
+            writingStyle = null,
+            protagonist = ProtagonistDraft(
+                name = "沈昭",
+                description = "外地来的记者",
+                initialState = "刚下火车",
+            ),
+            bindToConversationId = CONVERSATION_ID,
+        )
+
+        val profile = saved.protagonistProfile!!
+        assertEquals("沈昭", profile.name)
+        assertEquals("外地来的记者", profile.description)
+        assertEquals(listOf("刚下火车"), profile.textEntries.map { it.value })
+        val settings = settings()
+        assertEquals(profile.id, settings.protagonistProfileId)
+        assertEquals(card, settings.roleCardId)
+        assertEquals("", settings.protagonistName)
+        assertEquals(before, dao.getRpStatusPanel(CONVERSATION_ID))
+    }
+
+    /** 没有会话就没有落点：必须整笔失败，不能留下孤儿档案。 */
+    @Test
+    fun savingProtagonistWithoutConversation_fails() = runBlocking {
+        seedConversation()
+
+        val failure = runCatching {
+            repository.saveGeneratedSettings(
+                roleCard = null,
+                worldSetting = null,
+                writingStyle = null,
+                protagonist = ProtagonistDraft(name = "沈昭"),
+                bindToConversationId = null,
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertTrue(dao.observeProtagonistProfiles().first().isEmpty())
+    }
+
+    // ---------- 词条校验（§3.3） ----------
+
+    @Test
+    fun numericEntryNameWithSeparator_isRejected() = runBlocking {
+        val failure = runCatching {
+            repository.saveRoleCard(null, cardDraft("A", metricName = "主角::体力", initialValue = 10))
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
+    @Test
+    fun duplicateNumericEntryNames_areRejected() = runBlocking {
+        val failure = runCatching {
+            repository.saveProtagonistProfile(
+                null,
+                ProtagonistProfileDraft(
+                    name = "沈昭",
+                    entries = listOf(RpEntry.Numeric("", "体力"), RpEntry.Numeric("", "体力")),
+                ),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
+    /** 文本词条不进状态命名空间，名字不受分隔符限制。 */
+    @Test
+    fun textEntryNameMayContainSeparator() = runBlocking {
+        val saved = repository.saveProtagonistProfile(
+            null,
+            ProtagonistProfileDraft(name = "沈昭", entries = listOf(RpEntry.Text("", "备注::一", "值"))),
+        )
+
+        assertEquals("备注::一", saved.textEntries.single().name)
+    }
+
+    // ---------- 配角 ----------
+
+    @Test
+    fun supportingCharacters_keepOrderAndIgnoreDuplicates() = runBlocking {
+        seedConversation()
+        val a = repository.saveSupportingCharacter(null, supporting("甲")).id
+        val b = repository.saveSupportingCharacter(null, supporting("乙")).id
+
+        repository.setConversationSupportingCharacters(CONVERSATION_ID, listOf(b, a, b, "已删除的配角"))
+
+        val names = repository.observeConversationSupportingCharacters(CONVERSATION_ID).first().map { it.name }
+        assertEquals(listOf("乙", "甲"), names)
+    }
+
+    @Test
+    fun deletingSupportingCharacter_unlinksItFromConversations() = runBlocking {
+        seedConversation()
+        val a = repository.saveSupportingCharacter(null, supporting("甲")).id
+        repository.setConversationSupportingCharacters(CONVERSATION_ID, listOf(a))
+
+        repository.deleteSupportingCharacter(a)
+
+        assertTrue(repository.observeConversationSupportingCharacters(CONVERSATION_ID).first().isEmpty())
+    }
+
+    // ---------- 辅助 ----------
+
+    private suspend fun seedConversation() {
+        dao.upsertConversation(ConversationEntity(CONVERSATION_ID, "会话", 1, 1))
+    }
+
+    private suspend fun saveCard(name: String, initialValue: Int, withMetrics: Boolean = true): String =
+        repository.saveRoleCard(null, cardDraft(name, initialValue = initialValue, withMetrics = withMetrics)).id
+
+    private fun cardDraft(
+        name: String,
+        metricName: String = METRIC_NAME,
+        description: String = "",
+        initialValue: Int,
+        withMetrics: Boolean = true,
+    ) = RoleCardDraft(
+        name = name,
+        description = description,
+        metricDefinitions = if (withMetrics) {
+            listOf(RpMetricDefinition(METRIC_ID, metricName, 0, 100, initialValue))
+        } else {
+            emptyList()
+        },
+    )
+
+    private suspend fun saveProfile(name: String, staminaInitial: Int): String =
+        repository.saveProtagonistProfile(
+            null,
+            ProtagonistProfileDraft(
+                name = name,
+                entries = listOf(RpEntry.Numeric("stamina-$name", STAMINA, 0, 100, staminaInitial)),
+            ),
+        ).id
+
+    private fun supporting(name: String) = com.muxuechat.domain.model.SupportingCharacterDraft(
+        name = name,
+        entries = listOf(RpEntry.Text("", "身份", "邻居")),
+    )
+
+    private suspend fun bind(roleCardId: String?, isRpEnabled: Boolean = true, protagonist: String? = null) {
+        repository.updateConversationRpSettings(
+            conversationId = CONVERSATION_ID,
+            isRpEnabled = isRpEnabled,
+            roleCardId = roleCardId,
+            worldSettingId = null,
+            writingStyleId = null,
+            protagonistProfileId = protagonist,
+            narrativeMinChars = null,
+            narrativePerspective = null,
+            plotSuggestionPerspective = null,
+            rpMarkerMode = null,
+        )
+    }
+
+    private suspend fun settings() = dao.getConversationRpSettings(CONVERSATION_ID)!!.toDomain()
+
+    private suspend fun panel() = dao.getRpStatusPanel(CONVERSATION_ID)?.toDomain()
+
+    private suspend fun setPanel(vararg metrics: RpMetric, scene: String) {
+        dao.upsertRpStatusPanel(
+            RpStatusPanel(
+                conversationId = CONVERSATION_ID,
+                metrics = metrics.toList(),
+                relationship = "关系",
+                scene = scene,
+                rawJson = "",
+                updatedAtMillis = 50,
+            ).toEntity(),
+        )
+    }
+
+    private suspend fun seedAssistantWithSnapshot(metricsJson: String) {
+        dao.upsertMessage(
+            MessageEntity(
+                id = "assistant",
+                conversationId = CONVERSATION_ID,
+                role = ChatRole.ASSISTANT,
+                content = "正文",
+                reasoningContent = null,
+                status = MessageStatus.COMPLETED,
+                errorMessage = null,
+                createdAtMillis = 10,
+                updatedAtMillis = 10,
+            ),
+        )
+        dao.upsertMessageRpMetadata(
+            MessageRpMetadataEntity(
+                messageId = "assistant",
+                conversationId = CONVERSATION_ID,
+                optionsJson = "[\"继续\"]",
+                innerThought = "仍可展示的内心",
+                metricsJson = metricsJson,
+                relationship = "关系",
+                scene = "场景",
+                rawJson = "",
+                createdAtMillis = 10,
+                updatedAtMillis = 10,
+            ),
+        )
+    }
+
+    private companion object {
+        const val CONVERSATION_ID = "conversation"
+        const val METRIC_ID = "metric-affection"
+        const val METRIC_NAME = "好感度"
+        const val ROLE_WIRE = "角色::好感度"
+        const val STAMINA = "体力"
+        const val PROTAGONIST_WIRE = "主角::体力"
+    }
+}

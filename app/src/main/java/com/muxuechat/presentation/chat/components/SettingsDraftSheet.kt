@@ -28,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.muxuechat.domain.model.ProtagonistDraft
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.WorldSettingDraft
 import com.muxuechat.domain.model.WritingStyleProfileDraft
@@ -39,6 +40,7 @@ data class SettingsDraftConfirmation(
     val roleCard: RoleCardDraft?,
     val worldSetting: WorldSettingDraft?,
     val writingStyle: WritingStyleProfileDraft?,
+    val protagonist: ProtagonistDraft?,
     val bindToConversation: Boolean,
 )
 
@@ -61,15 +63,19 @@ fun SettingsDraftSheet(
     var roleCard by remember(draft.id) { mutableStateOf(draft.roleCard) }
     var worldSetting by remember(draft.id) { mutableStateOf(draft.worldSetting) }
     var writingStyle by remember(draft.id) { mutableStateOf(draft.writingStyle) }
+    var protagonist by remember(draft.id) { mutableStateOf(draft.protagonist) }
     // 默认不绑定：保存和绑定是两件事，不该替用户决定。
-    var bindToConversation by remember(draft.id) { mutableStateOf(false) }
+    // 主角例外：它只存在于会话设置里，不绑定就没有落点，因此强制绑定且不给取消。
+    val bindingRequired = draft.protagonist != null
+    var bindToConversation by remember(draft.id) { mutableStateOf(bindingRequired) }
 
     val canSave = roleCard?.name?.isNotBlank() == true ||
         worldSetting?.title?.isNotBlank() == true ||
-        writingStyle?.name?.isNotBlank() == true
+        writingStyle?.name?.isNotBlank() == true ||
+        (protagonist?.name?.isNotBlank() == true && draft.conversationId != null)
 
     val discardGuard = rememberGuardedDismiss(true, { onDiscard(draft.id) }, enabled = !isSaving)
-    val guardedDismiss = rememberGuardedDismiss(roleCard != draft.roleCard || worldSetting != draft.worldSetting || writingStyle != draft.writingStyle || bindToConversation, onDismiss, enabled = !isSaving)
+    val guardedDismiss = rememberGuardedDismiss(roleCard != draft.roleCard || worldSetting != draft.worldSetting || writingStyle != draft.writingStyle || protagonist != draft.protagonist || bindToConversation != bindingRequired, onDismiss, enabled = !isSaving)
     EditorSheet(
         onDismiss = guardedDismiss,
         actions = {
@@ -92,6 +98,7 @@ fun SettingsDraftSheet(
                                 roleCard = roleCard,
                                 worldSetting = worldSetting,
                                 writingStyle = writingStyle,
+                                protagonist = protagonist,
                                 bindToConversation = bindToConversation,
                             ),
                         )
@@ -153,6 +160,23 @@ fun SettingsDraftSheet(
                 }
             }
 
+            protagonist?.let { hero ->
+                DraftField("主角名字", hero.name) { protagonist = hero.copy(name = it) }
+                DraftField("主角描述", hero.description, minLines = 4) {
+                    protagonist = hero.copy(description = it)
+                }
+                DraftField("初始状态", hero.initialState, minLines = 3) {
+                    protagonist = hero.copy(initialState = it)
+                }
+                if (draft.conversationId == null) {
+                    Text(
+                        text = "当前没有会话，主角设定无处保存。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
@@ -160,12 +184,16 @@ fun SettingsDraftSheet(
                 Checkbox(
                     checked = bindToConversation,
                     onCheckedChange = { bindToConversation = it },
-                    enabled = draft.conversationId != null,
+                    enabled = draft.conversationId != null && !bindingRequired,
                 )
                 Column {
                     Text(text = "保存后绑定到当前会话", style = MaterialTheme.typography.bodyMedium)
                     Text(
-                        text = "绑定不会自动开启 RP 模式。",
+                        text = if (bindingRequired) {
+                            "主角是会话设置的一部分，只能保存到当前会话。绑定不会自动开启 RP 模式。"
+                        } else {
+                            "绑定不会自动开启 RP 模式。"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

@@ -38,7 +38,7 @@ import com.muxuechat.domain.model.TokenUsageNormalizer
 import com.muxuechat.domain.model.TokenUsageSnapshot
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.RoleCard
-import com.muxuechat.domain.model.RpMetric
+import com.muxuechat.data.local.RpStateCommitResult
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.RpMessageMetadata
 import com.muxuechat.domain.model.RpStatusPanel
@@ -56,11 +56,13 @@ import com.muxuechat.domain.prompt.PromptComposer
 import com.muxuechat.domain.prompt.PromptContext
 import com.muxuechat.domain.prompt.PromptMessage
 import com.muxuechat.domain.prompt.RpMetadataPromptContext
+import com.muxuechat.domain.rp.RpEffectiveDefinitions
 import com.muxuechat.domain.rp.RpMessageMetadataDraft
 import com.muxuechat.domain.rp.RpMessageMetadataParser
 import com.muxuechat.domain.rp.RpStatusPanelDraft
 import com.muxuechat.domain.rp.RpStateBlockFormat
 import com.muxuechat.domain.rp.RpStateBlockParser
+import com.muxuechat.domain.rp.RpStateMerger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
@@ -139,6 +141,8 @@ class ChatRepositoryImpl(
         val roleCard: RoleCard?,
         val definitions: List<RpMetricDefinition>,
         val currentPanel: RpStatusPanel?,
+        /** 提交时库里面板必须仍是它；否则说明请求期间面板被改过，不得用本轮结果覆盖。 */
+        val expectedStatusPanel: RpStatusPanelEntity?,
         val lastUser: String,
     )
 
@@ -1792,8 +1796,8 @@ class ChatRepositoryImpl(
         val completed = prepared.message
         // 即使正文没有携带本地状态块，也要把本轮沿用的当前面板先落到消息快照。
         // 后台补写失败或尚未启动时，后续编辑/重生成仍能恢复到准确的历史切点。
-        val completionStatusSnapshot = prepared.localStatusPanel
-            ?: capturedTurn.currentPanel?.takeIf { prepared.expectedRpState }
+        // currentPanel 只在 RP 启用时非空；角色卡没有状态条时它仍承载关系与场景，同样要落快照。
+        val completionStatusSnapshot = prepared.localStatusPanel ?: capturedTurn.currentPanel
         val completionMetadataSnapshot = completionStatusSnapshot?.let { panel ->
             createRpMessageMetadata(
                 message = completed,
@@ -1803,9 +1807,13 @@ class ChatRepositoryImpl(
             ).toEntity()
         }
 
-        val rpSnapshotCurrent = if (replacementPlan != null) {
-            val committedStatusPanel = completionStatusSnapshot
-                ?.copy(updatedAtMillis = completed.updatedAtMillis)
+        // 本次提交会写进面板的那一行；提交成功后它就是后台补写的期望值。
+        val committedStatusPanel = if (replacementPlan != null) {
+            completionStatusSnapshot?.copy(updatedAtMillis = completed.updatedAtMillis)?.toEntity()
+        } else {
+            prepared.localStatusPanel?.toEntity()
+        }
+        val rpCommitResult = if (replacementPlan != null) {
             // 一旦响应已完整生成，正式切换必须作为不可取消的短事务跑完，避免“已提交但向上抛取消”
             // 让 catch 误删刚转正的消息。旧分支补写的取消/等待也必须包含在这里，否则取消可能
             // 恰好打断在事务之前。网络请求本身不在 Room 事务里。
@@ -1819,23 +1827,25 @@ class ChatRepositoryImpl(
                         updatedAtMillis = completed.updatedAtMillis,
                     ),
                     completedAssistant = completed,
-                    rpStatusPanel = committedStatusPanel?.toEntity(),
+                    rpStatusPanel = committedStatusPanel,
                     updatedAtMillis = completed.updatedAtMillis,
                     expectedRpSettings = capturedTurn.expectedRpSettings,
                     expectedRoleCard = capturedTurn.expectedRoleCard,
+                    expectedStatusPanel = capturedTurn.expectedStatusPanel,
                     rpMetadataSnapshot = completionMetadataSnapshot,
                     tokenUsage = tokenUsage,
                 )
             }
         } else {
             // 正文已经完整收到后，完成状态与本地 RP 派生数据必须作为一个不可取消短事务提交。
-            // RP 配置若已变化，DAO 仍提交正文，但会保留用户的新 panel 并返回 false。
+            // RP 配置或面板若已变化，DAO 仍提交正文，但保留库里的新 panel。
             withContext(NonCancellable) {
                 chatDao.completeAssistantAndApplyRpState(
                     completedAssistant = completed,
                     expectedRpSettings = capturedTurn.expectedRpSettings,
                     expectedRoleCard = capturedTurn.expectedRoleCard,
-                    rpStatusPanel = prepared.localStatusPanel?.toEntity(),
+                    expectedStatusPanel = capturedTurn.expectedStatusPanel,
+                    rpStatusPanel = committedStatusPanel,
                     rpMetadataSnapshot = completionMetadataSnapshot,
                     tokenUsage = tokenUsage,
                     updatedAtMillis = completed.updatedAtMillis,
@@ -1843,16 +1853,23 @@ class ChatRepositoryImpl(
             }
         }
 
-        if (prepared.needsEnrichment && rpSnapshotCurrent) {
+        if (prepared.needsEnrichment && rpCommitResult != RpStateCommitResult.CONFIGURATION_CHANGED) {
+            // 面板被别处改过时，补写仍要生成剧情建议与内心独白，但期望值保持旧的那份：
+            // 它必然对不上库里的面板，补写的状态结果会被丢弃，不会覆盖那次修改。
+            // 既然状态注定被丢弃，也不再发兜底请求、不再提示「未更新状态栏」。
+            val panelApplied = rpCommitResult == RpStateCommitResult.APPLIED
             runCatching {
                 launchRpEnrichment(
                     RpEnrichmentInput(
                         expectedMessage = completed,
                         turn = capturedTurn.copy(
                             currentPanel = prepared.localStatusPanel ?: capturedTurn.currentPanel,
+                            expectedStatusPanel = committedStatusPanel
+                                ?.takeIf { panelApplied }
+                                ?: capturedTurn.expectedStatusPanel,
                         ),
                         hasLocalPanel = prepared.hasLocalPanel,
-                        expectedRpState = prepared.expectedRpState,
+                        expectedRpState = prepared.expectedRpState && panelApplied,
                         requestSnapshot = requestSnapshot,
                     ),
                 )
@@ -1876,9 +1893,13 @@ class ChatRepositoryImpl(
 
         // 只做本地解析。剧情建议、内心独白、兜底状态都需要额外的网络往返，
         // 放在这里会让用户看完正文后还要干等一整次请求，因此移到后台补写。
-        val panel = contentExtraction.panel ?: reasoningExtraction?.panel
+        val draft = contentExtraction.panel ?: reasoningExtraction?.panel
         val now = maxOf(message.updatedAtMillis, clock())
-        val missingExpectedState = panel == null && expectedRpState
+        // 整块都对不上定义的状态块不算「有本地状态」：否则会跳过兜底请求，这一轮的状态就白丢了。
+        val localStatusPanel = draft?.takeIf { expectedRpState }?.let {
+            mergeRpState(conversationId, turn, it, now, source = "content")
+        }
+        val missingExpectedState = localStatusPanel == null && expectedRpState
         val completed = message.copy(
             content = contentExtraction.cleanContent,
             reasoningContent = reasoningExtraction?.cleanContent ?: message.reasoningContent,
@@ -1891,16 +1912,6 @@ class ChatRepositoryImpl(
             },
             updatedAtMillis = now,
         )
-        val localStatusPanel = panel?.takeIf { expectedRpState }?.let { panel ->
-            RpStatusPanel(
-                conversationId = conversationId,
-                metrics = normalizeRpMetrics(turn.definitions, panel.metrics),
-                relationship = panel.relationship,
-                scene = panel.scene,
-                rawJson = panel.rawJson,
-                updatedAtMillis = now,
-            )
-        }
         return PreparedAssistant(
             message = completed,
             localStatusPanel = localStatusPanel,
@@ -1961,26 +1972,21 @@ class ChatRepositoryImpl(
         if (requireOptions) {
             require(metadata != null && metadata.options.isNotEmpty()) { "未能生成有效剧情推进建议" }
         }
-        val fallbackPanel = if (
-            !input.hasLocalPanel && metadata?.statusPanel == null && input.expectedRpState
-        ) {
-            requestFallbackRpStatusPanel(input)
+        val conversationId = input.expectedMessage.conversationId
+        // 元数据里的状态整块对不上时，同样当作没给状态，继续走兜底请求。
+        val metadataPanel = metadata?.statusPanel?.let {
+            mergeRpState(conversationId, input.turn, it, clock(), source = "metadata")
+        }
+        val fallbackPanel = if (!input.hasLocalPanel && metadataPanel == null && input.expectedRpState) {
+            requestFallbackRpStatusPanel(input)?.let {
+                mergeRpState(conversationId, input.turn, it, clock(), source = "fallback")
+            }
         } else {
             null
         }
 
         val now = clock()
-        val resolvedPanel = metadata?.statusPanel ?: fallbackPanel
-        val candidatePanel = resolvedPanel?.let { panel ->
-            RpStatusPanel(
-                conversationId = input.expectedMessage.conversationId,
-                metrics = normalizeRpMetrics(input.turn.definitions, panel.metrics),
-                relationship = panel.relationship,
-                scene = panel.scene,
-                rawJson = panel.rawJson,
-                updatedAtMillis = now,
-            )
-        }
+        val candidatePanel = (metadataPanel ?: fallbackPanel)?.copy(updatedAtMillis = now)
         val hasMetadataContent = metadata?.let { it.innerThought.isNotBlank() || it.options.isNotEmpty() } == true
         val savedMetadata = if (hasMetadataContent || candidatePanel != null) {
             createRpMessageMetadata(
@@ -1993,7 +1999,7 @@ class ChatRepositoryImpl(
             null
         }
         val missingStateMessage = if (
-            !input.hasLocalPanel && resolvedPanel == null && input.expectedRpState
+            !input.hasLocalPanel && candidatePanel == null && input.expectedRpState
         ) {
             "本次回复未更新状态栏，已保留上一次状态。"
         } else {
@@ -2005,6 +2011,7 @@ class ChatRepositoryImpl(
             expectedMessage = input.expectedMessage,
             expectedRpSettings = input.turn.expectedRpSettings,
             expectedRoleCard = input.turn.expectedRoleCard,
+            expectedStatusPanel = input.turn.expectedStatusPanel,
             metadata = savedMetadata?.toEntity(),
             statusPanel = candidatePanel?.toEntity(),
             missingStateMessage = missingStateMessage,
@@ -2034,10 +2041,12 @@ class ChatRepositoryImpl(
         val rpSettings = rpSettingsEntity?.toDomain()
         val activeRoleCardEntity = configuration.roleCard
         val roleCard = activeRoleCardEntity?.toDomain()
-        val definitions = roleCard?.metricDefinitions.orEmpty()
+        // 唯一的「本会话有效定义」来源：会话快照，不读实时角色卡（R6）。
+        val definitions = if (roleCard != null) RpEffectiveDefinitions.of(rpSettings) else emptyList()
         val statusPanel = if (resolveStatusBeforeTarget) {
             resolveRpStatusFromSnapshot(
                 conversationId = conversationId,
+                isRpActive = roleCard != null,
                 definitions = definitions,
                 previousMetadata = configuration.statusBeforeMetadata,
                 now = clock(),
@@ -2052,6 +2061,7 @@ class ChatRepositoryImpl(
             roleCard = roleCard,
             definitions = definitions,
             currentPanel = statusPanel,
+            expectedStatusPanel = configuration.persistedStatusPanel,
             lastUser = lastUserOverride ?: if (targetMessageId != null) {
                 RpHistoryMutation.lastCompletedUserContentBefore(
                     messages = messages,
@@ -2067,13 +2077,18 @@ class ChatRepositoryImpl(
         )
     }
 
+    /**
+     * 切点之前的状态。返回 null **只**表示 RP 未启用（暂停或未绑卡），调用方据此不动面板；
+     * 角色卡没有状态条时也要返回面板，否则关系与场景不会随编辑 / 重新生成回滚。
+     */
     private fun resolveRpStatusFromSnapshot(
         conversationId: String,
+        isRpActive: Boolean,
         definitions: List<RpMetricDefinition>,
         previousMetadata: com.muxuechat.data.local.MessageRpMetadataEntity?,
         now: Long,
     ): RpStatusPanel? {
-        if (definitions.isEmpty()) return null
+        if (!isRpActive) return null
 
         val previousSnapshot = previousMetadata
             ?.toDomain()
@@ -2081,21 +2096,19 @@ class ChatRepositoryImpl(
 
         if (previousSnapshot != null) {
             return previousSnapshot.copy(
-                metrics = normalizeRpMetrics(definitions, previousSnapshot.metrics),
+                // 没有定义时快照里是模型自报的状态条，原样保留（与合并规则一致）。
+                metrics = if (definitions.isEmpty()) {
+                    previousSnapshot.metrics
+                } else {
+                    RpStateMerger.alignToDefinitions(definitions, previousSnapshot.metrics)
+                },
                 updatedAtMillis = now,
             )
         }
 
         return RpStatusPanel(
             conversationId = conversationId,
-            metrics = definitions.map { definition ->
-                RpMetric(
-                    name = definition.name,
-                    value = definition.initialValue,
-                    min = definition.minValue,
-                    max = definition.maxValue,
-                )
-            },
+            metrics = RpStateMerger.alignToDefinitions(definitions, emptyList()),
             relationship = "",
             scene = "",
             rawJson = "",
@@ -2268,11 +2281,7 @@ class ChatRepositoryImpl(
         val user = buildString {
             appendLine("状态条定义与当前值：")
             definitions.forEach { definition ->
-                val current = currentPanel?.metrics
-                    ?.firstOrNull { it.name == definition.name }
-                    ?.value
-                    ?.coerceIn(definition.minValue, definition.maxValue)
-                    ?: definition.initialValue
+                val current = RpStateBlockFormat.currentValueOf(definition, currentPanel)
                 appendLine(
                     "- ${definition.name}: 当前 $current，范围 ${definition.minValue}-${definition.maxValue}，初始 ${definition.initialValue}",
                 )
@@ -2329,29 +2338,33 @@ class ChatRepositoryImpl(
         return rpStateBlockParser.extract("<muxue_state>$rawJson</muxue_state>").panel
     }
 
-    private fun normalizeRpMetrics(
-        definitions: List<RpMetricDefinition>,
-        metrics: List<RpMetric>,
-    ): List<RpMetric> {
-        if (definitions.isEmpty()) {
-            return metrics.map { metric ->
-                val min = metric.min
-                val max = if (metric.max > min) metric.max else min + 1
-                metric.copy(value = metric.value.coerceIn(min, max), min = min, max = max)
-            }
-        }
-
-        return definitions.map { definition ->
-            val matched = metrics.firstOrNull { it.name == definition.name }
-            val value = matched?.value?.coerceIn(definition.minValue, definition.maxValue)
-                ?: definition.initialValue
-            RpMetric(
-                name = definition.name,
-                value = value,
-                min = definition.minValue,
-                max = definition.maxValue,
+    /**
+     * 正文、元数据、兜底三条路共用的合并入口，基准是本轮冻结的当前面板。
+     * 返回 null 表示整块对不上定义，调用方必须当作「本轮没有状态」。
+     */
+    private fun mergeRpState(
+        conversationId: String,
+        turn: RpTurnSnapshot,
+        draft: RpStatusPanelDraft,
+        now: Long,
+        source: String,
+    ): RpStatusPanel? {
+        val result = RpStateMerger.merge(
+            conversationId = conversationId,
+            definitions = turn.definitions,
+            current = turn.currentPanel,
+            draft = draft,
+            now = now,
+        )
+        if (result.unknownCount > 0 || result.duplicateCount > 0 || result.panel == null) {
+            // 只记条数，不记状态条名与正文：名字来自用户的角色卡。
+            Log.w(
+                TAG,
+                "RP state merge ($source): matched=${result.panel != null} " +
+                    "unknown=${result.unknownCount} duplicate=${result.duplicateCount}",
             )
         }
+        return result.panel
     }
 
     private suspend fun getActiveRoleCard(conversationId: String): RoleCard? {

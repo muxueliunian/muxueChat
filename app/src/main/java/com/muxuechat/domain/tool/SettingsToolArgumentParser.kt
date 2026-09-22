@@ -1,5 +1,6 @@
 package com.muxuechat.domain.tool
 
+import com.muxuechat.domain.model.ProtagonistDraft
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.WorldSettingDraft
@@ -96,6 +97,32 @@ class SettingsToolArgumentParser(
                     writingStyle = WritingStyleProfileDraft(
                         name = name,
                         content = root.string("content").limit(MAX_LONG_TEXT_LENGTH, warnings, "文风正文"),
+                    ),
+                    warnings = warnings,
+                    createdAtMillis = clock(),
+                )
+            }
+
+            SettingsTool.CREATE_PROTAGONIST -> {
+                val name = root.string("name").normalizeName(MAX_NAME_LENGTH, warnings, "主角名字")
+                if (name.isBlank()) {
+                    return SettingsToolParseResult.Failure("模型没有给出主角名字，无法创建主角设定。")
+                }
+                if (conversationId == null) {
+                    // 主角没有独立实体，只能落到某个会话的 RP 设置上；没有会话就没有落点。
+                    return SettingsToolParseResult.Failure("当前没有会话，主角设定无处保存。")
+                }
+                SettingsToolDraft(
+                    id = idGenerator(),
+                    tool = tool,
+                    conversationId = conversationId,
+                    protagonist = ProtagonistDraft(
+                        name = name,
+                        // 上限与 RpRepositoryImpl 写入会话设置时的截断一致，避免保存时二次静默截断。
+                        description = root.string("description")
+                            .limit(MAX_PROFILE_LENGTH, warnings, "主角描述"),
+                        initialState = root.string("initial_state")
+                            .limit(MAX_PROFILE_LENGTH, warnings, "主角初始状态"),
                     ),
                     warnings = warnings,
                     createdAtMillis = clock(),
@@ -200,11 +227,15 @@ class SettingsToolArgumentParser(
         SettingsTool.CREATE_ROLE_CARD -> "角色卡"
         SettingsTool.CREATE_WORLD_SETTING -> "世界观"
         SettingsTool.CREATE_WRITING_STYLE -> "文风"
+        SettingsTool.CREATE_PROTAGONIST -> "主角"
     }
 
     private companion object {
         val NEWLINE_REGEX = Regex("[\\r\\n]+")
         const val MAX_NAME_LENGTH = 80
+
+        /** 与 `RpRepositoryImpl.MAX_PROFILE_LENGTH` 同值：主角三段文本存在会话设置里。 */
+        const val MAX_PROFILE_LENGTH = 2_000
         const val MAX_TEXT_LENGTH = 4_000
         const val MAX_LONG_TEXT_LENGTH = 20_000
         const val MAX_METRIC_DEFINITIONS = 12

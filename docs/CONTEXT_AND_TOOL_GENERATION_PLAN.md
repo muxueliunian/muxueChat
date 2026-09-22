@@ -127,15 +127,24 @@ system 消息（稳定前缀）：
 - **仅在 RP 模式关闭时**把 tools 挂到请求上。RP 进行中不给工具，避免模型在剧情中途去建卡。
 - `tool_choice = "auto"`。
 
-### 5.2 工具清单（首版三个）
+### 5.2 工具清单（首版三个，2026-09-23 增加主角）
 
 | 工具名 | 作用 |
 |---|---|
 | `create_role_card` | 创建角色卡草稿 |
 | `create_world_setting` | 创建世界观草稿 |
 | `create_writing_style` | 创建文风草稿 |
+| `create_protagonist` | 创建主角草稿（2026-09-23 新增） |
 
 参数 schema 对应 `docs/CLAUDE_DOCUMENT_IMPORT_SETTINGS_TASK.md` 第 5.3 节的 JSON 结构。
+
+`create_protagonist` 与前三个有一处本质差异：**主角目前不是独立实体**，它就是
+`conversation_rp_settings` 里的 `protagonistName` / `protagonistDescription` / `protagonistInitialState`
+三段文本。因此它的草稿只能保存到一个具体会话：没有会话时解析阶段就直接失败，
+预览界面强制勾选「绑定到当前会话」且不可取消，`saveGeneratedSettings` 也会拒绝没有会话的主角草稿。
+
+配角**没有实现**：数据层要等 `docs/RP_ACTOR_PLAN.md` 的 RP-1（新表 + Room v10）。
+RP-1 把主角升格为带词条与数值的独立实体后，`create_protagonist` 的 schema 与保存路径都要重写。
 
 ### 5.3 执行契约（**本节是安全核心，不可简化**）
 

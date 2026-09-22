@@ -102,7 +102,7 @@ fun GenerationSection(
         SettingsRow(
             title = "设定生成工具",
             subtitle = if (settings.settingsToolsEnabled) {
-                "关闭 RP 时，允许已启用工具能力的供应商创建角色卡、世界观和文风草稿"
+                "关闭 RP 时，允许已启用工具能力的供应商创建角色卡、世界观、文风和主角草稿"
             } else {
                 "已关闭：不会向任何供应商发送 tools 字段"
             },

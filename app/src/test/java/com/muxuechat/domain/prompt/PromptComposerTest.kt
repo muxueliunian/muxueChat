@@ -3,6 +3,8 @@ package com.muxuechat.domain.prompt
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.toNumericEntry
+import com.muxuechat.domain.model.RpEntryOwner
 import com.muxuechat.domain.model.RpMarkerMode
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.RpMetric
@@ -15,6 +17,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import com.muxuechat.domain.rp.RpEffectiveDefinitions
+
+/** 状态条在 prompt 与状态块里用的是带归属前缀的 wireName。 */
+private const val TRUST_WIRE = "角色::信任度"
 
 class PromptComposerTest {
     private val composer = PromptComposer()
@@ -30,20 +36,9 @@ class PromptComposerTest {
                 settings = ChatSettings(systemPrompt = "基础系统提示"),
                 rpSettings = rpSettings(
                     worldSettingId = "w1",
+                    metrics = listOf(trustMetric()),
                 ),
-                roleCard = roleCard(
-                    metricDefinitions = listOf(
-                        RpMetricDefinition(
-                            id = "m1",
-                            name = "信任度",
-                            minValue = -10,
-                            maxValue = 10,
-                            initialValue = 0,
-                            description = "角色对用户是否愿意透露秘密",
-                            progressRule = "只有用户守约或失约时才变化",
-                        ),
-                    ),
-                ),
+                roleCard = roleCard(metricDefinitions = listOf(trustMetric())),
                 worldSetting = WorldSetting(
                     id = "w1",
                     title = "雨城",
@@ -53,7 +48,7 @@ class PromptComposerTest {
                 ),
                 statusPanel = RpStatusPanel(
                     conversationId = "c1",
-                    metrics = listOf(RpMetric(name = "信任度", value = 3, min = -10, max = 10)),
+                    metrics = listOf(RpMetric(name = TRUST_WIRE, value = 3, min = -10, max = 10)),
                     relationship = "初识",
                     scene = "咖啡店",
                     rawJson = "{}",
@@ -313,7 +308,7 @@ class PromptComposerTest {
         val messages = composer.composeForOpenAiCompatibleRequest(
             PromptContext(
                 settings = ChatSettings(thinkingMode = ThinkingMode.ENABLED),
-                rpSettings = rpSettings(rpMarkerMode = RpMarkerMode.ROLE_IMMERSION),
+                rpSettings = rpSettings(rpMarkerMode = RpMarkerMode.ROLE_IMMERSION, metrics = listOf(trustMetric())),
                 roleCard = roleCard(metricDefinitions = listOf(trustMetric())),
                 worldSetting = null,
                 statusPanel = statusPanel(trust = 5, relationship = "熟识", scene = "码头"),
@@ -329,7 +324,7 @@ class PromptComposerTest {
         assertFalse(messages.any { it.content.contains("<muxue_rp_marker>") })
         assertTrue(messages.first { it.role == "system" }.content.contains("## 角色扮演模式"))
         assertTrue(messages.last().content.contains("### 当前状态"))
-        assertTrue(messages.last().content.contains("信任度: 5/10"))
+        assertTrue(messages.last().content.contains("$TRUST_WIRE: 5/10"))
     }
 
     @Test
@@ -423,7 +418,7 @@ class PromptComposerTest {
         val messages = composer.composeForDeepSeekRequest(
             PromptContext(
                 settings = ChatSettings(),
-                rpSettings = rpSettings(),
+                rpSettings = rpSettings(metrics = listOf(trustMetric())),
                 roleCard = roleCard(metricDefinitions = listOf(trustMetric())),
                 worldSetting = null,
                 statusPanel = statusPanel(trust = 3, relationship = "初识", scene = "咖啡店"),
@@ -446,7 +441,7 @@ class PromptComposerTest {
         assertEquals("user", lastUser.role)
         assertTrue(lastUser.content.startsWith("本轮输入"))
         assertTrue(lastUser.content.contains("### 当前状态"))
-        assertTrue(lastUser.content.contains("信任度: 3/10"))
+        assertTrue(lastUser.content.contains("$TRUST_WIRE: 3/10"))
         assertTrue(lastUser.content.contains("当前关系: 初识"))
         assertTrue(lastUser.content.contains("当前场景: 咖啡店"))
     }
@@ -457,7 +452,7 @@ class PromptComposerTest {
         fun composeWith(trust: Int, scene: String) = composer.composeForDeepSeekRequest(
             PromptContext(
                 settings = ChatSettings(systemPrompt = "基础系统提示"),
-                rpSettings = rpSettings(),
+                rpSettings = rpSettings(metrics = listOf(trustMetric())),
                 roleCard = roleCard(metricDefinitions = listOf(trustMetric())),
                 worldSetting = null,
                 statusPanel = statusPanel(trust = trust, relationship = "初识", scene = scene),
@@ -470,7 +465,7 @@ class PromptComposerTest {
 
         assertEquals(turnOne.first().content, turnTwo.first().content)
         // 但易变部分确实进入了请求，不是被丢掉了。
-        assertTrue(turnTwo.last().content.contains("信任度: 7/10"))
+        assertTrue(turnTwo.last().content.contains("$TRUST_WIRE: 7/10"))
         assertTrue(turnTwo.last().content.contains("雨中街道"))
     }
 
@@ -502,7 +497,7 @@ class PromptComposerTest {
         val messages = composer.composeForDeepSeekRequest(
             PromptContext(
                 settings = ChatSettings(thinkingMode = ThinkingMode.ENABLED),
-                rpSettings = rpSettings(rpMarkerMode = RpMarkerMode.ROLE_IMMERSION),
+                rpSettings = rpSettings(rpMarkerMode = RpMarkerMode.ROLE_IMMERSION, metrics = listOf(trustMetric())),
                 roleCard = roleCard(metricDefinitions = listOf(trustMetric())),
                 worldSetting = null,
                 statusPanel = statusPanel(trust = 5, relationship = "熟识", scene = "码头"),
@@ -514,7 +509,7 @@ class PromptComposerTest {
         assertTrue(onlyUser.content.contains("唯一输入"))
         assertTrue(onlyUser.content.contains("<muxue_rp_marker>"))
         assertTrue(onlyUser.content.contains("### 当前状态"))
-        assertTrue(onlyUser.content.contains("信任度: 5/10"))
+        assertTrue(onlyUser.content.contains("$TRUST_WIRE: 5/10"))
     }
 
     private fun trustMetric() = RpMetricDefinition(
@@ -529,7 +524,7 @@ class PromptComposerTest {
 
     private fun statusPanel(trust: Int, relationship: String, scene: String) = RpStatusPanel(
         conversationId = "c1",
-        metrics = listOf(RpMetric(name = "信任度", value = trust, min = -10, max = 10)),
+        metrics = listOf(RpMetric(name = TRUST_WIRE, value = trust, min = -10, max = 10)),
         relationship = relationship,
         scene = scene,
         rawJson = "{}",
@@ -541,11 +536,17 @@ class PromptComposerTest {
         narrativePerspective: RpNarrativePerspective = RpNarrativePerspective.PROTAGONIST_SECOND_PERSON,
         plotSuggestionPerspective: RpPlotSuggestionPerspective = RpPlotSuggestionPerspective.PROTAGONIST,
         rpMarkerMode: RpMarkerMode = RpMarkerMode.DISABLED,
+        /** 绑定时冻结的数值定义。prompt 只从这里取定义，不读角色卡（R6）。 */
+        metrics: List<RpMetricDefinition> = emptyList(),
     ) = ConversationRpSettings(
         conversationId = "c1",
         isRpEnabled = true,
         roleCardId = "r1",
         worldSettingId = worldSettingId,
+        metricSnapshot = RpEffectiveDefinitions.snapshotOf(
+            RpEntryOwner.ROLE_CARD,
+            metrics.map { it.toNumericEntry() },
+        ),
         narrativePerspective = narrativePerspective,
         plotSuggestionPerspective = plotSuggestionPerspective,
         rpMarkerMode = rpMarkerMode,
@@ -563,7 +564,7 @@ class PromptComposerTest {
         userIdentity = "常客",
         openingMessage = "今天也来了？",
         boundaries = "不要跳出角色",
-        metricDefinitions = metricDefinitions,
+        entries = metricDefinitions.map { it.toNumericEntry() },
         createdAtMillis = 1L,
         updatedAtMillis = 1L,
     )

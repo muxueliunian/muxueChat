@@ -41,7 +41,8 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 - 规划顺序：缺失检查 → 剥图 → 20 MiB 上限 → 估算与裁剪；
 - 发送预检基于冻结后的 `requestSnapshot`，保持「先写用户消息、失败写失败回复」；
 - 含图片请求使用流式 `RequestBody`，并单独放宽 `readTimeout`；
-- Room v10 需导出 `10.json`，并补 `MigrationTestHelper` 9→10 测试。
+- Room **v11** 需导出 `11.json`，并补 `MigrationTestHelper` 10→11 测试。
+  （v10 已被 `docs/RP_ACTOR_PLAN.md` 的 RP-1 占用，2026-09-23 改。）
 
 ## 0. 已确认的产品决策
 
@@ -102,7 +103,7 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 
 ### 3.1 数据层
 
-**新表 `message_attachments`（Room v10）**
+**新表 `message_attachments`（Room v11）**
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
@@ -119,7 +120,7 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 | `createdAtMillis` | INTEGER NOT NULL | |
 
 - 单独建表而不是给 `messages` 加 JSON 列：流式期间 `messages` 高频更新，附件不可变，不应随之反复序列化；级联删除也更可靠。
-- `MIGRATION_9_10` 只新建表，不重建既有表。导出 `10.json`，并用 `MigrationTestHelper` 按 `9.json → 10.json` 做真实升级测试。
+- `MIGRATION_10_11` 只新建表，不重建既有表。导出 `11.json`，并用 `MigrationTestHelper` 按 `10.json → 11.json` 做真实升级测试。
 - 已核实 `ChatDao.upsertMessage` 使用 `@Upsert`、`updateMessage` 使用 `@Update`，不会触发 `INSERT OR REPLACE` 式的先删后插，因此更新消息不会级联删除附件。实施时必须补回归测试，防止以后被改回 REPLACE。
 - DAO 提供 `observeAttachments(conversationId): Flow<List<MessageAttachmentEntity>>`，供上下文面板与消息列表使用（见 3.3、3.6）。
 
@@ -367,7 +368,7 @@ JVM 单元测试：
 
 API 36 设备 instrumentation：
 
-- `MIGRATION_9_10` 的 `MigrationTestHelper` 真实升级测试。
+- `MIGRATION_10_11` 的 `MigrationTestHelper` 真实升级测试。
 - 附件外键级联；`upsertMessage` / `updateMessage` 不删除附件的回归测试。
 - 删除、清空、历史替换后的文件清理，以及启动孤儿扫描（含刚移动文件不被误删）。
 - `ImageDecoder` 管线：大图、透明 PNG、HEIC、动图 GIF、带旋转 EXIF 的相机照片。
@@ -410,7 +411,7 @@ API 36 设备 instrumentation：
 | 分期 | 主要涉及 | 估计 |
 | --- | --- | --- |
 | MM-0 | `DeepSeekModels`、DataStore 迁移、RP Marker 与模型提示文案、预览、相关测试、文档 | 约 12～14 个文件，300～500 行 |
-| MM-1a | Room v10 与导出 schema、文件存储与基本清理、domain、两套 DTO 与约 12 处构造点（另约 7 个测试文件）、流式请求体、统一历史映射、规划器与估算器、上下文面板、Repository 发送与重新生成 | 约 25 个文件，1800～2500 行 |
+| MM-1a | Room v11 与导出 schema、文件存储与基本清理、domain、两套 DTO 与约 12 处构造点（另约 7 个测试文件）、流式请求体、统一历史映射、规划器与估算器、上下文面板、Repository 发送与重新生成 | 约 25 个文件，1800～2500 行 |
 | MM-1b | Photo Picker 与压缩管线、输入栏与预览、气泡缩略图、设置开关、面板展示 | 约 10 个文件，800～1200 行 |
 | MM-2 | 编辑两阶段提交与文件去留、编辑弹窗、启动孤儿扫描与 Mutex、测试 | 约 10 个文件，700～1000 行 |
 | MM-3 | 大图查看、粘贴、上传提示 | 约 5 个文件，300～500 行 |

@@ -72,6 +72,48 @@ class SettingsToolArgumentParserTest {
         assertEquals("文风", style.typeLabel)
     }
 
+    @Test
+    fun parsesProtagonist() {
+        val draft = success(
+            SettingsTool.CREATE_PROTAGONIST,
+            """{"name":"沈昭","description":"外地来的记者","initial_state":"刚下火车，只带了一个背包"}""",
+        )
+
+        val hero = draft.protagonist!!
+        assertEquals("沈昭", hero.name)
+        assertEquals("外地来的记者", hero.description)
+        assertEquals("刚下火车，只带了一个背包", hero.initialState)
+        assertEquals("主角", draft.typeLabel)
+        assertEquals("沈昭", draft.displayName)
+        assertNull(draft.roleCard)
+        assertTrue(draft.warnings.isEmpty())
+    }
+
+    /** 主角只能写进会话的 RP 设置：没有会话时必须当场失败，而不是产出一份存不下的草稿。 */
+    @Test
+    fun failsProtagonistWithoutConversation() {
+        val result = parser.parse(
+            SettingsTool.CREATE_PROTAGONIST,
+            """{"name":"沈昭"}""",
+            conversationId = null,
+        )
+
+        assertTrue(result is SettingsToolParseResult.Failure)
+    }
+
+    /** 截断上限与保存时写入会话设置的上限一致，避免保存时再被静默截一次。 */
+    @Test
+    fun truncatesProtagonistTextToProfileLimit() {
+        val long = "长".repeat(2_100)
+        val draft = success(
+            SettingsTool.CREATE_PROTAGONIST,
+            """{"name":"沈昭","description":"$long"}""",
+        )
+
+        assertEquals(2_000, draft.protagonist!!.description.length)
+        assertTrue(draft.warnings.any { it.contains("主角描述") })
+    }
+
     /** 模型偶尔会把参数包在 Markdown 代码围栏里。 */
     @Test
     fun toleratesMarkdownCodeFence() {
@@ -90,6 +132,7 @@ class SettingsToolArgumentParserTest {
             SettingsTool.CREATE_ROLE_CARD to """{"description":"没有名字"}""",
             SettingsTool.CREATE_WORLD_SETTING to """{"content":"没有标题"}""",
             SettingsTool.CREATE_WRITING_STYLE to """{"content":"没有名称"}""",
+            SettingsTool.CREATE_PROTAGONIST to """{"description":"没有名字"}""",
         ).forEach { (tool, json) ->
             val result = parse(tool, json)
             assertTrue("$tool 应当失败", result is SettingsToolParseResult.Failure)
