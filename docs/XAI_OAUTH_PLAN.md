@@ -1,8 +1,8 @@
 # muxueChat xAI OAuth 订阅链路实施计划
 
-状态：XAI-1a/1c/2 已实现，XAI-2 待真机验收。阻塞关系见「进度记录」。
+状态：XAI-1a/1c/2 已通过真机验收；XAI-5（工具调用）实施中。阻塞关系见「进度记录」。
 建立日期：2026-09-22
-最后更新：2026-09-22（第 2 版，已并入外部审查意见）
+最后更新：2026-09-23（第 2 版，已并入外部审查意见；新增 XAI-5）
 范围：App 内实现 xAI OAuth 登录，用**订阅额度**访问 Grok 模型
 不在范围：xAI 图片生成、视频生成、Grok 原生编码工具（`read_file` / `run_terminal_command` 等）
 
@@ -42,7 +42,8 @@
 | XAI-1a 遗留：登出调用 `/oauth2/revoke` | 完成，真机确认两次吊销都发出 | — |
 | XAI-1b loopback 路径 | 未开始 | — |
 | XAI-1c 凭据契约接入（第 4 节） | **完成**（commit 8d90101），真机验过登录/登出/刷新 | — |
-| XAI-2 适配器 | **已实现**，348 个 JVM 测试通过，**待真机验收** | — |
+| XAI-2 适配器 | **已通过真机验收**（2026-09-23，用户确认） | — |
+| XAI-5 工具调用 | **实施中**（2026-09-23 开工，分支 `xai-tool-calling`），见第 7 节 XAI-5 | — |
 | XAI-4 额度显示 | 未开始 | XAI-2 |
 | XAI-4 附带：`/v1/models-v2` 拉模型与 500K 窗口 | 未开始。`refreshProviderModels` 的 CAS 校验依赖 `expectedApiKey`，OAuth 没有 Key，需要先改那套并发保护 | XAI-2 |
 
@@ -457,6 +458,46 @@ refresh token 原子轮换、登出竞态处理、凭据加密存储与备份排
 
 另需一件实现工作：RP Marker 是 DeepSeek 专属，xAI 下不可用，需在
 `presentation/chat/RpMarkerAvailability.kt` 的文案中如实说明。
+
+### [ ] XAI-5：工具调用（2026-09-23 新增）
+
+XAI-2 以「工具结果回传形状未采集」为由拒绝带 `tools` 的请求。2026-09-23 复核第二轮原始抓包，
+确认形状其实已采到（`docs/XAI_WIRE_FORMAT.md` 2.1、2.1.1、3.3 已补记），因此单独开这一期。
+**不重新抓包。**
+
+范围只到 xAI 适配器内部与设置页开关，**不改 `ChatRepositoryImpl`**：上层现有的工具多轮循环
+（调用 → 生成草稿 → 回传结果 → 再次生成）原样复用，适配器只做翻译。
+
+| 方向 | OpenAI 兼容 | Responses |
+| --- | --- | --- |
+| 请求 | `tools[{type,function:{name,description,parameters}}]` | `tools[{type,name,description,parameters}]`（扁平） |
+| 请求 | `tool_choice` | **不发送**（抓包从未出现） |
+| 请求 | `assistant` + `tool_calls` | 正文非空时一个 `message` 项，然后每个调用一个 `function_call` 项 |
+| 请求 | `role=tool` + `tool_call_id` | `function_call_output{call_id,output}` |
+| 响应 | `delta.tool_calls[]` | 在 `output_item.done`（`function_call`）时一次性给出完整调用；`id` 取 `call_id` |
+| 响应 | `finish_reason` | 本轮有调用报 `tool_calls`，否则 `stop` |
+
+保守规则：`function_call` 项在 `response.completed` 前未收到 `output_item.done` 按失败处理；
+缺 `call_id` 或 `name` 的调用按失败处理（不能回传的调用不得静默丢弃）。
+非流式（`completeChat` 内部聚合）同样返回 `tool_calls`。
+
+**方案 A（本期实现）**：回放时不带 reasoning item，`function_call` 不带 `fc_` id。
+依据见线上格式 2.1 与 5.5。
+
+**方案 B（仅当真机拒绝方案 A 时实施）**：适配器内部维护一张有上限的内存表，
+以 `call_id` 为键记住本轮的 `fc_` id 与 reasoning item，回放时补上；
+需要 reasoning 时请求补 `include: ["reasoning.encrypted_content"]`。
+该表不外泄到 Repository 及以上，进程重启后丢失即退回方案 A 的形状。
+
+验收（真机）：
+
+- xAI 供应商设置页出现「启用标准工具调用」开关，默认关闭；关闭时请求不带 `tools`。
+- 非 RP 对话中让 Grok 创建角色卡：出现草稿预览，确认后落库；模型在工具结果后继续回复。
+- 一轮内多个调用（如同时建角色卡与世界观）。
+- 关闭流式后重复上一条。
+- 工具轮进行中点停止：消息为已取消，不残留在途请求。
+- RP 模式下不发送 `tools`。
+- 若上游以 400 拒绝工具轮回放，记下状态码与文案（不记正文），转方案 B。
 
 ### [ ] XAI-4：额度与用量显示
 

@@ -4,7 +4,6 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -220,23 +219,6 @@ class XaiResponsesTransportTest {
         assertEquals("9.9.9", recorded.get()!!.header("x-grok-client-version"))
     }
 
-    @Test
-    fun toolRequests_areRejectedBecauseResultRoundTripWasNeverCaptured() {
-        val tool = OpenAiCompatibleToolDto(
-            function = OpenAiCompatibleFunctionDto("f", "d", JsonObject(emptyMap())),
-        )
-
-        val error = runCatching {
-            runBlocking {
-                transportReturning(INTERLEAVED_SSE)
-                    .streamChat(TOKEN, BASE_URL, request(listOf(userMessage()), tools = listOf(tool)))
-                    .toList()
-            }
-        }.exceptionOrNull()
-
-        assertTrue(error?.message.orEmpty().contains("暂不支持工具调用"))
-    }
-
     // ------------------------------------------------------------------ 评审修复项
 
     @Test
@@ -299,25 +281,6 @@ class XaiResponsesTransportTest {
     }
 
     @Test
-    fun toolRejection_carriesSafeMessageMarkerSoItIsNotMappedToQuotaError() {
-        // 普通 IllegalArgumentException 会落到上层按关键字收敛的兜底上，
-        // 文案里的「订阅」二字会被误判成额度不足，把真正原因盖掉。
-        val tool = OpenAiCompatibleToolDto(
-            function = OpenAiCompatibleFunctionDto("f", "d", JsonObject(emptyMap())),
-        )
-        val error = runCatching {
-            runBlocking {
-                transportReturning(INTERLEAVED_SSE)
-                    .streamChat(TOKEN, BASE_URL, request(listOf(userMessage()), tools = listOf(tool)))
-                    .toList()
-            }
-        }.exceptionOrNull()
-
-        assertTrue(error is OpenAiCompatibleUserFacingError)
-        assertFalse("不能含「订阅」，否则被映射成额度不足", error!!.message.orEmpty().contains("订阅"))
-    }
-
-    @Test
     fun unauthorized_isDistinctSoCallerCanRefreshAndRetry() {
         val error = collect("", 401).exceptionOrNull()
         assertTrue(error is XaiResponsesTransport.XaiUnauthorizedException)
@@ -362,12 +325,13 @@ class XaiResponsesTransportTest {
 
     @Test
     fun completeChat_aggregatesTheStreamBecauseNonStreamShapeWasNeverCaptured() = runBlocking {
-        val chunk = transportReturning(INTERLEAVED_SSE)
+        val chunk = transportReturning(TEXT_ONLY_SSE)
             .completeChat(TOKEN, BASE_URL, request(listOf(userMessage())))
 
         val message = chunk.choices.single().message!!
         assertEquals("你好呀", message.content)
         assertEquals("想一想", message.reasoningContent)
+        assertNull(message.toolCalls)
         assertEquals("stop", chunk.choices.single().finishReason)
         assertEquals(10576, chunk.usage?.promptTokens)
         // 聚合走的是同一条流式请求，请求体里 stream 恒为 true。
@@ -376,6 +340,213 @@ class XaiResponsesTransportTest {
             json.parseToJsonElement(recordedBody.get()).jsonObject["stream"]?.jsonPrimitive?.content?.toBoolean(),
         )
     }
+
+    // ------------------------------------------------------------------ 工具调用（XAI-5）
+
+    private fun toolDto(name: String = "create_role_card") = OpenAiCompatibleToolDto(
+        function = OpenAiCompatibleFunctionDto(
+            name = name,
+            description = "创建角色卡草稿",
+            parameters = json.parseToJsonElement("""{"type":"object","properties":{}}""").jsonObject,
+        ),
+    )
+
+    private fun toolCallsOf(events: List<OpenAiCompatibleStreamEvent>): List<OpenAiCompatibleToolCallDto> =
+        OpenAiCompatibleToolCallAccumulator().apply {
+            events.filterIsInstance<OpenAiCompatibleStreamEvent.Delta>().forEach { accept(it.toolCalls) }
+        }.build()
+
+    @Test
+    fun functionCall_isHandedOverOnceWithAuthoritativeArguments() {
+        // INTERLEAVED_SSE 里 delta 只到 {"path":，.done 才是全文。上层累加器只会追加，
+        // 若把 delta 透传下去再补全文，参数就会拼成两份。
+        val events = collect(INTERLEAVED_SSE).getOrThrow()
+        val call = toolCallsOf(events).single()
+
+        assertEquals("call-abc-1", call.id)
+        assertEquals("read", call.function?.name)
+        assertEquals("""{"path":"a"}""", call.function?.arguments)
+        val finish = events.filterIsInstance<OpenAiCompatibleStreamEvent.Delta>().mapNotNull { it.finishReason }
+        assertEquals(listOf("tool_calls"), finish)
+    }
+
+    @Test
+    fun capturedThreeCallRound_keepsOrderAndArgumentsPerOutputIndex() {
+        // 线上格式 §3.2 的 004 序列：第三个调用的参数分片跨过了正文项收尾，
+        // .done 甚至排在正文 output_item.done 之后。
+        val events = collect(THREE_CALL_SSE).getOrThrow()
+        val calls = toolCallsOf(events)
+
+        assertEquals(listOf("call-u-0", "call-u-1", "call-u-2"), calls.map { it.id })
+        assertEquals(listOf("list_dir", "bash", "bash"), calls.map { it.function?.name })
+        assertEquals(
+            listOf("""{"p":"."}""", """{"c":"ls"}""", """{"c":"pwd"}"""),
+            calls.map { it.function?.arguments },
+        )
+        assertEquals(
+            "前言",
+            events.filterIsInstance<OpenAiCompatibleStreamEvent.Delta>().mapNotNull { it.content }.joinToString(""),
+        )
+    }
+
+    @Test
+    fun argumentsFallBackToDoneItemThenToAccumulatedDeltas() {
+        val sse = """
+            data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_0","type":"function_call","name":"a","call_id":"call-x-0","arguments":""}}
+            data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"k\":"}
+            data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_0","type":"function_call","name":"a","call_id":"call-x-0","arguments":"{\"k\":1}"}}
+            data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","name":"b","call_id":"call-x-1","arguments":""}}
+            data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"k\":"}
+            data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"2}"}
+            data: {"type":"response.output_item.done","output_index":1}
+            data: {"type":"response.completed","response":{"status":"completed"}}
+        """.trimIndent()
+
+        val calls = toolCallsOf(collect(sse).getOrThrow())
+
+        assertEquals(listOf("""{"k":1}""", """{"k":2}"""), calls.map { it.function?.arguments })
+    }
+
+    @Test
+    fun functionCallNotFinishedBeforeCompleted_failsInsteadOfDroppingTheCall() {
+        val sse = """
+            data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_0","type":"function_call","name":"a","call_id":"call-x-0"}}
+            data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{"}
+            data: {"type":"response.completed","response":{"status":"completed"}}
+        """.trimIndent()
+
+        assertEquals("xAI 回复未正常结束，请重试", collect(sse).exceptionOrNull()?.message)
+    }
+
+    @Test
+    fun functionCallWithoutCallId_failsBecauseItsResultCouldNeverBeReturned() {
+        val sse = """
+            data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_0","type":"function_call","name":"a"}}
+            data: {"type":"response.output_item.done","output_index":0}
+            data: {"type":"response.completed","response":{"status":"completed"}}
+        """.trimIndent()
+
+        assertEquals("xAI 返回的工具调用不完整，请重试", collect(sse).exceptionOrNull()?.message)
+    }
+
+    @Test
+    fun argumentsForUnknownItem_failAsUnparseable() {
+        val sse = """
+            data: {"type":"response.function_call_arguments.delta","output_index":7,"delta":"{"}
+            data: {"type":"response.completed","response":{"status":"completed"}}
+        """.trimIndent()
+
+        assertEquals("xAI 返回内容无法解析", collect(sse).exceptionOrNull()?.message)
+    }
+
+    @Test
+    fun toolRequest_translatesDefinitionsAndReplaysExchangeInCapturedShape() {
+        val history = listOf(
+            userMessage(),
+            // 有前言的工具轮：正文 message 在前，调用在后（§2.1.1）。
+            OpenAiCompatibleMessageDto(
+                role = "assistant",
+                content = "我来建卡",
+                toolCalls = listOf(
+                    OpenAiCompatibleToolCallDto(
+                        id = "call-u-0",
+                        function = OpenAiCompatibleFunctionCallDto("create_role_card", """{"name":"A"}"""),
+                    ),
+                    OpenAiCompatibleToolCallDto(
+                        id = "call-u-1",
+                        function = OpenAiCompatibleFunctionCallDto("create_world_setting", """{"name":"W"}"""),
+                    ),
+                ),
+            ),
+            OpenAiCompatibleMessageDto(role = "tool", content = "草稿已创建：1", toolCallId = "call-u-0"),
+            OpenAiCompatibleMessageDto(role = "tool", content = "草稿已创建：2", toolCallId = "call-u-1"),
+            // 纯工具调用、没有正文的第二轮。
+            OpenAiCompatibleMessageDto(
+                role = "assistant",
+                toolCalls = listOf(
+                    OpenAiCompatibleToolCallDto(
+                        id = "call-u-2",
+                        function = OpenAiCompatibleFunctionCallDto("create_writing_style", "{}"),
+                    ),
+                ),
+            ),
+            OpenAiCompatibleMessageDto(role = "tool", content = "草稿已创建：3", toolCallId = "call-u-2"),
+        )
+        runBlocking {
+            transportReturning(TEXT_ONLY_SSE).streamChat(
+                TOKEN,
+                BASE_URL,
+                request(history, tools = listOf(toolDto())).copy(toolChoice = "auto"),
+            ).toList()
+        }
+
+        val body = json.parseToJsonElement(recordedBody.get()).jsonObject
+        // 扁平形状（§2.2），没有 function 包裹层。
+        val tool = body["tools"]!!.jsonArray.single().jsonObject
+        assertEquals(setOf("type", "name", "description", "parameters"), tool.keys)
+        assertEquals("function", tool["type"]?.jsonPrimitive?.content)
+        assertEquals("create_role_card", tool["name"]?.jsonPrimitive?.content)
+        // 抓包里从未出现 tool_choice（§2）；回放也不带 reasoning，因此不请求加密推理。
+        assertNull(body["tool_choice"])
+        assertNull(body["include"])
+
+        val input = body["input"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(
+            listOf(
+                null, "message", "function_call", "function_call", "function_call_output",
+                "function_call_output", "function_call", "function_call_output",
+            ),
+            input.map { it["type"]?.jsonPrimitive?.content },
+        )
+        val firstCall = input[2]
+        assertEquals(setOf("type", "call_id", "name", "arguments"), firstCall.keys)
+        assertEquals("call-u-0", firstCall["call_id"]?.jsonPrimitive?.content)
+        assertEquals("""{"name":"A"}""", firstCall["arguments"]?.jsonPrimitive?.content)
+        val firstOutput = input[4]
+        assertEquals(setOf("type", "call_id", "output"), firstOutput.keys)
+        assertEquals("call-u-0", firstOutput["call_id"]?.jsonPrimitive?.content)
+        assertEquals("草稿已创建：1", firstOutput["output"]?.jsonPrimitive?.content)
+        assertTrue("不得把工具结果当成用户消息", input.none { it["role"]?.jsonPrimitive?.content == "tool" })
+    }
+
+    @Test
+    fun requestWithoutTools_omitsToolsFieldSoItMatchesTheXai2Body() {
+        collect(TEXT_ONLY_SSE).getOrThrow()
+
+        val body = json.parseToJsonElement(recordedBody.get()).jsonObject
+        assertEquals(setOf("model", "input", "stream", "store", "max_output_tokens"), body.keys)
+    }
+
+    @Test
+    fun toolResultWithoutCallId_isRejectedBeforeAnythingIsSent() {
+        val error = runCatching {
+            runBlocking {
+                transportReturning(TEXT_ONLY_SSE).streamChat(
+                    TOKEN,
+                    BASE_URL,
+                    request(listOf(userMessage(), OpenAiCompatibleMessageDto(role = "tool", content = "结果"))),
+                ).toList()
+            }
+        }.exceptionOrNull()
+
+        // 带安全文案标记，才不会被上层按关键字收敛成别的错误。
+        assertTrue(error is OpenAiCompatibleUserFacingError)
+        assertNull(recorded.get())
+    }
+
+    @Test
+    fun completeChat_returnsToolCallsLikeAStandardNonStreamResponse() = runBlocking {
+        val chunk = transportReturning(THREE_CALL_SSE)
+            .completeChat(TOKEN, BASE_URL, request(listOf(userMessage()), tools = listOf(toolDto())))
+
+        val choice = chunk.choices.single()
+        val calls = choice.message!!.toolCalls!!
+        assertEquals(listOf("call-u-0", "call-u-1", "call-u-2"), calls.map { it.id })
+        // 非流式响应里的完整调用不带流式拼接用的 index。
+        assertTrue(calls.all { it.index == null })
+        assertEquals("tool_calls", choice.finishReason)
+    }
+
 
     private companion object {
         const val TOKEN = "synthetic-xai-access-token"
@@ -404,6 +575,45 @@ class XaiResponsesTransportTest {
             data: {"type":"response.content_part.done","output_index":1}
             data: {"type":"response.output_item.done","output_index":1}
             data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10576,"output_tokens":118,"total_tokens":10694}}}
+        """.trimIndent()
+
+        /** 纯文本一轮：不含任何工具项。 */
+        val TEXT_ONLY_SSE = """
+            data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}
+            data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"想一想"}
+            data: {"type":"response.output_item.done","output_index":0}
+            data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message"}}
+            data: {"type":"response.output_text.delta","output_index":1,"delta":"你好呀"}
+            data: {"type":"response.output_item.done","output_index":1}
+            data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10576,"output_tokens":118,"total_tokens":10694}}}
+        """.trimIndent()
+
+        /**
+         * 按线上格式 §3.2 的 004 顺序构造的三调用一轮：第三个调用的参数分片跨过了
+         * 正文项收尾，`.done` 排在正文 output_item.done 之后。字段取自 §3.3 的补记。
+         */
+        val THREE_CALL_SSE = """
+            data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}
+            data: {"type":"response.output_item.done","output_index":0}
+            data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message"}}
+            data: {"type":"response.output_text.delta","output_index":1,"delta":"前言"}
+            data: {"type":"response.output_item.added","output_index":2,"item":{"id":"fc_u_0","type":"function_call","name":"list_dir","call_id":"call-u-0","arguments":"","status":"in_progress"}}
+            data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_u_0","delta":"{\"p\":\".\"}"}
+            data: {"type":"response.function_call_arguments.done","output_index":2,"item_id":"fc_u_0","name":"list_dir","arguments":"{\"p\":\".\"}"}
+            data: {"type":"response.output_item.done","output_index":2,"item":{"id":"fc_u_0","type":"function_call","name":"list_dir","call_id":"call-u-0","arguments":"{\"p\":\".\"}","status":"completed"}}
+            data: {"type":"response.output_item.added","output_index":3,"item":{"id":"fc_u_1","type":"function_call","name":"bash","call_id":"call-u-1","arguments":"","status":"in_progress"}}
+            data: {"type":"response.function_call_arguments.delta","output_index":3,"item_id":"fc_u_1","delta":"{\"c\":\"ls\"}"}
+            data: {"type":"response.function_call_arguments.done","output_index":3,"item_id":"fc_u_1","name":"bash","arguments":"{\"c\":\"ls\"}"}
+            data: {"type":"response.output_item.done","output_index":3,"item":{"id":"fc_u_1","type":"function_call","name":"bash","call_id":"call-u-1","arguments":"{\"c\":\"ls\"}","status":"completed"}}
+            data: {"type":"response.output_item.added","output_index":4,"item":{"id":"fc_u_2","type":"function_call","name":"bash","call_id":"call-u-2","arguments":"","status":"in_progress"}}
+            data: {"type":"response.function_call_arguments.delta","output_index":4,"item_id":"fc_u_2","delta":"{\"c\":"}
+            data: {"type":"response.output_text.done","output_index":1,"text":"前言"}
+            data: {"type":"response.content_part.done","output_index":1}
+            data: {"type":"response.output_item.done","output_index":1}
+            data: {"type":"response.function_call_arguments.delta","output_index":4,"item_id":"fc_u_2","delta":"\"pwd\"}"}
+            data: {"type":"response.function_call_arguments.done","output_index":4,"item_id":"fc_u_2","name":"bash","arguments":"{\"c\":\"pwd\"}"}
+            data: {"type":"response.output_item.done","output_index":4,"item":{"id":"fc_u_2","type":"function_call","name":"bash","call_id":"call-u-2","arguments":"{\"c\":\"pwd\"}","status":"completed"}}
+            data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}
         """.trimIndent()
     }
 }

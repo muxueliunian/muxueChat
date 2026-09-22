@@ -626,17 +626,15 @@ fun CustomProviderSection(
         },
     )
 
-    // xAI 订阅链路不支持工具调用：结果回传的形状没有采集到，适配器会直接拒绝带 tools
-    // 的请求。既然开了也用不了，就不提供这个开关，免得用户以为是自己配错了。
+    // xAI 订阅链路只给工具开关：用量总在 response.completed 里返回，适配器不发 stream_options，
+    // 「请求流式用量统计」对它没有意义，显示出来反而让人以为关掉就拿不到用量。
     if (!provider.usesXaiOAuth) {
         com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具调用与流式用量统计") {
             ProviderToolCallingSection(provider = provider, onUpdate = onUpdate)
         }
     } else {
-        com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "该链路的能力限制") {
-            SettingsSection(title = "工具调用") {
-                MetaLine("xAI 订阅链路暂不支持工具调用，因此不提供该开关。")
-            }
+        com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具调用") {
+            XaiToolCallingSection(provider = provider, onUpdate = onUpdate)
         }
     }
 
@@ -701,6 +699,40 @@ private fun ProviderToolCallingSection(
                 Switch(
                     checked = provider.streamUsageEnabled,
                     onCheckedChange = { enabled -> onUpdate { it.copy(streamUsageEnabled = enabled) } },
+                    colors = quietSwitchColors(),
+                )
+            },
+        )
+    }
+}
+
+/**
+ * xAI 订阅链路的工具开关。与自定义供应商共用 [CustomProvider.toolCallingEnabled]，默认关闭。
+ *
+ * 回放时不带 reasoning 与 `fc_` id 是否被上游接受仍待真机确认（线上格式 §5.5），
+ * 所以如实写明，出问题时用户知道关掉它就能恢复普通聊天。
+ */
+@Composable
+private fun XaiToolCallingSection(
+    provider: CustomProvider,
+    onUpdate: (CustomProviderMutation) -> Unit,
+) {
+    SettingsSection(
+        title = "端点能力",
+        description = "xAI 链路的工具调用经 Responses 协议转换，仍在验证中；" +
+            "开启后若出现请求失败，关闭此项即可恢复普通聊天。",
+    ) {
+        SettingsRow(
+            title = "启用工具调用",
+            subtitle = if (provider.toolCallingEnabled) {
+                "非 RP 聊天中，模型可以生成设定草稿，确认后才会保存"
+            } else {
+                "默认关闭"
+            },
+            trailing = {
+                Switch(
+                    checked = provider.toolCallingEnabled,
+                    onCheckedChange = { enabled -> onUpdate { it.copy(toolCallingEnabled = enabled) } },
                     colors = quietSwitchColors(),
                 )
             },

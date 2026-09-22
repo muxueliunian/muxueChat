@@ -34,12 +34,12 @@ import java.util.concurrent.TimeUnit
  * 上层构造的仍是 [OpenAiCompatibleChatRequest]，收到的仍是 [OpenAiCompatibleStreamEvent]，
  * 调用方不知道自己走的是哪个实现。
  *
- * 一切形状取自 `docs/XAI_WIRE_FORMAT.md` 的实测记录。两处实测缺口按保守方式处理：
+ * 一切形状取自 `docs/XAI_WIRE_FORMAT.md` 的实测记录。实测缺口按保守方式处理：
  *
- * - **工具调用**：结果回传的 input item 形状未采集（§2.1），因此本实现**拒绝**携带
- *   tools 的请求，而不是照 OpenAI Responses 的公开文档猜 `function_call_output`。
  * - **非流式**：未采集（§3、§4 只覆盖 `stream: true`），因此 [completeChat] 内部跑流式再聚合，
  *   不猜一个没见过的响应体。
+ * - **工具调用**（XAI-5）：回放形状见 §2.1。`tool_choice` 从未出现在抓包里，不发送；
+ *   回放时不带 reasoning item 与 `fc_` id——上层没有保留它们，这是否被上游接受由真机验收（§5.5）。
  */
 class XaiResponsesTransport private constructor(
     private val okHttpClient: OkHttpClient,
@@ -150,6 +150,7 @@ class XaiResponsesTransport private constructor(
     ): OpenAiCompatibleChatChunkDto {
         val content = StringBuilder()
         val reasoning = StringBuilder()
+        val toolCalls = OpenAiCompatibleToolCallAccumulator()
         var usage: OpenAiCompatibleUsageDto? = null
         var finishReason: String? = null
 
@@ -158,6 +159,7 @@ class XaiResponsesTransport private constructor(
             if (event !is OpenAiCompatibleStreamEvent.Delta) return@collect
             event.content?.let(content::append)
             event.reasoningContent?.let(reasoning::append)
+            toolCalls.accept(event.toolCalls)
             event.usage?.let { usage = it }
             event.finishReason?.let { finishReason = it }
         }
@@ -170,6 +172,8 @@ class XaiResponsesTransport private constructor(
                         role = ROLE_ASSISTANT,
                         content = content.toString(),
                         reasoningContent = reasoning.toString().takeIf { it.isNotEmpty() },
+                        // 与标准非流式响应一致：完整调用不带流式拼接用的 index。
+                        toolCalls = toolCalls.build().map { it.copy(index = null) }.takeIf { it.isNotEmpty() },
                     ),
                     finishReason = finishReason,
                 ),
@@ -233,11 +237,6 @@ class XaiResponsesTransport private constructor(
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
     ): Request {
-        // 必须抛带标记的异常：普通 IllegalArgumentException 会落到上层按关键字收敛的
-        // 兜底映射上，而「订阅」二字会被误判成额度不足，把真正的原因盖掉。
-        if (!requestDto.tools.isNullOrEmpty()) {
-            throw XaiResponsesException("xAI 链路暂不支持工具调用，请在该供应商设置中关闭工具开关")
-        }
         // 发送凭据的最后一道关口自己校验，不依赖调用方自律：
         // 冻结器已经钉死地址，但本类是唯一附加 Authorization 的地方（AGENT.md §2）。
         val normalized = baseUrl.trim().trimEnd('/')
@@ -283,32 +282,87 @@ class XaiResponsesTransport private constructor(
 
     private fun toResponsesRequest(requestDto: OpenAiCompatibleChatRequest) = XaiResponsesRequest(
         model = requestDto.model,
-        input = requestDto.messages.map(::toInputItem),
+        input = requestDto.messages.flatMap(::toInputItems),
         maxOutputTokens = requestDto.maxTokens,
         reasoning = requestDto.reasoningEffort
             ?.takeIf { it.isNotBlank() }
             ?.let { XaiReasoningRequestDto(effort = it) },
+        // tool_choice 不翻译：抓包里从未出现，而不发送时模型照样调用工具（线上格式 §2）。
+        tools = requestDto.tools
+            ?.takeIf { it.isNotEmpty() }
+            ?.map { tool ->
+                XaiToolDto(
+                    name = tool.function.name,
+                    description = tool.function.description,
+                    parameters = tool.function.parameters,
+                )
+            },
     )
 
-    /** 三种实测形状见线上格式 §2.1；系统提示的角色是 `developer` 且内容为纯字符串。 */
-    private fun toInputItem(message: OpenAiCompatibleMessageDto): XaiInputItem {
+    /**
+     * 实测形状见线上格式 §2.1；系统提示的角色是 `developer` 且内容为纯字符串。
+     *
+     * 一条 OpenAI 兼容消息可能对应多个 item：带 tool_calls 的 assistant 拆成
+     * 「正文 message（有正文时）+ 每个调用一个 function_call」，顺序与抓包的回放一致（§2.1.1）。
+     */
+    private fun toInputItems(message: OpenAiCompatibleMessageDto): List<XaiInputItem> {
         val text = message.content.orEmpty()
         return when (message.role) {
-            ROLE_SYSTEM -> XaiInputItem(role = ROLE_DEVELOPER, content = JsonPrimitive(text))
+            ROLE_SYSTEM -> listOf(XaiInputItem(role = ROLE_DEVELOPER, content = JsonPrimitive(text)))
 
-            ROLE_ASSISTANT -> XaiInputItem(
-                type = "message",
-                role = ROLE_ASSISTANT,
-                content = jsonArrayOf(json.encodeToJsonElement(XaiOutputTextPart(text = text))),
+            ROLE_ASSISTANT -> {
+                val calls = message.toolCalls.orEmpty()
+                // 纯工具调用的 assistant 没有正文，发一个空 message 项没有依据，省掉；
+                // 不带调用的 assistant 保持 XAI-2 的形状不变。
+                val body = if (calls.isNotEmpty() && text.isBlank()) {
+                    emptyList()
+                } else {
+                    listOf(
+                        XaiInputItem(
+                            type = ITEM_TYPE_MESSAGE,
+                            role = ROLE_ASSISTANT,
+                            content = jsonArrayOf(json.encodeToJsonElement(XaiOutputTextPart(text = text))),
+                        ),
+                    )
+                }
+                body + calls.map(::toFunctionCallItem)
+            }
+
+            ROLE_TOOL -> listOf(
+                XaiInputItem(
+                    type = ITEM_TYPE_FUNCTION_CALL_OUTPUT,
+                    // 没有 call_id 就无法和调用配对，发出去只会让上游拒绝或模型误解。
+                    callId = message.toolCallId?.takeIf { it.isNotBlank() }
+                        ?: throw XaiResponsesException("工具结果缺少调用标识，无法发送给 xAI"),
+                    output = text,
+                ),
             )
 
             // user 以及任何其它角色都按用户输入发送：Responses 的 input 只认 developer /
-            // user / assistant，工具角色已在 buildRequest 处被拒。
-            else -> XaiInputItem(
-                role = ROLE_USER,
-                content = jsonArrayOf(json.encodeToJsonElement(XaiInputTextPart(text = text))),
+            // user / assistant 与上面的工具项。
+            else -> listOf(
+                XaiInputItem(
+                    role = ROLE_USER,
+                    content = jsonArrayOf(json.encodeToJsonElement(XaiInputTextPart(text = text))),
+                ),
             )
         }
+    }
+
+    /** 上层的 tool_call id 就是解析器交出的 `call_id`，原样带回（线上格式 §3.3）。 */
+    private fun toFunctionCallItem(call: OpenAiCompatibleToolCallDto): XaiInputItem {
+        val function = call.function
+        val callId = call.id?.takeIf { it.isNotBlank() }
+        val name = function?.name?.takeIf { it.isNotBlank() }
+        if (callId == null || function == null || name == null) {
+            throw XaiResponsesException("工具调用记录不完整，无法发送给 xAI")
+        }
+        return XaiInputItem(
+            type = ITEM_TYPE_FUNCTION_CALL,
+            callId = callId,
+            name = name,
+            arguments = function.arguments.orEmpty(),
+        )
     }
 
     private fun jsonArrayOf(vararg elements: JsonElement) = JsonArray(elements.toList())
@@ -362,6 +416,11 @@ class XaiResponsesTransport private constructor(
         private const val ROLE_DEVELOPER = "developer"
         private const val ROLE_ASSISTANT = "assistant"
         private const val ROLE_USER = "user"
+        private const val ROLE_TOOL = "tool"
+
+        private const val ITEM_TYPE_MESSAGE = "message"
+        private const val ITEM_TYPE_FUNCTION_CALL = "function_call"
+        private const val ITEM_TYPE_FUNCTION_CALL_OUTPUT = "function_call_output"
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 

@@ -5,6 +5,7 @@ import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 
 /**
  * xAI 订阅链路的 Responses 协议 DTO。
@@ -32,6 +33,22 @@ internal data class XaiResponsesRequest(
     val store: Boolean = false,
     @SerialName("max_output_tokens") val maxOutputTokens: Int? = null,
     val reasoning: XaiReasoningRequestDto? = null,
+    /** 为空时整个字段省略：不带工具的请求与 XAI-2 的请求体逐字节相同。 */
+    val tools: List<XaiToolDto>? = null,
+)
+
+/**
+ * 实测形状（线上格式 §2.2）：扁平的 `{type,name,description,parameters}`，
+ * 不是 chat/completions 那样把后三者包在 `function` 里。
+ */
+@Serializable
+internal data class XaiToolDto(
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val type: String = "function",
+    val name: String,
+    val description: String,
+    val parameters: JsonObject,
 )
 
 /** 实测形状：`{ "effort": "medium", "summary": "auto" }`。 */
@@ -44,19 +61,26 @@ internal data class XaiReasoningRequestDto(
 )
 
 /**
- * `input[]` 的三种实测形状（见线上格式 §2.1）：
+ * `input[]` 的五种实测形状（见线上格式 §2.1）：
  *
  * - 系统提示：`{"role":"developer","content":"纯字符串"}`——注意角色是 `developer` 而非 `system`
  * - 用户：`{"role":"user","content":[{"type":"input_text","text":…}]}`
  * - 助手：`{"type":"message","role":"assistant","content":[{"type":"output_text","text":…,"annotations":[]}]}`
+ * - 工具调用：`{"type":"function_call","call_id":…,"name":…,"arguments":"JSON 字符串"}`
+ * - 工具结果：`{"type":"function_call_output","call_id":…,"output":"纯字符串"}`
  *
- * 用一个可空字段的类覆盖三者，序列化时 `encodeDefaults = false` 会省掉所有 null。
+ * 用一个可空字段的类覆盖五者，序列化时 `explicitNulls = false` 会省掉所有 null。
+ * pi 回放 function_call 时还带 `id`（`fc_…`），上层没有保留它，因此不发（线上格式 §5.5）。
  */
 @Serializable
 internal data class XaiInputItem(
     val type: String? = null,
-    val role: String,
-    val content: JsonElement,
+    val role: String? = null,
+    val content: JsonElement? = null,
+    @SerialName("call_id") val callId: String? = null,
+    val name: String? = null,
+    val arguments: String? = null,
+    val output: String? = null,
 )
 
 @Serializable
@@ -90,6 +114,8 @@ internal data class XaiResponseEventDto(
     @SerialName("output_index") val outputIndex: Int? = null,
     val delta: String? = null,
     val text: String? = null,
+    /** `function_call_arguments.done` 的完整参数，比累积的 delta 权威（线上格式 §3.3）。 */
+    val arguments: String? = null,
     val item: XaiOutputItemDto? = null,
     val response: XaiResponseBodyDto? = null,
 )
@@ -100,6 +126,8 @@ internal data class XaiOutputItemDto(
     val type: String? = null,
     val name: String? = null,
     @SerialName("call_id") val callId: String? = null,
+    /** 只在 function_call 项上出现：added 时为空串，done 时是完整参数。 */
+    val arguments: String? = null,
 )
 
 @Serializable
@@ -129,6 +157,8 @@ internal object XaiResponsesEventNames {
     const val OUTPUT_ITEM_ADDED = "response.output_item.added"
     const val OUTPUT_ITEM_DONE = "response.output_item.done"
     const val OUTPUT_TEXT_DELTA = "response.output_text.delta"
+    const val FUNCTION_CALL_ARGUMENTS_DELTA = "response.function_call_arguments.delta"
+    const val FUNCTION_CALL_ARGUMENTS_DONE = "response.function_call_arguments.done"
     const val REASONING_SUMMARY_DELTA = "response.reasoning_summary_text.delta"
     const val COMPLETED = "response.completed"
 }

@@ -14,8 +14,12 @@
 | 第一轮 | pi 内置 `xai` | `https://api.x.ai/v1/responses` | 纯文本、思考、多轮 |
 | 第二轮 | `pi-xai-oauth` 的 `xai-auth` | `https://cli-chat-proxy.grok.com/v1/*` | 纯文本、思考、**工具调用**、models-v2、user、billing |
 
-**两条路径的请求体与 SSE 事件完全一致**，差别只在 host、请求头与 `Accept`。
-因此适配器的翻译逻辑对两者通用。
+两条路径的 SSE 事件一致；请求体只有系统提示的放法不同（见第 2 节，2026-09-23 更正），
+其余差别在 host、请求头与 `Accept`。因此适配器的翻译逻辑对两者通用。
+
+> **2026-09-23 复核**：为接入工具调用重读了第二轮原始抓包（005、006），发现第 1 版漏记了
+> 工具结果回传的形状，并把第一轮的两条观察误写成了两条路径的共同结论。
+> 本次更正的段落都标了日期；复核只提取字段结构，未读取对话正文。
 
 ## 1. 请求头
 
@@ -65,10 +69,14 @@ x-authenticateresponse: authenticate-response
 }
 ```
 
-- **`instructions` 字段未被使用。** 系统提示放在 `input[0]`，角色是 **`developer`**（不是 `system`），
-  `content` 是**纯字符串**。
+- **系统提示的两种放法（2026-09-23 更正）**：第一轮（`api.x.ai`）放在 `input[0]`，
+  角色是 **`developer`**（不是 `system`），`content` 是**纯字符串**；第二轮（订阅路径）
+  改用顶层 **`instructions`** 字段，`input[0]` 直接是用户消息。第 1 版写的「`instructions` 未使用」
+  只对第一轮成立。App 在订阅路径上用 `developer` 写法，2026-09-23 真机验收通过，
+  说明订阅路径**也接受** `developer` 写法。
 - `previous_response_id` **未发送**；多轮靠完整重发 `input`。
 - `prompt_cache_key` 用于前缀缓存。
+- `tool_choice`、`parallel_tool_calls` **两轮都未发送**，模型照样会调用工具（2026-09-23 复核）。
 
 ### 2.1 `input[]` item 形状
 
@@ -77,10 +85,35 @@ x-authenticateresponse: authenticate-response
 { "role": "user", "content": [ { "type": "input_text", "text": "你好" } ] }
 { "type": "message", "role": "assistant",
   "content": [ { "type": "output_text", "text": "……", "annotations": [] } ] }
+
+// 工具调用与结果回传（第二轮 005 / 006，2026-09-23 补记）
+{ "type": "function_call", "id": "fc_<uuid>_0", "call_id": "call-<uuid>-0",
+  "name": "list_dir", "arguments": "……JSON 字符串……" }
+{ "type": "function_call_output", "call_id": "call-<uuid>-0", "output": "……纯字符串……" }
 ```
 
-历史中**没有回传任何 reasoning item**——普通多轮不需要回传
-`reasoning.encrypted_content`。（含工具调用的同轮回传未采集。）
+pi 回放的 message 与 function_call 项还带 `status: "completed"` 与 `id`。
+
+**reasoning item 的回传（2026-09-23 更正）**：第 1 版写「历史中没有回传任何 reasoning item」，
+这不准确。两轮里 pi 都会把**自己产生的回合**连同 reasoning item（含 `encrypted_content`）一起回放：
+
+```jsonc
+{ "type": "reasoning", "id": "rs_<uuid>", "status": "completed",
+  "summary": [ { "type": "summary_text", "text": "…" } ], "encrypted_content": "…" }
+```
+
+同时，第一轮的历史里有两条 assistant 消息**没有配对的 reasoning item**，id 是客户端自编的
+`msg_pi_1` / `msg_pi_3`，上游照常接受。结合 App 从不回传 reasoning、普通多轮真机验收通过，
+可以确认的只有：**普通多轮不回传 reasoning item 是被接受的。**
+工具轮不回传是否被接受，见 5.5。
+
+### 2.1.1 工具轮的回放顺序（第二轮 006）
+
+一轮带工具的回复被回放为：`reasoning` → `message`（工具前言）→ 本轮全部 `function_call`
+→ 按调用顺序排列的全部 `function_call_output`。同一请求里连续两轮工具调用时，
+第二轮的这组 item 紧接在第一轮的 `function_call_output` 之后，中间**没有**用户消息。
+
+`call_id` 的序号在同一会话内跨轮递增（第二轮第一个调用是 `-3`），`fc_` id 的序号则每轮从 `_0` 重来。
 
 ### 2.2 `tools[]` 形状
 
@@ -161,6 +194,26 @@ response.completed
 - `function_call_arguments.delta` 的 `delta` 是 JSON 字符串片段；
   本次采集中一次就发完了，但**不能假设不分片**——`.done` 的 `arguments`
   才是权威的完整值，实现上应累积 delta 并以 `.done` 为准。
+
+工具调用三种事件的字段（004，2026-09-23 补记）：
+
+```jsonc
+// output_item.added：arguments 为空串，status 为 in_progress
+{ "type": "response.output_item.added", "output_index": 2,
+  "item": { "type": "function_call", "id": "fc_…_0", "call_id": "call-…-0",
+            "name": "list_dir", "arguments": "", "status": "in_progress" } }
+// function_call_arguments.done：带完整 arguments 与 name，没有 call_id
+{ "type": "response.function_call_arguments.done", "output_index": 2,
+  "item_id": "fc_…_0", "name": "list_dir", "arguments": "…" }
+// output_item.done：item 里是完整 arguments，status 为 completed
+{ "type": "response.output_item.done", "output_index": 2,
+  "item": { "type": "function_call", "id": "fc_…_0", "call_id": "call-…-0",
+            "name": "list_dir", "arguments": "…", "status": "completed" } }
+```
+
+以工具调用收尾的一轮，`response.completed` 的 `status` **仍是 `completed`**，
+`response.output[]` 的类型依次为 `reasoning`、`message`、`function_call` ×3。
+没有单独的「需要执行工具」终止状态。
 
 ### 3.4 未采集的事件
 
@@ -295,15 +348,25 @@ App 只需要 `email` 用于账号展示——而这一项 `id_token` 里已经�
 | --- | --- |
 | `temperature` | 不发送。构造了就记一条 warn 日志（只记字段名，不记取值） |
 | `top_p` | 同上 |
+| `tool_choice` | 不发送，也不记日志。两轮抓包都没有这个字段（第 2 节），而不发送时模型照样调用工具；上层恒为 `"auto"` |
 
-要支持必须先补采一轮带这些参数的请求，不得照 OpenAI Responses 的公开文档猜字段名。
-工具调用同理：结果回传的 input item 形状未采集，适配器直接拒绝携带 `tools` 的请求，
-设置页也不对 xAI 供应商显示工具开关。
+temperature / top_p 要支持必须先补采一轮带这些参数的请求，不得照 OpenAI Responses 的公开文档猜字段名。
 
-### 5.5 仍未采集
+工具调用本身**已支持**（2026-09-23，XAI-5）。第 1 版以「结果回传形状未采集」为由拒绝工具请求，
+复核后确认形状已在 2.1 中，拒绝已移除。
+
+### 5.5 仍未采集 / 未验证
 
 见 3.4：截断结束、失败/错误事件、主动取消断流、429、无终止事件的异常断流。
-另：含工具调用的同轮是否需要回传 `reasoning.encrypted_content` 仍未验证。
+
+工具轮回放有两处与 pi 的做法不同，抓包无法回答，只能真机验证（XAI-5 验收项）：
+
+1. **不回传 reasoning item。** App 的上层消息模型装不下 `encrypted_content`（计划 D7）。
+   普通多轮已确认可以不回传（2.1），工具轮未验证。
+2. **回放的 `function_call` 不带 `id`（`fc_…`）。** 上层只保留 `call_id`。
+   message 项不带 `id` 已确认可以（App 的普通多轮就是这样发的），function_call 项未验证。
+
+若真机被拒，按 `docs/XAI_OAUTH_PLAN.md` XAI-5 的方案 B 处理，而不是在上层开口子。
 
 ## 6. 采集资料
 
