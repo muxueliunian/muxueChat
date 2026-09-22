@@ -18,13 +18,15 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.muxuechat.presentation.chat.ChatScreen
 import com.muxuechat.presentation.chat.ChatViewModel
 import com.muxuechat.presentation.settings.SettingsScreen
+import com.muxuechat.presentation.settings.XaiAuthViewModel
 import com.muxuechat.presentation.theme.MuxueChatTheme
 
 private enum class Destination { Chat, Settings }
 
 @Composable
-fun MuxueChatApp(viewModel: ChatViewModel) {
+fun MuxueChatApp(viewModel: ChatViewModel, xaiAuthViewModel: XaiAuthViewModel) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val xaiAuthState by xaiAuthViewModel.uiState.collectAsStateWithLifecycle()
     val saveableStateHolder = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
     var destination by rememberSaveable { mutableStateOf(Destination.Chat) }
 
@@ -126,6 +128,11 @@ fun MuxueChatApp(viewModel: ChatViewModel) {
                         onSaveProviderKey = viewModel::saveProviderKey,
                         onClearProviderKey = viewModel::clearProviderKey,
                         onRefreshProviderModels = viewModel::refreshProviderModels,
+                        xaiAuthState = xaiAuthState,
+                        onXaiLogin = xaiAuthViewModel::startLogin,
+                        onXaiCancelLogin = xaiAuthViewModel::cancelLogin,
+                        onXaiSignOut = xaiAuthViewModel::signOut,
+                        onXaiBrowserUnavailable = xaiAuthViewModel::reportBrowserUnavailable,
                         onBack = { destination = Destination.Chat },
                     )
                 }

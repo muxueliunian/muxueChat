@@ -42,6 +42,11 @@ fun SettingsScreen(
     onSaveProviderKey: (providerId: String, apiKey: String) -> Unit,
     onClearProviderKey: (String) -> Unit,
     onRefreshProviderModels: (String) -> Unit,
+    xaiAuthState: XaiAuthUiState,
+    onXaiLogin: () -> Unit,
+    onXaiCancelLogin: () -> Unit,
+    onXaiSignOut: () -> Unit,
+    onXaiBrowserUnavailable: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     refreshErrors: Map<String, String> = emptyMap(),
@@ -182,6 +187,18 @@ fun SettingsScreen(
                             }
                         }
                     }
+                }
+                SettingsGroup(
+                    title = "xAI 订阅登录",
+                    summary = xaiAuthSummary(xaiAuthState.auth),
+                ) {
+                    XaiAuthSection(
+                        state = xaiAuthState,
+                        onLogin = onXaiLogin,
+                        onCancelLogin = onXaiCancelLogin,
+                        onSignOut = onXaiSignOut,
+                        onBrowserUnavailable = onXaiBrowserUnavailable,
+                    )
                 }
                 SettingsGroup(
                     title = "RP 辅助请求",
