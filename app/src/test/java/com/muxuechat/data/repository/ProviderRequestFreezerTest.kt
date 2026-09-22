@@ -61,7 +61,7 @@ class ProviderRequestFreezerTest {
         val normalized = deepSeekSettings().normalized()
         assertEquals(ChatProviderId.DEEPSEEK, selected)
         assertEquals(ChatProviderId.DEEPSEEK, snapshot.provider)
-        assertEquals("sk-deepseek", snapshot.apiKey)
+        assertEquals("sk-deepseek", snapshot.requireApiKey())
         assertTrue(snapshot.credential is ProviderCredential.ApiKey)
         assertEquals(normalized.activeBaseUrl, snapshot.baseUrl)
         assertEquals(normalized.activeModel, snapshot.model)
@@ -88,7 +88,7 @@ class ProviderRequestFreezerTest {
         val snapshot = freezer.freeze()
 
         assertEquals(ChatProviderId.CUSTOM_OPENAI, snapshot.provider)
-        assertEquals("sk-custom", snapshot.apiKey)
+        assertEquals("sk-custom", snapshot.requireApiKey())
         assertEquals("http://192.168.1.20:8317/v1", snapshot.baseUrl)
         assertEquals("gpt-x", snapshot.model)
         assertEquals("high", snapshot.reasoningEffort)
@@ -152,15 +152,17 @@ class ProviderRequestFreezerTest {
     }
 
     @Test
-    fun xaiSnapshot_isNeverUsableAsApiKey() = runBlocking {
+    fun xaiSnapshot_isNeverUsableAsDeepSeekApiKey() = runBlocking {
         val snapshot = ProviderRequestFreezer(
             FakeSettingsRepository(customSettings(xaiProvider), "sk-leftover"),
             RecordingTokenSource(token = XaiFixtures.ACCESS_TOKEN),
         ).freeze()
 
-        val error = runCatching { snapshot.apiKey }.exceptionOrNull()
+        // DeepSeek 协议只接受 API Key；OAuth 凭据走到那里就是路由错误，必须直接失败，
+        // 绝不能把 bearer token 当成 Key 发出去。OpenAI 兼容链路改由传输路由器按凭据分派。
+        val error = runCatching { snapshot.requireApiKey() }.exceptionOrNull()
 
-        assertTrue(error is XaiTransportUnavailableException)
+        assertTrue(error is IllegalStateException)
         assertFalse(error!!.message.orEmpty().contains(XaiFixtures.ACCESS_TOKEN))
         assertFalse(snapshot.credential.toString().contains(XaiFixtures.ACCESS_TOKEN))
         assertFalse(snapshot.toString().contains(XaiFixtures.ACCESS_TOKEN))

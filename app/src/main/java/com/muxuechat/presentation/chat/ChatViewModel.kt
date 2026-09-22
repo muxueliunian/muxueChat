@@ -23,6 +23,7 @@ import com.muxuechat.data.repository.RpRepository
 import com.muxuechat.data.repository.RpRepositoryImpl
 import com.muxuechat.data.repository.SettingsRepository
 import com.muxuechat.data.repository.SettingsRepositoryImpl
+import com.muxuechat.data.remote.XaiResponsesTransport
 import com.muxuechat.data.repository.XaiAuthRepository
 import com.muxuechat.domain.model.ChatMessage
 import com.muxuechat.domain.model.ChatProviderId
@@ -1190,6 +1191,8 @@ class ChatViewModel(
                 // 模型列表与聊天走同一个 client 实例：共用连接池，且"停止生成"不会误伤模型拉取。
                 val openAiCompatibleClient = OpenAiCompatibleClient()
                 val deepSeekApiClient = DeepSeekApiClient()
+                // 只建一个：cancelActiveRequest 依赖同一个实例追踪在途 Call。
+                val xaiResponsesTransport = XaiResponsesTransport()
                 val settingsRepository = SettingsRepositoryImpl(
                     settingsDataStore = SettingsDataStore(application),
                     apiKeyStore = EncryptedApiKeyStore(application),
@@ -1203,6 +1206,7 @@ class ChatViewModel(
                     settingsRepository = settingsRepository,
                     apiClient = deepSeekApiClient,
                     openAiCompatibleClient = openAiCompatibleClient,
+                    xaiResponsesTransport = xaiResponsesTransport,
                     // 必须与设置页的 XaiAuthViewModel 共用同一个单例：刷新的串行化依赖同一把锁。
                     xaiAccessTokens = XaiAuthRepository.getInstance(application),
                 )

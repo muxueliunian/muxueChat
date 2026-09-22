@@ -23,6 +23,7 @@ import com.muxuechat.data.remote.DeepSeekToolCallAccumulator
 import com.muxuechat.data.remote.DeepSeekToolCallDto
 import com.muxuechat.data.remote.SettingsToolCatalog
 import com.muxuechat.data.remote.XaiAuthException
+import com.muxuechat.data.remote.XaiResponsesTransport
 import com.muxuechat.domain.tool.SettingsTool
 import com.muxuechat.domain.tool.SettingsToolArgumentParser
 import com.muxuechat.domain.tool.SettingsToolDraft
@@ -89,7 +90,9 @@ class ChatRepositoryImpl(
     private val settingsRepository: SettingsRepository,
     private val apiClient: DeepSeekApiClient,
     /** 所有自定义供应商共用的 OpenAI 兼容聊天请求客户端。 */
-    private val openAiCompatibleClient: OpenAiCompatibleClient,
+    openAiCompatibleClient: OpenAiCompatibleClient,
+    /** xAI 订阅链路的 Responses 传输适配器；与上面那个客户端藏在同一个入口之后。 */
+    xaiResponsesTransport: XaiResponsesTransport,
     /** xAI 订阅登录的 token 来源；生产环境必须是 [XaiAuthRepository.getInstance]，刷新锁依赖该单例。 */
     xaiAccessTokens: XaiAccessTokenSource,
     private val promptComposer: PromptComposer = PromptComposer(),
@@ -103,6 +106,7 @@ class ChatRepositoryImpl(
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) : ChatRepository {
     private val providerRequestFreezer = ProviderRequestFreezer(settingsRepository, xaiAccessTokens)
+    private val chatTransport = ChatTransportRouter(openAiCompatibleClient, xaiResponsesTransport)
     private val generationSessions = GenerationSessionRegistry()
     private val enrichmentTasks = RpEnrichmentTaskRegistry()
 
@@ -575,11 +579,7 @@ class ChatRepositoryImpl(
 
     private suspend fun freezeProviderRequest(
         onProviderSelected: (ChatProviderId) -> Unit = {},
-    ): ProviderRequestSnapshot = providerRequestFreezer.freeze(onProviderSelected).also { snapshot ->
-        // XAI-2 接上 Responses 传输适配器前，OAuth 快照在预检阶段就停下：
-        // 用户消息已写入、尚未创建 assistant 行，失败会走与其它预检错误相同的落库路径。
-        if (snapshot.credential is ProviderCredential.OAuthBearer) throw XaiTransportUnavailableException()
-    }
+    ): ProviderRequestSnapshot = providerRequestFreezer.freeze(onProviderSelected)
 
     /**
      * 在请求开始前冻结所有会影响路由的值，避免生成过程中切换 Provider、端点、模型或 Key 后，
@@ -679,7 +679,7 @@ class ChatRepositoryImpl(
         rpTurnSnapshot: RpTurnSnapshot,
     ): Flow<ChatMessage> = flow {
         val settings = requestSnapshot.settings
-        val apiKey = requestSnapshot.apiKey
+        val apiKey = requestSnapshot.requireApiKey()
 
         // 自动压缩放在发请求之前：这样本轮就能用上压缩后的上下文，
         // 而不是先超预算发一次、下轮才生效。代价是跨过阈值的那一轮会多等一次摘要请求。
@@ -914,7 +914,7 @@ class ChatRepositoryImpl(
         rpTurnSnapshot: RpTurnSnapshot,
     ): Flow<ChatMessage> = flow {
         val settings = requestSnapshot.settings
-        val apiKey = requestSnapshot.apiKey
+        val credential = requestSnapshot.credential
         if (replacementPlan == null) {
             autoCompactIfNeeded(conversationId, requestSnapshot)
         }
@@ -986,8 +986,8 @@ class ChatRepositoryImpl(
                     val textAccumulator = requireNotNull(streamingAccumulator)
                     val toolCallAccumulator = OpenAiCompatibleToolCallAccumulator()
                     var receivedTerminalEvent = false
-                    openAiCompatibleClient.streamChat(
-                        apiKey = apiKey,
+                    chatTransport.streamChat(
+                        credential = credential,
                         baseUrl = requestSnapshot.baseUrl,
                         requestDto = request,
                     ).collect { event ->
@@ -1028,8 +1028,8 @@ class ChatRepositoryImpl(
                     responseContent = textAccumulator.snapshotSince(requireNotNull(roundCursor)).content
                     toolCalls = if (tools != null) toolCallAccumulator.build() else emptyList()
                 } else {
-                    val response = openAiCompatibleClient.completeChat(
-                        apiKey = apiKey,
+                    val response = chatTransport.completeChat(
+                        credential = credential,
                         baseUrl = requestSnapshot.baseUrl,
                         requestDto = request,
                     )
@@ -1366,7 +1366,7 @@ class ChatRepositoryImpl(
                         purpose = DeepSeekRequestFactory.Purpose.CONTEXT_SUMMARY,
                     )
                     apiClient.completeChat(
-                        requestSnapshot.apiKey,
+                        requestSnapshot.requireApiKey(),
                         requestSnapshot.baseUrl,
                         request,
                     ).choices.firstOrNull()?.message?.content.orEmpty().trim()
@@ -1381,8 +1381,8 @@ class ChatRepositoryImpl(
                         },
                         purpose = OpenAiCompatibleRequestFactory.Purpose.CONTEXT_SUMMARY,
                     )
-                    openAiCompatibleClient.completeChat(
-                        requestSnapshot.apiKey,
+                    chatTransport.completeChat(
+                        requestSnapshot.credential,
                         requestSnapshot.baseUrl,
                         request,
                     ).choices.firstOrNull()?.message?.content.orEmpty().trim()
@@ -2155,7 +2155,7 @@ class ChatRepositoryImpl(
                         modelOverride = auxiliaryModelOverride,
                     )
                     apiClient.completeChat(
-                        requestSnapshot.apiKey,
+                        requestSnapshot.requireApiKey(),
                         requestSnapshot.baseUrl,
                         request,
                     ).choices.firstOrNull()?.message?.content.orEmpty()
@@ -2171,8 +2171,8 @@ class ChatRepositoryImpl(
                         },
                         purpose = OpenAiCompatibleRequestFactory.Purpose.RP_METADATA,
                     )
-                    openAiCompatibleClient.completeChat(
-                        requestSnapshot.apiKey,
+                    chatTransport.completeChat(
+                        requestSnapshot.credential,
                         requestSnapshot.baseUrl,
                         request,
                     ).choices.firstOrNull()?.message?.content.orEmpty()
@@ -2221,7 +2221,7 @@ class ChatRepositoryImpl(
                         modelOverride = settings.rpAuxiliaryModel,
                     )
                     apiClient.completeChat(
-                        requestSnapshot.apiKey,
+                        requestSnapshot.requireApiKey(),
                         requestSnapshot.baseUrl,
                         request,
                     ).choices.firstOrNull()?.message?.content.orEmpty()
@@ -2236,8 +2236,8 @@ class ChatRepositoryImpl(
                         },
                         purpose = OpenAiCompatibleRequestFactory.Purpose.RP_STATE_UPDATE,
                     )
-                    openAiCompatibleClient.completeChat(
-                        requestSnapshot.apiKey,
+                    chatTransport.completeChat(
+                        requestSnapshot.credential,
                         requestSnapshot.baseUrl,
                         request,
                     ).choices.firstOrNull()?.message?.content.orEmpty()

@@ -45,13 +45,6 @@ internal class XaiProviderNotConfiguredException(providerName: String) :
     SafeUserFacingError
 
 /**
- * xAI 供应商已登录、快照也已冻结，但 Responses 传输适配器（XAI-2）尚未接入。
- */
-internal class XaiTransportUnavailableException :
-    IllegalStateException("xAI 订阅聊天尚未接入：当前版本只能登录，发送消息需等待后续版本。"),
-    SafeUserFacingError
-
-/**
  * 单轮请求的不可变路由快照。凭据只在内存中短暂保留，绝不进入日志、消息或持久化层。
  * 后台 RP 补写复用同一快照，避免用户切换设置后把同一轮请求拆到两个 Provider。
  */
@@ -68,16 +61,17 @@ internal class ProviderRequestSnapshot(
     val includeStreamUsage: Boolean = false,
 ) {
     /**
-     * DeepSeek 与 OpenAI 兼容客户端只接受 API Key。
+     * DeepSeek 协议只接受 API Key，因此只有 DeepSeek 链路可以调用本方法。
      *
-     * OAuth 快照在这里直接失败，而不是把 bearer token 当作 API Key 发给 `chat/completions`：
-     * xAI 订阅链路只说 Responses 协议，要等 XAI-2 的传输适配器接上。
+     * 写成方法而不是属性是刻意的：它**会失败**，而属性读起来像个普通字段。
+     * OAuth 凭据在这里直接报错，绝不把 bearer token 当作 API Key 发出去。
+     * OpenAI 兼容链路一律走 [ChatTransportRouter]，由它按凭据类型分派传输实现。
      */
-    val apiKey: String
-        get() = when (credential) {
-            is ProviderCredential.ApiKey -> credential.value
-            is ProviderCredential.OAuthBearer -> throw XaiTransportUnavailableException()
-        }
+    fun requireApiKey(): String = when (credential) {
+        is ProviderCredential.ApiKey -> credential.value
+        is ProviderCredential.OAuthBearer ->
+            error("DeepSeek 协议不接受 OAuth 凭据，这是一个路由错误")
+    }
 }
 
 /**
