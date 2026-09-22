@@ -45,7 +45,9 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 - DeepSeek API Key 本地保存。
 - DeepSeek `chat/completions` 请求可正常工作。
 - 流式输出可正常显示。
-- 支持 `deepseek-v4-flash` 与 `deepseek-v4-pro`。
+- 支持 `deepseek-flash`（默认，V4.1-Flash）与 `deepseek-v4-pro`。旧名 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`
+  由 `DeepSeekModelIdMigration`（DataStore 迁移，只执行一次）改写为 `deepseek-flash`；自定义供应商的模型 ID 不参与迁移。
+  图片输入尚未实现，计划见 `docs/MULTIMODAL_PLAN.md`。
 - 支持基础生成参数：
   - Base URL
   - model
@@ -117,7 +119,7 @@ com.muxuechat
 - `ChatRole`
 - `MessageStatus`
 - `ChatSettings`
-- `DeepSeekModel`
+- `DeepSeekModels`（DeepSeek 模型 ID 是开放字符串；该对象只持有默认值、内置兜底列表与已知模型元数据，不要再做成封闭枚举）
 - `ThinkingMode`
 - `ReasoningEffort`
 
@@ -167,6 +169,15 @@ POST /chat/completions
 
 - 当前默认模型不得使用已计划废弃的 `deepseek-chat` 或 `deepseek-reasoner`。
 - `stream=true` 必须实际出现在请求体中，不能被 `encodeDefaults=false` 省略。
+- （仅自定义 OpenAI 兼容供应商）`stream_options: {"include_usage": true}` 只在用户为该供应商显式开启「请求流式用量统计」后才发送，
+  **默认完全不发**。它是可选字段，只支持普通聊天的旧反代收到未知字段可能直接 400。
+  DeepSeek 请求不发送该字段：官方文档说明省略时 `usage` 仍会出现在流的最后一个 chunk。
+  与 `type`、`stream` 同理，`include_usage` 必须用 `@EncodeDefault(ALWAYS)` 强制序列化，
+  否则 `encodeDefaults=false` 会把它省成一个空的 `"stream_options":{}`，上游不会返回任何用量。
+- 响应里的 `usage` 只有正文聊天请求才可以消费并持久化。RP 元数据、状态兜底、上下文摘要
+  这些内部请求的用量绝不能覆盖会话的「上次实际用量」。
+- 不要在日志中输出 API Key 或完整用户消息。
+- 网络日志 tag 使用 `muxueChat.*` 前缀，方便 Logcat 筛选。
 
 #### thinking mode 请求语义
 
@@ -205,8 +216,17 @@ DeepSeek 官方文档明确：**`thinking` 的缺省值是 `enabled`**（默认 
 - `max_tokens` 必须经过 `ChatSettings.coerceMaxTokens()` 收敛，
   domain、DataStore、请求构造三层都要校验，不能只在 UI 限制。
 
-- 不要在日志中输出 API Key 或完整用户消息。
-- 网络日志 tag 使用 `muxueChat.*` 前缀，方便 Logcat 筛选。
+#### 上下文预算
+
+- 上下文占用一律按**模型真实 token 窗口**计算，口径集中在
+  `domain/context/ModelContextSpec.kt` 与 `domain/context/ChatContextPlanner.kt`。
+  不允许再引入任何写死的字符预算。
+- 一次请求的最终消息、UI 的占用百分比、硬裁剪与压缩判据都必须来自同一个
+  `ContextWindowPlan`。请求层只做 DTO 映射，不得自行拼装或二次裁剪。
+- 估算走 `HeuristicTokenEstimator`，不引入任何 tokenizer 依赖；结果在 UI 上必须标注为「预计」，
+  只有响应返回的 `usage` 才能称为真实用量。
+- 模型窗口的解析顺序固定为「用户逐模型覆盖 → 内置常量 → 32K 回退」，回退值必须在 UI 上明确警告，
+  不得伪装成供应商的真实能力。也不得按模型名猜测自定义供应商的窗口。
 
 ### 3.4 data.repository 层
 
@@ -382,6 +402,9 @@ Windows 下优先使用：
 - 文本阅读优先。
 - 少装饰。
 - 操作入口清晰但不喧宾夺主。
+- 间距、圆角与触控目标统一取自 `presentation/theme/Dimens.kt`（`Spacing`、`Corner`、`MinTouchTarget`），
+  不在组件里另写新数字；层次靠留白与分隔线表达，不给每块内容都套卡片。
+- 状态不能只靠颜色表达：选中、警告、禁用都要同时有文字、图标或边框，禁用控件要说明原因。
 
 聊天页：
 
@@ -390,6 +413,8 @@ Windows 下优先使用：
 - reasoning 内容默认折叠。
 - 错误消息直接显示在对应 assistant 消息位置。
 - 正在生成时必须可停止。
+- 自动滚动只在用户接近底部时跟随；用户在看历史时不得强行拉回，改为显示「回到底部 / 有新内容」。
+- 编辑类 Sheet 统一用 `EditorSheet` + `rememberGuardedDismiss`：有未保存草稿时，返回、点遮罩、取消都先确认。
 
 设置页：
 
@@ -400,12 +425,20 @@ Windows 下优先使用：
 - 供应商地址为 http 时，设置页必须显示明文风险提示。
 - 供应商的增删改在设置页完成；删除供应商必须二次确认，并同时清除其 Keystore 条目。
 - thinking mode、reasoning effort 及其采样参数提示仅适用于 DeepSeek；自定义供应商下不得误导性展示为可生效的 DeepSeek 专属配置。
+- 设置页按任务分组（服务与模型、RP 辅助请求、提示词与生成、思考与采样、上下文管理、外观），低频分组默认折叠，
+  折叠摘要写当前值；分组折叠或离页前必须 flush 未提交的文本草稿。
+- 清除已保存的 Key 必须二次确认。
+- 模型目录最多 2,000 项：不得在普通 `verticalScroll` 里急切组合完整目录或逐模型输入框，
+  统一用 `ModelListWindow`（当前项 + 已配置项 + 搜索命中的有限条）或 `LazyColumn`，截断时必须提示还有多少未显示。
 
 聊天页的模型选择：
 
-- 顶栏标题展示当前供应商与模型，点击后从底部弹出选择面板。
-- 面板按供应商分组，列出该供应商已知的可用模型；选中即同时切换供应商与模型。
+- 顶栏第一行是会话标题与操作，第二行是可点的「供应商 · 模型」选择器，长模型名只在第二行内省略。
+- 面板按供应商分组，用 `LazyColumn` + 搜索列出该供应商已知的可用模型；选中即同时切换供应商与模型。
 - 模型列表可在面板内触发刷新（`GET {base}/models`）；拉取失败只提示，不清空已缓存的列表。
+- 刷新在 ViewModel 中全局串行：任一列表刷新期间，所有刷新入口都要禁用并写明原因，不能点了没反应。
+- 模型标注文案统一出自 `presentation/common/ModelPresentation.kt` 的 `ModelNotes`，只认完整模型 ID，不按名字猜能力。
+  图片输入上线前，`deepseek-flash` 与视觉实验旧名必须标注「当前 App 仅支持文本输入，尚未支持图片。」
 - 不要展示 DeepSeek 已废弃的参数控件（presence penalty、frequency penalty）。
 
 ## 10. Agent 工作流

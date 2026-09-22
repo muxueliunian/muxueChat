@@ -9,7 +9,7 @@
 - DeepSeek API Key 本地保存。
 - DeepSeek `chat/completions` 请求可正常工作。
 - 流式输出可正常显示。
-- `deepseek-v4-flash` 与 `deepseek-v4-pro` 可用。
+- `deepseek-flash` 与 `deepseek-v4-pro` 可用（2026-09-16 起默认 `deepseek-flash`，旧 Flash 名自动迁移）。
 - 基础设置页可配置 Base URL、模型、system prompt、流式输出、max tokens、thinking mode、reasoning effort、采样参数。
 - 设置页支持"显示大小"档位（极紧凑 / 紧凑 / 默认 / 舒适），叠加在系统字体大小之上，仅缩放字号和行距。
 - 会话基础操作已接入：
@@ -54,6 +54,32 @@
 - 仍然禁止：App 内 OAuth、非 OpenAI 协议的私有适配、通用多 Provider SDK。
 
 详细设计与任务拆分见 `docs/CUSTOM_PROVIDER_PLAN.md`。
+
+## 前端 UI/UX 整体优化（2026-09-20 完成，已真机安装）
+
+- 设置页按任务重新分组并可折叠；Base URL 行内校验与明文 HTTP 提示；清除 Key、删除供应商均二次确认。
+- 修复上下文窗口设置一次组合上千个输入框的问题（`ModelListWindow`：当前项 + 已配置项 + 搜索）。
+- 模型选择面板改为 `LazyColumn` + 搜索，目录来源、上次成功刷新时间、刷新互斥说明在各分组一致。
+- 思考强度中文化（副文案保留 API 值）；思考关闭 / 开启时分别说明 reasoning_effort 与采样参数是否生效。
+- 顶栏改为两行；消息列表不再强制拉回底部，提供「回到底部 / 有新内容」；输入栏 IME 与导航栏取并集。
+- 编辑器 Sheet 离开前统一确认未保存草稿（点遮罩、返回不会先把 Sheet 隐藏）。
+- RP Marker 不可用文案不再误称「当前模型不是 DeepSeek V4」。
+- 真机（2026-09-20）已确认：键盘不遮挡输入框；编辑器放弃确认可弹出，且能回到编辑。
+- 未覆盖：TalkBack 实测、系统大字体 × App 显示比例叠加、深色模式对比度实测、androidTest 真机执行。
+
+## 多模态图片输入（2026-09-16 确认方向，MM-0 已实现，图片输入尚未实施）
+
+DeepSeek 于 2026-09-10 发布原生多模态的 `deepseek-flash`，用户确认 App 跟进支持图片输入：
+
+- 前置：已保存的旧 ID `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 自动迁移到 `deepseek-flash`（MM-0，2026-09-16 已实现，待真机验收）。
+- DeepSeek 与自定义 OpenAI 兼容供应商共用标准 `image_url` content part，不使用 DeepSeek Files API，不新增第三方依赖。
+- 图片能力不按模型名猜测：DeepSeek 按内置已知 ID，自定义供应商按模型手动开启。
+- 历史图片每轮重发（受上下文预算与 20 MiB 请求体安全上限约束）；本地压缩为长边 1568px、JPEG 85，每条消息最多 4 张。
+- 编辑历史用户消息时允许增删图片；允许只发图片、不写文字。
+- 分期：MM-0 模型 ID 迁移 → MM-1a 数据/请求/规划（含基本文件清理）→ MM-1b 发送 UI → MM-2 编辑图片与孤儿清理 → MM-3 体验打磨。
+- 计划已于 2026-09-16 经独立审查修订（重新生成丢图、提交后取消误删文件等问题已写入设计）。
+
+详细设计、边界、验收与风险见 `docs/MULTIMODAL_PLAN.md`。
 
 ## CLIProxyAPI 接入：三任务完成记录（历史）
 

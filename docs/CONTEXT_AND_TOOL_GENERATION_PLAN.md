@@ -209,3 +209,78 @@ PDF / DOCX / 图片 OCR / EPUB / 压缩包。
 
 多 Provider、Embedding/RAG/向量库、整篇文档常驻上下文、自动覆盖已有设定、
 OCR、云同步、为 PDF/DOCX 引入大型依赖、strict 模式所需的 base_url 切换。
+
+---
+
+## 8. 后续修订：上下文口径改为模型真实 token 窗口
+
+本节记录在上述阶段一~阶段四之后完成的一轮重构。**与前文冲突时以本节为准。**
+
+### 8.1 为什么改
+
+阶段一落地的 `ContextWindowPlanner` 用的是一个写死的字符预算
+（`ContextCompressionPolicy.DEFAULT_BUDGET_CHARS = 40_000`），由此产生四个问题：
+
+1. 40,000 字符在中文下约合 2.5~3 万 token，而 DeepSeek V4 的窗口是 1,000,000 token——
+   用户实际只用到模型能力的 3% 左右，自动压缩在约 2 万 token 处就触发。
+2. 预算只统计**历史消息**的字符数。system prompt、RP 规则、角色卡、世界观、文风、
+   状态栏契约和工具 schema 全部不进账，而这些恰恰是 RP 模式下最长的部分。
+3. UI 与请求各算一次：`refreshContextWindow()` 只在打开面板时调一次，
+   请求路径另有 `buildPromptContext()` 再 plan 一次并二次组装。
+4. 响应里的 `usage` 已经解析到 stream event 上，却从未被消费，用户看不到任何真实数据。
+
+### 8.2 新口径
+
+```text
+effectiveContextTokens = contextWindowTokens × 95%      // 客户端统一安全余量
+modelInputBudgetTokens = effectiveContextTokens − maxTokens
+inputBudgetTokens      = min(模型预算, 成本上限)          // 成本上限默认关闭
+usagePercent           = estimatedInputTokens / inputBudgetTokens
+```
+
+DeepSeek 默认：`1,000,000 → 950,000 → −4,096 → 945,904 tokens`。
+
+- 内置窗口：`ModelContextCatalog.DEEPSEEK_V4_CONTEXT_TOKENS`，设置页可逐模型覆盖。
+- 自定义供应商：逐模型手填；未配置回退 `32,768` 并在设置页与上下文面板显示黄色警告。
+  标准 `GET /models` 只保证返回 `id`，不解析任何厂商私有 context 字段。
+- **成本上限**（新增，默认关闭）：模型窗口到百万级后，真正的约束不是「装不装得下」，
+  而是每轮重发全量历史有多贵、首 token 有多慢。开启后预算取二者较小值。
+
+### 8.3 架构
+
+| 组件 | 职责 |
+|---|---|
+| `domain/context/ModelContextSpec.kt` | 模型容量解析（用户覆盖 → 内置 → 回退）与预算推导 |
+| `domain/context/HeuristicTokenEstimator.kt` | 无依赖的启发式 token 估算，统一上浮 10% 安全余量 |
+| `domain/context/ChatContextPlanner.kt` | 唯一的上下文规划入口，取代 `ContextWindowPlanner` |
+| `PromptComposer.composeStructured()` | 同时产出最终消息与各段落原文，供分项统计 |
+
+`ContextWindowPlan` 是唯一真相来源：`requestMessages` 就是要发出去的内容，
+`sections` 就是 UI 的构成区，`usagePercent` 就是压缩判据。三者不允许各算各的。
+
+工具轮的临时消息带 `tool_call_id` / `tool_calls`，塞不进 `PromptMessage`，因此
+**不进 `requestMessages`**，由请求层原样追加；但它们的占用通过 `ChatContextInput.toolExchange`
+计入预算，且每进入下一轮网络请求前都会重新规划。
+
+不可裁剪内容本身超预算时，`ContextWindowPlan.overflowError` 非 null，
+Repository 抛 `ContextOverflowException` 在**本地**失败，不去换一个服务端 400。
+
+### 8.4 API usage
+
+- Room v9 新增 `conversation_token_usage`（每会话一行，三个计数列可空，外键 CASCADE）。
+- 用量与 assistant 完成状态在同一事务提交；传 null 表示上游没给，保留上一份有效快照。
+- 只有正文请求成功完成才写入。失败、取消、RP 补写、摘要请求一律不写。
+- 工具多轮只保存**最后一次实际网络请求**的用量，不做跨轮累加。
+- 清空会话删除用量；**编辑历史不删**——那是一次真实发生过的请求，界面标注其模型与时间。
+- 流式下不少 OpenAI 兼容上游只有收到 `stream_options` 才返回 usage。该字段
+  **默认不发送**，由用户在供应商设置里显式开启（与 `toolCallingEnabled` 同款降级策略）。
+- DeepSeek 不发送 `stream_options`：官方文档说明省略该字段时，`usage` 仍会出现在流的最后一个 chunk 中
+  （[Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion)）。
+
+### 8.5 已作废的旧结论
+
+- `ContextCompressionPolicy.budgetChars` / `autoTriggerChars` / `targetChars` 已删除。
+- `ChatSettings.contextBudgetChars` 保留但标记 `@Deprecated`，仅为兼容旧 DataStore 数据，
+  **不参与任何显示、裁剪或压缩决策**。
+- 第 7 节验收项「上下文视窗显示的字符数与实际请求一致」改为
+  「上下文视窗显示的预计 token 与实际发送的 messages 来自同一份规划」。
