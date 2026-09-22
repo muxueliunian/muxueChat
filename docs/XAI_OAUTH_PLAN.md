@@ -1,6 +1,6 @@
 # muxueChat xAI OAuth 订阅链路实施计划
 
-状态：XAI-1a/1c/2 已通过真机验收；XAI-5（工具调用）实施中。阻塞关系见「进度记录」。
+状态：XAI-1a/1c/2/5 已通过真机验收。阻塞关系见「进度记录」。
 建立日期：2026-09-22
 最后更新：2026-09-23（第 2 版，已并入外部审查意见；新增 XAI-5）
 范围：App 内实现 xAI OAuth 登录，用**订阅额度**访问 Grok 模型
@@ -43,7 +43,7 @@
 | XAI-1b loopback 路径 | 未开始 | — |
 | XAI-1c 凭据契约接入（第 4 节） | **完成**（commit 8d90101），真机验过登录/登出/刷新 | — |
 | XAI-2 适配器 | **已通过真机验收**（2026-09-23，用户确认） | — |
-| XAI-5 工具调用 | **实施中**（2026-09-23 开工，分支 `xai-tool-calling`），见第 7 节 XAI-5 | — |
+| XAI-5 工具调用 | **已通过真机验收**（2026-09-23，commit d1a5c10，方案 A 被上游接受） | — |
 | XAI-4 额度显示 | 未开始 | XAI-2 |
 | XAI-4 附带：`/v1/models-v2` 拉模型与 500K 窗口 | 未开始。`refreshProviderModels` 的 CAS 校验依赖 `expectedApiKey`，OAuth 没有 Key，需要先改那套并发保护 | XAI-2 |
 
@@ -459,7 +459,7 @@ refresh token 原子轮换、登出竞态处理、凭据加密存储与备份排
 另需一件实现工作：RP Marker 是 DeepSeek 专属，xAI 下不可用，需在
 `presentation/chat/RpMarkerAvailability.kt` 的文案中如实说明。
 
-### [ ] XAI-5：工具调用（2026-09-23 新增）
+### [x] XAI-5：工具调用（2026-09-23 新增）
 
 XAI-2 以「工具结果回传形状未采集」为由拒绝带 `tools` 的请求。2026-09-23 复核第二轮原始抓包，
 确认形状其实已采到（`docs/XAI_WIRE_FORMAT.md` 2.1、2.1.1、3.3 已补记），因此单独开这一期。
@@ -484,7 +484,7 @@ XAI-2 以「工具结果回传形状未采集」为由拒绝带 `tools` 的请�
 **方案 A（本期实现）**：回放时不带 reasoning item，`function_call` 不带 `fc_` id。
 依据见线上格式 2.1 与 5.5。
 
-**方案 B（仅当真机拒绝方案 A 时实施）**：适配器内部维护一张有上限的内存表，
+**方案 B（仅当真机拒绝方案 A 时实施；2026-09-23 真机接受方案 A，未实施）**：适配器内部维护一张有上限的内存表，
 以 `call_id` 为键记住本轮的 `fc_` id 与 reasoning item，回放时补上；
 需要 reasoning 时请求补 `include: ["reasoning.encrypted_content"]`。
 该表不外泄到 Repository 及以上，进程重启后丢失即退回方案 A 的形状。
