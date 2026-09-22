@@ -10,8 +10,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -32,6 +33,8 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,25 +56,29 @@ fun MessageInputBar(
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
     attachment: PendingAttachment? = null,
+    isImportingAttachment: Boolean = false,
     canAttach: Boolean = false,
     onAttach: () -> Unit = {},
     onRemoveAttachment: () -> Unit = {},
 ) {
     // 带附件时即使正文为空也允许发送——附件本身就是内容。
-    val canSend = (value.text.isNotBlank() || attachment != null) && !isGenerating
+    val canSend = (value.text.isNotBlank() || attachment != null) && !isGenerating && !isImportingAttachment
     Surface(
         color = MaterialTheme.colorScheme.background,
         contentColor = MaterialTheme.colorScheme.onBackground,
-        modifier = modifier
-            .fillMaxWidth()
-            .imePadding(),
+        modifier = modifier.fillMaxWidth(),
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.navigationBars)
+                // 键盘弹出时 IME 高度已经覆盖导航栏；两个 padding 分别加会多出一段空白，
+                // 收起时又只剩导航栏。union 让两种状态都恰好留出应有的高度。
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .padding(horizontal = 12.dp, vertical = 10.dp),
         ) {
+            if (isImportingAttachment) {
+                Text("正在提取文档文字，完成后即可发送…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(bottom = 8.dp))
+            }
             attachment?.let { pending ->
                 AttachmentChip(attachment = pending, onRemove = onRemoveAttachment)
             }
@@ -80,23 +87,24 @@ fun MessageInputBar(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(22.dp))
+                    .clip(com.muxuechat.presentation.theme.Corner.Container)
                     .background(MaterialTheme.colorScheme.surface)
                     .border(
                         width = 1.dp,
                         color = MaterialTheme.colorScheme.outlineVariant,
-                        shape = RoundedCornerShape(22.dp),
+                        shape = com.muxuechat.presentation.theme.Corner.Container,
                     )
                     .padding(start = 6.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
             ) {
                 if (canAttach) {
                     IconButton(
                         onClick = onAttach,
-                        modifier = Modifier.size(44.dp),
+                        enabled = !isGenerating && !isImportingAttachment,
+                        modifier = Modifier.size(com.muxuechat.presentation.theme.MinTouchTarget),
                     ) {
                         Icon(
                             imageVector = Icons.Outlined.AttachFile,
-                            contentDescription = "附加资料",
+                            contentDescription = if (isImportingAttachment) "正在提取文档文字" else if (isGenerating) "附加文本文档，生成期间不可用" else "附加文本文档，仅提取文字，不支持图片",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -108,12 +116,15 @@ fun MessageInputBar(
                     onValueChange = onValueChange,
                     modifier = Modifier
                         .weight(1f)
+                        .semantics { contentDescription = "消息正文" }
                         .heightIn(min = 40.dp, max = 180.dp)
                         .padding(vertical = 10.dp),
                 )
                 SendOrStopButton(
                     isGenerating = isGenerating,
                     canSend = canSend,
+                    isImportingAttachment = isImportingAttachment,
+                    hasContent = value.text.isNotBlank() || attachment != null,
                     onSend = onSend,
                     onStop = onStop,
                 )
@@ -209,13 +220,17 @@ private fun MessageTextField(
 private fun SendOrStopButton(
     isGenerating: Boolean,
     canSend: Boolean,
+    isImportingAttachment: Boolean,
+    hasContent: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
 ) {
     if (isGenerating) {
         IconButton(
             onClick = onStop,
-            modifier = Modifier.size(44.dp),
+            modifier = Modifier
+                .size(com.muxuechat.presentation.theme.MinTouchTarget)
+                .clip(CircleShape),
             colors = IconButtonDefaults.iconButtonColors(
                 containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                 contentColor = MaterialTheme.colorScheme.onSurface,
@@ -231,7 +246,7 @@ private fun SendOrStopButton(
             onClick = onSend,
             enabled = canSend,
             modifier = Modifier
-                .size(44.dp)
+                .size(com.muxuechat.presentation.theme.MinTouchTarget)
                 .clip(CircleShape),
             colors = IconButtonDefaults.iconButtonColors(
                 containerColor = if (canSend) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -242,7 +257,8 @@ private fun SendOrStopButton(
         ) {
             Icon(
                 imageVector = Icons.AutoMirrored.Outlined.Send,
-                contentDescription = "发送",
+                // 禁用时也要说明原因，否则 TalkBack 只会读出一个读不出所以然的「发送」。
+                contentDescription = if (isImportingAttachment) "发送不可用，正在提取文档文字" else if (hasContent) "发送" else "发送，当前不可用：还没有输入内容",
             )
         }
     }

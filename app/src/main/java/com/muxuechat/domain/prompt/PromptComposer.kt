@@ -1,6 +1,8 @@
 package com.muxuechat.domain.prompt
 
+import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
+import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RpMarkerMode
@@ -30,6 +32,30 @@ data class PromptContext(
     val settingsToolsAvailable: Boolean = false,
 )
 
+/**
+ * 一次组合的结果：最终消息列表 + 各段落原文。
+ *
+ * 段落原文是给上下文规划器做 token 分项统计用的。之前 UI 只能统计历史字符数，
+ * system prompt、RP 规则、角色卡、世界观、文风、状态栏契约这些**最长的部分**完全不进账，
+ * 于是「占用 12%」这种数字与真实请求毫无关系。
+ *
+ * 这里刻意返回原文而不是 token 数：分词口径属于 domain/context 的职责，
+ * PromptComposer 只负责「发什么」，不负责「多大」。
+ */
+data class ComposedPrompt(
+    val messages: List<PromptMessage>,
+    /** 用户自己写的 system prompt，原样直送的那一段。 */
+    val userSystemPrompt: String,
+    /** 工具可用性说明（不含工具 JSON schema，schema 由请求层持有）。 */
+    val toolInstructions: String,
+    /** RP 规则 + 角色卡 + 世界观 + 文风 + 主角档案 + 状态栏契约。 */
+    val rpInstructions: String,
+    /** 附加到最后一条 user 消息末尾的本轮易变状态。 */
+    val volatileState: String,
+    /** 附加到第一条 user 消息的 DeepSeek RP Marker；不适用时为空串。 */
+    val deepSeekRpMarker: String,
+)
+
 data class RpMetadataPromptContext(
     val rpSettings: ConversationRpSettings?,
     val roleCard: RoleCard,
@@ -48,15 +74,46 @@ class PromptComposer {
         addAll(context.history)
     }
 
-    fun composeForDeepSeekRequest(context: PromptContext): List<PromptMessage> =
-        appendVolatileStateIfNeeded(
-            messages = appendDeepSeekRpMarkerIfNeeded(
-                messages = compose(context),
-                settings = context.settings,
-                rpSettings = context.rpSettings,
-            ),
-            context = context,
+    /**
+     * 唯一的组合实现，同时产出最终消息与各段落原文。
+     *
+     * [protocol] 决定是否注入 DeepSeek 专属的 RP Marker——协议边界只有两条，
+     * 不按供应商名称分叉。
+     */
+    fun composeStructured(context: PromptContext, protocol: ChatProviderId): ComposedPrompt {
+        val parts = buildSystemPromptParts(context)
+        val base = buildList {
+            if (parts.joined.isNotBlank()) {
+                add(PromptMessage(role = "system", content = parts.joined))
+            }
+            addAll(context.history)
+        }
+
+        val marker = when (protocol) {
+            ChatProviderId.DEEPSEEK -> resolveDeepSeekRpMarker(context.settings, context.rpSettings)
+            ChatProviderId.CUSTOM_OPENAI -> ""
+        }
+        val withMarker = if (marker.isBlank()) base else appendToFirstUser(base, marker)
+
+        val volatileState = resolveVolatileState(context)
+        val messages = if (volatileState.isBlank()) {
+            withMarker
+        } else {
+            appendToLastUser(withMarker, volatileState)
+        }
+
+        return ComposedPrompt(
+            messages = messages,
+            userSystemPrompt = parts.userSystemPrompt,
+            toolInstructions = parts.toolInstructions,
+            rpInstructions = parts.rpInstructions,
+            volatileState = volatileState,
+            deepSeekRpMarker = marker,
         )
+    }
+
+    fun composeForDeepSeekRequest(context: PromptContext): List<PromptMessage> =
+        composeStructured(context, ChatProviderId.DEEPSEEK).messages
 
     /**
      * 为自定义 OpenAI 兼容供应商的普通聊天请求组合消息。
@@ -66,12 +123,8 @@ class PromptComposer {
      * 端点支持时挂载，并保留相应的使用说明。RP 的稳定系统提示词与本轮易变状态仍需
      * 保留，避免同一会话切换 Provider 后丢失正常对话/RP 语义。
      */
-    fun composeForOpenAiCompatibleRequest(context: PromptContext): List<PromptMessage> {
-        return appendVolatileStateIfNeeded(
-            messages = compose(context),
-            context = context,
-        )
-    }
+    fun composeForOpenAiCompatibleRequest(context: PromptContext): List<PromptMessage> =
+        composeStructured(context, ChatProviderId.CUSTOM_OPENAI).messages
 
     /**
      * 把每轮都会变的「当前状态」附加到最后一条 user 消息末尾。
@@ -88,10 +141,18 @@ class PromptComposer {
         messages: List<PromptMessage>,
         context: PromptContext,
     ): List<PromptMessage> {
-        if (context.rpSettings?.isRpEnabled != true) return messages
-        val volatileState = buildVolatileStateSection(context)
+        val volatileState = resolveVolatileState(context)
         if (volatileState.isBlank()) return messages
+        return appendToLastUser(messages, volatileState)
+    }
 
+    /** RP 关闭或没有状态面板时返回空串。规划器据此把这段计入 token 估算。 */
+    internal fun resolveVolatileState(context: PromptContext): String {
+        if (context.rpSettings?.isRpEnabled != true) return ""
+        return buildVolatileStateSection(context)
+    }
+
+    private fun appendToLastUser(messages: List<PromptMessage>, section: String): List<PromptMessage> {
         val lastUserIndex = messages.indexOfLast { it.role.equals("user", ignoreCase = true) }
         if (lastUserIndex < 0) return messages
 
@@ -99,7 +160,21 @@ class PromptComposer {
             if (index != lastUserIndex) {
                 message
             } else {
-                message.copy(content = message.content.trimEnd() + "\n\n" + volatileState)
+                message.copy(content = message.content.trimEnd() + "\n\n" + section)
+            }
+        }
+    }
+
+    private fun appendToFirstUser(messages: List<PromptMessage>, section: String): List<PromptMessage> {
+        val firstUserIndex = messages.indexOfFirst { it.role.equals("user", ignoreCase = true) }
+        if (firstUserIndex < 0) return messages
+
+        return messages.mapIndexed { index, message ->
+            if (index != firstUserIndex) {
+                message
+            } else {
+                val separator = if (message.content.endsWith("\n")) "\n" else "\n\n"
+                message.copy(content = message.content + separator + section)
             }
         }
     }
@@ -142,37 +217,31 @@ class PromptComposer {
         isRpEnabled &&
             thinkingModeEnabled &&
             rpMarkerMode != RpMarkerMode.DISABLED &&
-            modelApiName.isDeepSeekV4ApiName()
+            DeepSeekModels.supportsRpMarker(modelApiName)
 
     internal fun appendDeepSeekRpMarkerIfNeeded(
         messages: List<PromptMessage>,
         settings: ChatSettings,
         rpSettings: ConversationRpSettings?,
     ): List<PromptMessage> {
+        val marker = resolveDeepSeekRpMarker(settings, rpSettings)
+        if (marker.isBlank()) return messages
+        return appendToFirstUser(messages, marker)
+    }
+
+    /** 不该注入时返回空串；规划器据此把 Marker 计入 token 估算。 */
+    internal fun resolveDeepSeekRpMarker(
+        settings: ChatSettings,
+        rpSettings: ConversationRpSettings?,
+    ): String {
         val markerMode = rpSettings?.rpMarkerMode ?: RpMarkerMode.DISABLED
-        if (
-            !shouldInjectDeepSeekRpMarker(
-                modelApiName = settings.model.apiName,
-                thinkingModeEnabled = settings.thinkingMode == ThinkingMode.ENABLED,
-                isRpEnabled = rpSettings?.isRpEnabled == true,
-                rpMarkerMode = markerMode,
-            )
-        ) {
-            return messages
-        }
-
-        val firstUserIndex = messages.indexOfFirst { it.role.equals("user", ignoreCase = true) }
-        if (firstUserIndex < 0) return messages
-
-        val marker = buildDeepSeekRpMarker(markerMode)
-        return messages.mapIndexed { index, message ->
-            if (index != firstUserIndex) {
-                message
-            } else {
-                val separator = if (message.content.endsWith("\n")) "\n" else "\n\n"
-                message.copy(content = message.content + separator + marker)
-            }
-        }
+        val shouldInject = shouldInjectDeepSeekRpMarker(
+            modelApiName = settings.model,
+            thinkingModeEnabled = settings.thinkingMode == ThinkingMode.ENABLED,
+            isRpEnabled = rpSettings?.isRpEnabled == true,
+            rpMarkerMode = markerMode,
+        )
+        return if (shouldInject) buildDeepSeekRpMarker(markerMode) else ""
     }
 
     /**
@@ -187,24 +256,41 @@ class PromptComposer {
      * 声明优先级要靠 App 自己的章节让位（见 [DEFERENCE_NOTICE]），
      * 元描述只能写在 App 自己的段落里，绝不能包住用户的文字。
      */
-    private fun buildSystemPrompt(context: PromptContext): String {
-        val sections = mutableListOf<String>()
+    private fun buildSystemPrompt(context: PromptContext): String =
+        buildSystemPromptParts(context).joined
 
+    /**
+     * system prompt 的三个段落，既用于拼接也用于分项 token 统计。
+     *
+     * 顺序不能改：用户提示词永远排最前且原样直送，App 自己的段落靠 [DEFERENCE_NOTICE] 让位。
+     */
+    internal data class SystemPromptParts(
+        val userSystemPrompt: String,
+        val toolInstructions: String,
+        val rpInstructions: String,
+    ) {
+        val joined: String
+            get() = listOf(userSystemPrompt, toolInstructions, rpInstructions)
+                .filter { it.isNotBlank() }
+                .joinToString(separator = "\n\n")
+    }
+
+    internal fun buildSystemPromptParts(context: PromptContext): SystemPromptParts {
         val baseSystemPrompt = context.settings.systemPrompt.trim()
         val hasUserPrompt = baseSystemPrompt.isNotBlank()
-        if (hasUserPrompt) {
-            sections += baseSystemPrompt
-        }
-
-        if (context.settingsToolsAvailable) {
-            sections += buildSettingsToolInstructions(hasUserPrompt)
-        }
-
-        if (context.rpSettings?.isRpEnabled == true) {
-            sections += buildRpInstructions(context)
-        }
-
-        return sections.joinToString(separator = "\n\n")
+        return SystemPromptParts(
+            userSystemPrompt = baseSystemPrompt,
+            toolInstructions = if (context.settingsToolsAvailable) {
+                buildSettingsToolInstructions(hasUserPrompt)
+            } else {
+                ""
+            },
+            rpInstructions = if (context.rpSettings?.isRpEnabled == true) {
+                buildRpInstructions(context)
+            } else {
+                ""
+            },
+        )
     }
 
     /**
@@ -507,9 +593,6 @@ class PromptComposer {
                 </muxue_rp_marker>
             """.trimIndent()
         }
-
-    private fun String.isDeepSeekV4ApiName(): Boolean =
-        trim().startsWith(prefix = "deepseek-v4", ignoreCase = true)
 
     /**
      * 截取尾部而非开头。情绪转折和状态变化通常发生在一段剧情的后半段，

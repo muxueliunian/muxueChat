@@ -1,6 +1,7 @@
 package com.muxuechat.presentation.chat
 
 import com.muxuechat.domain.model.ChatSettings
+import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.ThinkingMode
 
 internal data class RpMarkerAvailability(
@@ -16,21 +17,25 @@ internal fun ChatSettings.rpMarkerAvailability(): RpMarkerAvailability {
         )
     }
 
-    val isDeepSeekV4 = model.apiName.startsWith("deepseek-v4", ignoreCase = true)
+    val supportsRpMarker = DeepSeekModels.supportsRpMarker(model)
     val isThinkingEnabled = thinkingMode == ThinkingMode.ENABLED
 
     return when {
-        isDeepSeekV4 && isThinkingEnabled -> RpMarkerAvailability(
+        supportsRpMarker && isThinkingEnabled -> RpMarkerAvailability(
             isAvailable = true,
             unavailableReason = null,
         )
-        !isDeepSeekV4 -> RpMarkerAvailability(
+        // 视觉实验旧名没有被验证过 Marker，不能因此说「当前模型不是 V4」。
+        // 未知的新 ID 也一样：App 不按名字猜测能力，只如实说明它不在已验证名单里。
+        !supportsRpMarker -> RpMarkerAvailability(
             isAvailable = false,
-            unavailableReason = "仅 DeepSeek V4 且思考模式开启时可用。当前模型不是 DeepSeek V4。",
+            unavailableReason = "当前模型「$model」未验证 DeepSeek Marker，暂不支持。" +
+                "已验证的是 ${DeepSeekModels.FLASH} 与 ${DeepSeekModels.V4_PRO}，且需要开启思考模式。",
         )
         else -> RpMarkerAvailability(
             isAvailable = false,
-            unavailableReason = "仅 DeepSeek V4 且思考模式开启时可用。请先在设置中开启思考模式。",
+            unavailableReason = "当前模型支持 DeepSeek Marker，但需要开启思考模式。" +
+                "请先到「设置 → 思考与采样」打开思考模式。",
         )
     }
 }

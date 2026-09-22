@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,8 +39,6 @@ fun SettingsSection(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .background(MaterialTheme.colorScheme.surface)
                 .padding(vertical = 6.dp),
         ) {
             content()
@@ -82,7 +82,7 @@ fun SettingsRow(
             }
         }
         if (trailing != null) {
-            Box(modifier = Modifier.padding(start = 12.dp)) {
+            Box(modifier = Modifier.padding(start = 12.dp).semantics(mergeDescendants = true) { contentDescription = "$title，${subtitle.orEmpty()}" }) {
                 trailing()
             }
         }

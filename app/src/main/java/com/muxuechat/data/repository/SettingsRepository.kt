@@ -9,7 +9,20 @@ interface SettingsRepository {
     val settings: Flow<ChatSettings>
     val displaySettings: Flow<DisplaySettings>
 
-    suspend fun updateSettings(settings: ChatSettings)
+    /** 等待已排队的设置写入完成后返回一致快照，发送请求前应使用它。 */
+    suspend fun currentSettings(): ChatSettings
+
+    /**
+     * 在同一临界区内读取当前路由设置与对应 API Key，并立即交给 [transform] 冻结请求。
+     *
+     * 不返回含 Key 的通用 data class，避免它被意外 `toString()` 到日志；[transform] 也不得
+     * 把 Key 写入日志、Room 或 DataStore。实现必须阻止设置或 Key 修改插入两次读取之间。
+     */
+    suspend fun <T> withCurrentProviderCredentials(
+        transform: (settings: ChatSettings, apiKey: String?) -> T,
+    ): T
+    /** 基于持久化层最新值原子修改，避免并发字段更新互相覆盖。 */
+    suspend fun updateSettings(transform: (ChatSettings) -> ChatSettings)
     suspend fun updateDisplaySettings(settings: DisplaySettings)
 
     /** DeepSeek API Key。 */
@@ -28,6 +41,12 @@ interface SettingsRepository {
     /** 新增或更新一个供应商；新增时自动设为当前选中。 */
     suspend fun upsertCustomProvider(provider: CustomProvider)
 
+    /** 基于最新供应商记录原子修改单个供应商，模型刷新与字段编辑不会互相覆盖。 */
+    suspend fun updateCustomProvider(
+        providerId: String,
+        transform: (CustomProvider) -> CustomProvider,
+    )
+
     /** 删除供应商，并同时清除其 Keystore 条目。 */
     suspend fun deleteCustomProvider(providerId: String)
 
@@ -41,6 +60,14 @@ interface SettingsRepository {
      * 此时已缓存的列表保持不变。
      */
     suspend fun refreshProviderModels(providerId: String): List<String>
+
+    /**
+     * 用 DeepSeek 自己的 Base URL 与 API Key 请求 `GET /models` 并缓存结果。
+     *
+     * 失败、空列表或解析错误时保留旧缓存，且不会改掉当前选中的模型。
+     * 刷新途中若 Base URL 或 Key 已变化，旧请求结果不会写回新配置。
+     */
+    suspend fun refreshDeepSeekModels(): List<String>
 
     /** 把一般化改造前写死的 CLIProxyAPI 配置迁移成普通供应商记录；只执行一次。 */
     suspend fun migrateLegacyProviderIfNeeded()

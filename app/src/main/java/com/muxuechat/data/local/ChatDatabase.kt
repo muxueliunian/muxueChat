@@ -18,8 +18,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         MessageRpMetadataEntity::class,
         WritingStyleProfileEntity::class,
         ConversationContextEntity::class,
+        ConversationTokenUsageEntity::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -42,9 +43,46 @@ abstract class ChatDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_5_6)
                     .addMigrations(MIGRATION_6_7)
                     .addMigrations(MIGRATION_7_8)
+                    .addMigrations(MIGRATION_8_9)
+                    .addCallback(STARTUP_GENERATION_RECOVERY_CALLBACK)
                     .build()
                     .also { instance = it }
             }
+
+        /**
+         * Room 单例首次打开数据库时执行一次进程恢复。
+         *
+         * history-replacement 行还不是正式历史，必须删除而不是保留为 CANCELLED；普通生成行则
+         * 转成可见的取消态。两步处于同一 SQLite 事务，启动期间不会暴露半恢复状态。
+         */
+        internal val STARTUP_GENERATION_RECOVERY_CALLBACK = object : RoomDatabase.Callback() {
+            override fun onOpen(db: SupportSQLiteDatabase) {
+                super.onOpen(db)
+                val recoveredAtMillis = System.currentTimeMillis()
+                db.beginTransaction()
+                try {
+                    db.execSQL(
+                        """
+                        DELETE FROM `messages`
+                        WHERE `id` LIKE 'history-replacement:%'
+                            AND `status` != 'COMPLETED'
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        """
+                        UPDATE `messages`
+                        SET `status` = 'CANCELLED', `errorMessage` = NULL, `updatedAtMillis` = ?
+                        WHERE `id` NOT LIKE 'history-replacement:%'
+                            AND `status` IN ('PENDING', 'STREAMING')
+                        """.trimIndent(),
+                        arrayOf(recoveredAtMillis),
+                    )
+                    db.setTransactionSuccessful()
+                } finally {
+                    db.endTransaction()
+                }
+            }
+        }
 
         private val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -251,6 +289,34 @@ abstract class ChatDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_conversation_rp_settings_writingStyleId` " +
                         "ON `conversation_rp_settings` (`writingStyleId`)",
+                )
+            }
+        }
+
+        /**
+         * v9：保存每个会话最近一次正文请求的真实 token 用量。
+         *
+         * 只是新建一张侧表，不动任何既有表，因此不需要 v8 那样的整表重建。
+         * 外键 CASCADE 保证删除会话时用量自动消失。
+         */
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `conversation_token_usage` (
+                        `conversationId` TEXT NOT NULL,
+                        `providerKey` TEXT NOT NULL,
+                        `model` TEXT NOT NULL,
+                        `promptTokens` INTEGER,
+                        `completionTokens` INTEGER,
+                        `totalTokens` INTEGER,
+                        `effectiveContextTokens` INTEGER NOT NULL,
+                        `capturedAtMillis` INTEGER NOT NULL,
+                        PRIMARY KEY(`conversationId`),
+                        FOREIGN KEY(`conversationId`) REFERENCES `conversations`(`id`)
+                            ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
                 )
             }
         }

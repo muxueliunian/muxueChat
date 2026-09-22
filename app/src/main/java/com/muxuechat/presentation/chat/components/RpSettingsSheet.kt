@@ -42,6 +42,8 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import com.muxuechat.presentation.common.components.EditorSheet
+import com.muxuechat.presentation.common.components.rememberGuardedDismiss
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -133,7 +135,6 @@ fun RpSettingsSheet(
     onDeleteWritingStyle: (WritingStyleProfile) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val effectiveDraftRpMarkerMode = if (showRpMarkerOption && isRpMarkerAvailable) {
         draftRpMarkerMode
     } else {
@@ -152,21 +153,32 @@ fun RpSettingsSheet(
         draftPlotSuggestionPerspective != initialPlotSuggestionPerspective ||
         effectiveDraftRpMarkerMode != initialRpMarkerMode
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        containerColor = MaterialTheme.colorScheme.surface,
-        contentWindowInsets = { WindowInsets(0) },
+    val guardedDismiss = rememberGuardedDismiss(hasChanges, onDismiss)
+    EditorSheet(
+        onDismiss = guardedDismiss,
+        actions = {
+            SheetActions(
+                canSave = hasChanges,
+                onCancel = guardedDismiss,
+                onSave = {
+                    onSave(
+                        draftRpEnabled,
+                        draftRoleCardId,
+                        draftWorldSettingId,
+                        draftWritingStyleId,
+                        draftProtagonistName,
+                        draftProtagonistDescription,
+                        draftProtagonistInitialState,
+                        draftNarrativeMinCharsText.toNarrativeMinChars(),
+                        draftNarrativePerspective,
+                        draftPlotSuggestionPerspective,
+                        effectiveDraftRpMarkerMode,
+                    )
+                },
+            )
+
+        },
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .imePadding()
-                .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(horizontal = 20.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
             SheetHeader()
 
             RpToggleRow(
@@ -269,28 +281,7 @@ fun RpSettingsSheet(
                 onDelete = onDeleteWritingStyle,
             )
 
-            SheetActions(
-                canSave = hasChanges,
-                onCancel = onDismiss,
-                onSave = {
-                    onSave(
-                        draftRpEnabled,
-                        draftRoleCardId,
-                        draftWorldSettingId,
-                        draftWritingStyleId,
-                        draftProtagonistName,
-                        draftProtagonistDescription,
-                        draftProtagonistInitialState,
-                        draftNarrativeMinCharsText.toNarrativeMinChars(),
-                        draftNarrativePerspective,
-                        draftPlotSuggestionPerspective,
-                        effectiveDraftRpMarkerMode,
-                    )
-                },
-            )
 
-            Spacer(Modifier.height(8.dp))
-        }
     }
 }
 

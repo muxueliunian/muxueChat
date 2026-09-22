@@ -30,6 +30,30 @@ data class OpenAiCompatibleChatRequest(
     /** 仅正文聊天使用的标准 OpenAI function 工具定义。 */
     val tools: List<OpenAiCompatibleToolDto>? = null,
     @SerialName("tool_choice") val toolChoice: String? = null,
+    /**
+     * 仅在用户为该供应商显式开启「请求流式用量统计」时才非 null。
+     * 默认省略，避免向只支持普通聊天的旧反代发送未知字段。
+     */
+    @SerialName("stream_options") val streamOptions: OpenAiCompatibleStreamOptionsDto? = null,
+)
+
+/**
+ * 流式用量开关。
+ *
+ * 不少 OpenAI 兼容上游在流式下**只有**收到这个字段才会在末尾推一个带 usage 的 chunk。
+ * 但它同时也是一个可选字段，只支持普通聊天的旧反代收到未知字段可能直接 400，
+ * 因此默认不发，由用户在该供应商上显式开启。
+ */
+@Serializable
+data class OpenAiCompatibleStreamOptionsDto(
+    /**
+     * 与 [OpenAiCompatibleToolDto.type] 同理：Json 配置是 `encodeDefaults = false`，
+     * 只写默认值会被整个省略，请求体里就只剩一个空的 `"stream_options":{}`，
+     * 上游收到后不会返回任何用量——这个字段必须强制序列化。
+     */
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("include_usage") val includeUsage: Boolean = true,
 )
 
 /**

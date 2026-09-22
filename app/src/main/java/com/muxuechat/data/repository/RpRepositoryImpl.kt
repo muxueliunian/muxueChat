@@ -48,44 +48,69 @@ class RpRepositoryImpl(
         val name = draft.name.trim()
         require(name.isNotBlank()) { "角色名称不能为空" }
 
-        val now = clock()
-        val existing = id?.let { chatDao.getRoleCard(it) }
-        val entity = RoleCardEntity(
-            id = existing?.id ?: id ?: UUID.randomUUID().toString(),
-            name = name.take(MAX_NAME_LENGTH),
-            description = draft.description.trim(),
-            persona = draft.persona.trim(),
-            speakingStyle = draft.speakingStyle.trim(),
-            userIdentity = draft.userIdentity.trim(),
-            openingMessage = draft.openingMessage.trim(),
-            boundaries = draft.boundaries.trim(),
-            metricDefinitionsJson = repositoryJson.encodeToString(normalizeMetricDefinitions(draft.metricDefinitions)),
-            createdAtMillis = existing?.createdAtMillis ?: now,
-            updatedAtMillis = now,
-        )
-        chatDao.upsertRoleCard(entity)
-        return entity.toDomain()
+        return database.withTransaction {
+            val now = clock()
+            val existing = id?.let { chatDao.getRoleCard(it) }
+            require(id == null || existing != null) { "角色卡不存在，无法保存修改" }
+            val entity = RoleCardEntity(
+                id = existing?.id ?: UUID.randomUUID().toString(),
+                name = name.take(MAX_NAME_LENGTH),
+                description = draft.description.trim(),
+                persona = draft.persona.trim(),
+                speakingStyle = draft.speakingStyle.trim(),
+                userIdentity = draft.userIdentity.trim(),
+                openingMessage = draft.openingMessage.trim(),
+                boundaries = draft.boundaries.trim(),
+                metricDefinitionsJson = repositoryJson.encodeToString(
+                    normalizeMetricDefinitions(draft.metricDefinitions),
+                ),
+                createdAtMillis = existing?.createdAtMillis ?: now,
+                updatedAtMillis = now,
+            )
+
+            if (existing == null) {
+                chatDao.insertRoleCard(entity)
+            } else {
+                check(chatDao.updateRoleCard(entity) == 1) { "角色卡已被删除，保存失败" }
+                val roleSemanticsChanged = existing.copy(updatedAtMillis = entity.updatedAtMillis) != entity
+                if (roleSemanticsChanged) {
+                    refreshBindingsAfterRoleCardEdit(
+                        roleCard = entity.toDomain(),
+                        normalizeCurrentPanel = existing.metricDefinitionsJson != entity.metricDefinitionsJson,
+                        now = now,
+                    )
+                }
+            }
+            entity.toDomain()
+        }
     }
 
     override suspend fun deleteRoleCard(roleCardId: String) {
-        chatDao.deleteRoleCard(roleCardId)
+        chatDao.deleteRoleCardAndResetBindings(roleCardId, clock())
     }
 
     override suspend fun saveWorldSetting(id: String?, draft: WorldSettingDraft): WorldSetting {
         val title = draft.title.trim()
         require(title.isNotBlank()) { "世界观标题不能为空" }
 
-        val now = clock()
-        val existing = id?.let { chatDao.getWorldSetting(it) }
-        val entity = WorldSettingEntity(
-            id = existing?.id ?: id ?: UUID.randomUUID().toString(),
-            title = title.take(MAX_NAME_LENGTH),
-            content = draft.content.trim(),
-            createdAtMillis = existing?.createdAtMillis ?: now,
-            updatedAtMillis = now,
-        )
-        chatDao.upsertWorldSetting(entity)
-        return entity.toDomain()
+        return database.withTransaction {
+            val now = clock()
+            val existing = id?.let { chatDao.getWorldSetting(it) }
+            require(id == null || existing != null) { "世界观不存在，无法保存修改" }
+            val entity = WorldSettingEntity(
+                id = existing?.id ?: UUID.randomUUID().toString(),
+                title = title.take(MAX_NAME_LENGTH),
+                content = draft.content.trim(),
+                createdAtMillis = existing?.createdAtMillis ?: now,
+                updatedAtMillis = now,
+            )
+            if (existing == null) {
+                chatDao.insertWorldSetting(entity)
+            } else {
+                check(chatDao.updateWorldSetting(entity) == 1) { "世界观已被删除，保存失败" }
+            }
+            entity.toDomain()
+        }
     }
 
     override suspend fun deleteWorldSetting(worldSettingId: String) {
@@ -102,17 +127,24 @@ class RpRepositoryImpl(
         val name = draft.name.trim()
         require(name.isNotBlank()) { "文风名称不能为空" }
 
-        val now = clock()
-        val existing = id?.let { chatDao.getWritingStyleProfile(it) }
-        val entity = WritingStyleProfileEntity(
-            id = existing?.id ?: id ?: UUID.randomUUID().toString(),
-            name = name.take(MAX_NAME_LENGTH),
-            content = draft.content.trim(),
-            createdAtMillis = existing?.createdAtMillis ?: now,
-            updatedAtMillis = now,
-        )
-        chatDao.upsertWritingStyleProfile(entity)
-        return entity.toDomain()
+        return database.withTransaction {
+            val now = clock()
+            val existing = id?.let { chatDao.getWritingStyleProfile(it) }
+            require(id == null || existing != null) { "文风不存在，无法保存修改" }
+            val entity = WritingStyleProfileEntity(
+                id = existing?.id ?: UUID.randomUUID().toString(),
+                name = name.take(MAX_NAME_LENGTH),
+                content = draft.content.trim(),
+                createdAtMillis = existing?.createdAtMillis ?: now,
+                updatedAtMillis = now,
+            )
+            if (existing == null) {
+                chatDao.insertWritingStyleProfile(entity)
+            } else {
+                check(chatDao.updateWritingStyleProfile(entity) == 1) { "文风已被删除，保存失败" }
+            }
+            entity.toDomain()
+        }
     }
 
     override suspend fun deleteWritingStyleProfile(writingStyleId: String) {
@@ -137,28 +169,48 @@ class RpRepositoryImpl(
 
             var bound = false
             if (bindToConversationId != null && chatDao.getConversation(bindToConversationId) != null) {
-                val previous = chatDao.getConversationRpSettings(bindToConversationId)?.toDomain()
+                val previousEntity = chatDao.getConversationRpSettings(bindToConversationId)
+                val previous = previousEntity?.toDomain()
                 val now = clock()
-                chatDao.upsertConversationRpSettings(
-                    ConversationRpSettingsEntity(
-                        conversationId = bindToConversationId,
-                        // 绑定不等于开启 RP：沿用当前开关，由用户自己决定何时进入 RP。
-                        isRpEnabled = previous?.isRpEnabled ?: false,
-                        roleCardId = savedRoleCard?.id ?: previous?.roleCardId,
-                        worldSettingId = savedWorldSetting?.id ?: previous?.worldSettingId,
-                        writingStyleId = savedWritingStyle?.id ?: previous?.writingStyleId,
-                        protagonistName = previous?.protagonistName.orEmpty(),
-                        protagonistDescription = previous?.protagonistDescription.orEmpty(),
-                        protagonistInitialState = previous?.protagonistInitialState.orEmpty(),
-                        narrativeMinChars = previous?.narrativeMinChars.orZero(),
-                        narrativePerspective = (previous?.narrativePerspective
-                            ?: RpNarrativePerspective.DEFAULT).storageValue,
-                        plotSuggestionPerspective = (previous?.plotSuggestionPerspective
-                            ?: RpPlotSuggestionPerspective.DEFAULT).storageValue,
-                        rpMarkerMode = (previous?.rpMarkerMode ?: RpMarkerMode.DEFAULT).storageValue,
-                        updatedAtMillis = now,
-                    ),
+                val nextEntity = ConversationRpSettingsEntity(
+                    conversationId = bindToConversationId,
+                    // 绑定不等于开启 RP：沿用当前开关，由用户自己决定何时进入 RP。
+                    isRpEnabled = previous?.isRpEnabled ?: false,
+                    roleCardId = savedRoleCard?.id ?: previous?.roleCardId,
+                    worldSettingId = savedWorldSetting?.id ?: previous?.worldSettingId,
+                    writingStyleId = savedWritingStyle?.id ?: previous?.writingStyleId,
+                    protagonistName = previous?.protagonistName.orEmpty(),
+                    protagonistDescription = previous?.protagonistDescription.orEmpty(),
+                    protagonistInitialState = previous?.protagonistInitialState.orEmpty(),
+                    narrativeMinChars = previous?.narrativeMinChars.orZero(),
+                    narrativePerspective = (previous?.narrativePerspective
+                        ?: RpNarrativePerspective.DEFAULT).storageValue,
+                    plotSuggestionPerspective = (previous?.plotSuggestionPerspective
+                        ?: RpPlotSuggestionPerspective.DEFAULT).storageValue,
+                    rpMarkerMode = (previous?.rpMarkerMode ?: RpMarkerMode.DEFAULT).storageValue,
+                    updatedAtMillis = now,
                 )
+                chatDao.upsertConversationRpSettings(nextEntity)
+                if (previousEntity.hasDifferentRpSemanticsFrom(nextEntity)) {
+                    chatDao.clearMessageRpStatusSnapshots(bindToConversationId, now)
+                }
+                if (
+                    previousEntity?.isRpEnabled != nextEntity.isRpEnabled ||
+                    previousEntity?.roleCardId != nextEntity.roleCardId
+                ) {
+                    if (nextEntity.isRpEnabled && nextEntity.roleCardId != null) {
+                        chatDao.getRoleCard(nextEntity.roleCardId)?.toDomain()?.let { activeRoleCard ->
+                            ensureInitialStatusPanel(
+                                conversationId = bindToConversationId,
+                                roleCard = activeRoleCard,
+                                resetNarrative = previousEntity?.roleCardId != nextEntity.roleCardId,
+                                now = now,
+                            )
+                        } ?: chatDao.deleteRpStatusPanel(bindToConversationId)
+                    } else {
+                        chatDao.deleteRpStatusPanel(bindToConversationId)
+                    }
+                }
                 chatDao.touchConversation(bindToConversationId, now)
                 bound = true
             }
@@ -185,47 +237,50 @@ class RpRepositoryImpl(
         narrativePerspective: RpNarrativePerspective?,
         plotSuggestionPerspective: RpPlotSuggestionPerspective?,
         rpMarkerMode: RpMarkerMode?,
-    ) {
+    ) = database.withTransaction {
         require(chatDao.getConversation(conversationId) != null) { "会话不存在" }
-        val previousSettings = chatDao.getConversationRpSettings(conversationId)?.toDomain()
+        val previousEntity = chatDao.getConversationRpSettings(conversationId)
+        val previousSettings = previousEntity?.toDomain()
         val now = clock()
         val roleCard = roleCardId?.let { chatDao.getRoleCard(it)?.toDomain() }
         val validRoleCardId = roleCard?.id
         val validWorldSettingId = worldSettingId?.takeIf { chatDao.getWorldSetting(it) != null }
         val validWritingStyleId = writingStyleId?.takeIf { chatDao.getWritingStyleProfile(it) != null }
-        chatDao.upsertConversationRpSettings(
-            ConversationRpSettingsEntity(
-                conversationId = conversationId,
-                isRpEnabled = isRpEnabled,
-                roleCardId = validRoleCardId,
-                worldSettingId = validWorldSettingId,
-                writingStyleId = validWritingStyleId,
-                protagonistName = protagonistName?.trim()?.take(MAX_PROFILE_LENGTH)
-                    ?: previousSettings?.protagonistName.orEmpty(),
-                protagonistDescription = protagonistDescription?.trim()?.take(MAX_PROFILE_LENGTH)
-                    ?: previousSettings?.protagonistDescription.orEmpty(),
-                protagonistInitialState = protagonistInitialState?.trim()?.take(MAX_PROFILE_LENGTH)
-                    ?: previousSettings?.protagonistInitialState.orEmpty(),
-                narrativeMinChars = narrativeMinChars?.coerceIn(0, MAX_NARRATIVE_MIN_CHARS)
-                    ?: previousSettings?.narrativeMinChars.orZero(),
-                narrativePerspective = (
-                    narrativePerspective
-                        ?: previousSettings?.narrativePerspective
-                        ?: RpNarrativePerspective.DEFAULT
-                    ).storageValue,
-                plotSuggestionPerspective = (
-                    plotSuggestionPerspective
-                        ?: previousSettings?.plotSuggestionPerspective
-                        ?: RpPlotSuggestionPerspective.DEFAULT
-                    ).storageValue,
-                rpMarkerMode = (
-                    rpMarkerMode
-                        ?: previousSettings?.rpMarkerMode
-                        ?: RpMarkerMode.DEFAULT
-                    ).storageValue,
-                updatedAtMillis = now,
-            ),
+        val nextEntity = ConversationRpSettingsEntity(
+            conversationId = conversationId,
+            isRpEnabled = isRpEnabled,
+            roleCardId = validRoleCardId,
+            worldSettingId = validWorldSettingId,
+            writingStyleId = validWritingStyleId,
+            protagonistName = protagonistName?.trim()?.take(MAX_PROFILE_LENGTH)
+                ?: previousSettings?.protagonistName.orEmpty(),
+            protagonistDescription = protagonistDescription?.trim()?.take(MAX_PROFILE_LENGTH)
+                ?: previousSettings?.protagonistDescription.orEmpty(),
+            protagonistInitialState = protagonistInitialState?.trim()?.take(MAX_PROFILE_LENGTH)
+                ?: previousSettings?.protagonistInitialState.orEmpty(),
+            narrativeMinChars = narrativeMinChars?.coerceIn(0, MAX_NARRATIVE_MIN_CHARS)
+                ?: previousSettings?.narrativeMinChars.orZero(),
+            narrativePerspective = (
+                narrativePerspective
+                    ?: previousSettings?.narrativePerspective
+                    ?: RpNarrativePerspective.DEFAULT
+                ).storageValue,
+            plotSuggestionPerspective = (
+                plotSuggestionPerspective
+                    ?: previousSettings?.plotSuggestionPerspective
+                    ?: RpPlotSuggestionPerspective.DEFAULT
+                ).storageValue,
+            rpMarkerMode = (
+                rpMarkerMode
+                    ?: previousSettings?.rpMarkerMode
+                    ?: RpMarkerMode.DEFAULT
+                ).storageValue,
+            updatedAtMillis = now,
         )
+        chatDao.upsertConversationRpSettings(nextEntity)
+        if (previousEntity.hasDifferentRpSemanticsFrom(nextEntity)) {
+            chatDao.clearMessageRpStatusSnapshots(conversationId, now)
+        }
         if (isRpEnabled && roleCard != null) {
             ensureInitialStatusPanel(
                 conversationId = conversationId,
@@ -274,6 +329,27 @@ class RpRepositoryImpl(
         )
     }
 
+    /** 清除绑定会话的旧历史状态；指标定义变化时同时按新定义收敛当前面板。 */
+    private suspend fun refreshBindingsAfterRoleCardEdit(
+        roleCard: RoleCard,
+        normalizeCurrentPanel: Boolean,
+        now: Long,
+    ) {
+        chatDao.getConversationRpSettingsByRoleCard(roleCard.id).forEach { settings ->
+            chatDao.clearMessageRpStatusSnapshots(settings.conversationId, now)
+            if (normalizeCurrentPanel && settings.isRpEnabled) {
+                ensureInitialStatusPanel(
+                    conversationId = settings.conversationId,
+                    roleCard = roleCard,
+                    resetNarrative = false,
+                    now = now,
+                )
+            } else if (normalizeCurrentPanel) {
+                chatDao.deleteRpStatusPanel(settings.conversationId)
+            }
+        }
+    }
+
     private companion object {
         const val MAX_NAME_LENGTH = 80
         const val MAX_PROFILE_LENGTH = 2000
@@ -283,6 +359,10 @@ class RpRepositoryImpl(
     }
 
     private fun Int?.orZero(): Int = this ?: 0
+
+    private fun ConversationRpSettingsEntity?.hasDifferentRpSemanticsFrom(
+        other: ConversationRpSettingsEntity,
+    ): Boolean = this?.copy(updatedAtMillis = other.updatedAtMillis) != other
 
     private fun normalizeMetricDefinitions(definitions: List<RpMetricDefinition>): List<RpMetricDefinition> =
         definitions

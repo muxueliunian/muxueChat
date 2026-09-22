@@ -26,6 +26,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import com.muxuechat.presentation.common.components.EditorSheet
+import com.muxuechat.presentation.common.components.rememberGuardedDismiss
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,7 +55,6 @@ fun RoleCardEditorSheet(
     onSave: (RoleCardDraft) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     var name by remember(initialDraft) { mutableStateOf(initialDraft.name) }
     var description by remember(initialDraft) { mutableStateOf(initialDraft.description) }
@@ -70,22 +71,40 @@ fun RoleCardEditorSheet(
         metricDefinitions = metricDefinitions.toMutableList().also { it[index] = metric }
     }
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        // 长表单内部的滚动到边界后，剩余滑动不能再交给 Sheet 回弹，
-        // 否则会与 verticalScroll 竞争，表现为到底部时上下抽搐。
-        sheetGesturesEnabled = false,
-        dragHandle = null,
-        containerColor = MaterialTheme.colorScheme.surface,
+    val guardedDismiss = rememberGuardedDismiss(name != initialDraft.name || description != initialDraft.description || persona != initialDraft.persona || speakingStyle != initialDraft.speakingStyle || userIdentity != initialDraft.userIdentity || openingMessage != initialDraft.openingMessage || boundaries != initialDraft.boundaries || metricDefinitions != initialDraft.metricDefinitions, onDismiss)
+    EditorSheet(
+        onDismiss = guardedDismiss,
+        actions = {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                TextButton(onClick = guardedDismiss) {
+                    Text("取消")
+                }
+                Button(
+                    onClick = {
+                        onSave(
+                            RoleCardDraft(
+                                name = name.trim(),
+                                description = description.trim(),
+                                persona = persona.trim(),
+                                speakingStyle = speakingStyle.trim(),
+                                userIdentity = userIdentity.trim(),
+                                openingMessage = openingMessage.trim(),
+                                boundaries = boundaries.trim(),
+                                metricDefinitions = metricDefinitions,
+                            ),
+                        )
+                    },
+                    enabled = canSave,
+                ) {
+                    Text("保存")
+                }
+            }
+        },
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
             Text(
                 text = if (isEditing) "编辑角色卡" else "新建角色卡",
                 style = MaterialTheme.typography.titleLarge,
@@ -175,37 +194,7 @@ fun RoleCardEditorSheet(
                 },
             )
 
-            Spacer(Modifier.height(8.dp))
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                TextButton(onClick = onDismiss) {
-                    Text("取消")
-                }
-                Button(
-                    onClick = {
-                        onSave(
-                            RoleCardDraft(
-                                name = name.trim(),
-                                description = description.trim(),
-                                persona = persona.trim(),
-                                speakingStyle = speakingStyle.trim(),
-                                userIdentity = userIdentity.trim(),
-                                openingMessage = openingMessage.trim(),
-                                boundaries = boundaries.trim(),
-                                metricDefinitions = metricDefinitions,
-                            ),
-                        )
-                    },
-                    enabled = canSave,
-                ) {
-                    Text("保存")
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-        }
+
     }
 }
 

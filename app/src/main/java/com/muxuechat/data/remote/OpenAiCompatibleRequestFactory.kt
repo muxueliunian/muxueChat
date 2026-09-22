@@ -1,5 +1,6 @@
 package com.muxuechat.data.remote
 
+import com.muxuechat.domain.context.ChatContextPlanner
 import com.muxuechat.domain.model.ChatSettings
 
 /**
@@ -29,9 +30,12 @@ object OpenAiCompatibleRequestFactory {
         /** 仅 [Purpose.CHAT] 可用的标准 OpenAI function 工具定义。 */
         tools: List<OpenAiCompatibleToolDto>? = null,
         toolChoice: String? = null,
+        /** 该供应商是否已由用户确认支持 `stream_options`。默认 false，绝不擅自发送。 */
+        includeStreamUsage: Boolean = false,
     ): OpenAiCompatibleChatRequest {
         val normalized = settings.normalized()
         val resolvedModel = model.trim()
+        val activeProvider = normalized.activeCustomProvider
         require(resolvedModel.isNotBlank()) { "请配置供应商模型名" }
 
         return OpenAiCompatibleChatRequest(
@@ -40,14 +44,26 @@ object OpenAiCompatibleRequestFactory {
             // stream 不带默认值，false 也必须被实际编码。
             stream = streamOverride ?: (purpose == Purpose.CHAT && normalized.streamEnabled),
             maxTokens = purpose.maxTokens(normalized),
-            temperature = purpose.temperature(normalized),
-            topP = purpose.topP(normalized),
+            temperature = purpose.temperature(normalized).takeIf { activeProvider?.sendTemperature != false },
+            topP = purpose.topP(normalized).takeIf { activeProvider?.sendTopP != false },
             reasoningEffort = purpose.reasoningEffort(reasoningEffort),
             // RP 补写和摘要是内部结构化请求，绝不能被调用点误挂载工具。
             tools = purpose.tools(tools),
             toolChoice = purpose.toolChoice(tools, toolChoice),
+            streamOptions = streamOptions(
+                stream = streamOverride ?: (purpose == Purpose.CHAT && normalized.streamEnabled),
+                includeStreamUsage = includeStreamUsage,
+            ),
         )
     }
+
+    /**
+     * 只在「确实是流式」且「用户显式开启」时才发。
+     *
+     * 非流式请求的 usage 本来就在响应体里，多发这个字段只会增加被旧反代拒绝的风险。
+     */
+    private fun streamOptions(stream: Boolean, includeStreamUsage: Boolean): OpenAiCompatibleStreamOptionsDto? =
+        OpenAiCompatibleStreamOptionsDto(includeUsage = true).takeIf { stream && includeStreamUsage }
 
     private fun Purpose.tools(value: List<OpenAiCompatibleToolDto>?): List<OpenAiCompatibleToolDto>? =
         value?.takeIf { this == Purpose.CHAT && it.isNotEmpty() }
@@ -89,7 +105,13 @@ object OpenAiCompatibleRequestFactory {
 
     const val RP_METADATA_MAX_TOKENS = 900
     const val RP_STATE_UPDATE_MAX_TOKENS = 512
-    const val CONTEXT_SUMMARY_MAX_TOKENS = 2_000
+    /**
+     * 摘要请求的输出上限。
+     *
+     * 直接引用规划器的常量：上下文规划器要用同一个数字为摘要请求预留输出空间，
+     * 两边各写一份迟早会漂移，届时规划器会以为还装得下，而服务端已经拒绝了。
+     */
+    const val CONTEXT_SUMMARY_MAX_TOKENS = ChatContextPlanner.SUMMARY_OUTPUT_RESERVE_TOKENS
 
     private const val RP_METADATA_TEMPERATURE = 0.35
     private const val RP_STATE_UPDATE_TEMPERATURE = 0.1

@@ -1,5 +1,6 @@
 package com.muxuechat.presentation.chat
 
+import android.content.ClipData
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,6 +29,8 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -38,13 +41,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
-import com.muxuechat.domain.model.ChatSettings
-import com.muxuechat.domain.model.DeepSeekModel
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpMarkerMode
@@ -108,13 +109,12 @@ fun ChatScreen(
     onEditAssistantMessage: (messageId: String, newContent: String) -> Unit,
     onAttachDocument: (Uri) -> Unit,
     onRemoveAttachment: () -> Unit,
-    onRefreshContextWindow: () -> Unit,
     onCompactContextNow: () -> Unit,
     onCompressionModeChange: (ContextCompressionMode) -> Unit,
     onCompressionTriggerChange: (Int) -> Unit,
     onConfirmSettingsDraft: (SettingsDraftConfirmation) -> Unit,
     onDiscardSettingsDraft: (String) -> Unit,
-    onSelectDeepSeekModel: (DeepSeekModel) -> Unit,
+    onSelectDeepSeekModel: (String) -> Unit,
     onSelectCustomProviderModel: (providerId: String, model: String) -> Unit,
     onRefreshProviderModels: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -122,7 +122,7 @@ fun ChatScreen(
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
-    val clipboardManager = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
     val canUseSettingsTools = state.settings.settingsToolsEnabledForActiveProvider
 
     var inputValue by rememberSaveable(stateSaver = TextFieldValue.Saver) {
@@ -176,23 +176,18 @@ fun ChatScreen(
         collapsedDraftIds = collapsedDraftIds + draftId
     }
 
-    // ModalBottomSheet 正常会自己处理返回；这里保留 Activity 级兜底，
-    // 以兼容部分设备把系统返回直接分发给 Activity 的情况。
-    BackHandler(enabled = roleCardEditor != null) {
-        dismissRoleCardEditor()
-    }
-
-    // AI 草稿 Sheet 正常会自己处理返回；这里与角色卡编辑器一样提供 Activity 级兜底。
-    BackHandler(enabled = visibleDraft != null && roleCardEditor == null) {
-        visibleDraft?.let { collapseSettingsDraft(it.id) }
-    }
-
     LaunchedEffect(state.errorMessage) {
         val message = state.errorMessage
         if (!message.isNullOrBlank()) {
             snackbarHostState.showSnackbar(message)
         }
     }
+
+    val activeConversationTitle = state.conversations
+        .firstOrNull { it.id == state.activeConversationId }
+        ?.title
+        ?.takeIf { it.isNotBlank() }
+        ?: "新的对话"
 
     val isRpActive = state.activeRpSettings?.isRpEnabled == true
     val showStatusPanel = isRpActive && state.activeRpStatusPanel != null
@@ -234,6 +229,12 @@ fun ChatScreen(
         pendingCreatedWritingStyleIds = null
     }
 
+    // 抽屉展开时必须自己吃掉返回键。这台机器逻辑宽度只有 361dp，而 ModalDrawerSheet 默认
+    // 就占 360dp，右侧遮罩窄到点不中，返回键是唯一可靠的关闭方式；不拦就会直接退出 App。
+    BackHandler(enabled = drawerState.isOpen) {
+        scope.launch { drawerState.close() }
+    }
+
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
@@ -260,9 +261,10 @@ fun ChatScreen(
             ),
             topBar = {
                 ChatTopBar(
-                    // 顶栏必须跟随当前 Provider，否则用自定义供应商时会显示 DeepSeek 的模型和域名。
+                    conversationTitle = activeConversationTitle,
+                    // 顶栏必须跟随当前 Provider，否则用自定义供应商时会显示 DeepSeek 的模型。
+                    providerLabel = state.settings.activeProviderLabel,
                     modelLabel = state.settings.activeModel.ifBlank { "未选择模型" },
-                    subtitle = buildTopBarSubtitle(state.settings),
                     isRpActive = isRpActive,
                     onSelectModel = { modelSheetVisible = true },
                     onMenu = { scope.launch { drawerState.open() } },
@@ -270,10 +272,8 @@ fun ChatScreen(
                         rpSettingsDraft = RpSettingsDraft.from(state)
                         rpSheetVisible = true
                     },
-                    onOpenContext = {
-                        onRefreshContextWindow()
-                        contextSheetVisible = true
-                    },
+                    // 上下文占用由 Flow 持续推送，打开面板不需要再手动刷新一次。
+                    onOpenContext = { contextSheetVisible = true },
                     onOpenSettings = onOpenSettings,
                     contextUsagePercent = state.contextWindowPlan?.usagePercent,
                 )
@@ -292,6 +292,7 @@ fun ChatScreen(
                     },
                     onStop = onStopGeneration,
                     attachment = state.pendingAttachment,
+                    isImportingAttachment = state.isImportingAttachment,
                     // 附件是给设定生成工具用的，RP 进行中工具不可用，入口也一并隐藏。
                     canAttach = !isRpActive && canUseSettingsTools,
                     onAttach = { documentPicker.launch(DocumentTextExtractor.SAF_MIME_TYPES) },
@@ -323,10 +324,15 @@ fun ChatScreen(
                     messages = state.messages,
                     isGenerating = state.isGenerating,
                     retryingRpOptionsMessageId = state.retryingRpOptionsMessageId,
+                    enrichingMessageIds = state.enrichingMessageIds,
                     canRetryMissingRpOptions = isRpActive && state.activeRoleCard != null,
                     onCopy = { text ->
-                        clipboardManager.setText(AnnotatedString(text))
-                        scope.launch { snackbarHostState.showSnackbar("已复制") }
+                        scope.launch {
+                            clipboard.setClipEntry(
+                                ClipEntry(ClipData.newPlainText("message", text)),
+                            )
+                            snackbarHostState.showSnackbar("已复制")
+                        }
                     },
                     onRegenerate = onRegenerate,
                     onRetryRpOptions = onRetryRpOptions,
@@ -367,6 +373,7 @@ fun ChatScreen(
         ModelPickerSheet(
             settings = state.settings,
             refreshingModelsProviderId = state.refreshingModelsProviderId,
+            refreshErrors = state.modelRefreshErrors,
             onSelectDeepSeekModel = onSelectDeepSeekModel,
             onSelectCustomProviderModel = onSelectCustomProviderModel,
             onRefreshProviderModels = onRefreshProviderModels,
@@ -382,6 +389,10 @@ fun ChatScreen(
             onCompactNow = onCompactContextNow,
             onModeChange = onCompressionModeChange,
             onTriggerPercentChange = onCompressionTriggerChange,
+            onOpenSettings = {
+                contextSheetVisible = false
+                onOpenSettings()
+            },
             onDismiss = { contextSheetVisible = false },
         )
     }
@@ -756,11 +767,12 @@ private fun EditUserMessageDialog(
         )
     }
     val canConfirm = text.text.isNotBlank()
+    val guardedDismiss = com.muxuechat.presentation.common.components.rememberGuardedDismiss(text.text != initialContent, onDismiss)
     AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("编辑玩家消息") },
+        onDismissRequest = guardedDismiss,
+        title = { Text("编辑用户消息") },
         text = {
-            Column {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text(
                     text = "重新发送会删除这条消息之后的所有回复与决策，并回滚 RP 状态。",
                     style = MaterialTheme.typography.bodySmall,
@@ -786,7 +798,7 @@ private fun EditUserMessageDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = guardedDismiss) {
                 Text("取消")
             }
         },
@@ -794,7 +806,7 @@ private fun EditUserMessageDialog(
 }
 
 /**
- * 编辑模型回复。与编辑玩家消息不同，这里**不重新生成、不删除任何后续消息**——
+ * 编辑模型回复。与编辑用户消息不同，这里**不重新生成、不删除任何后续消息**——
  * 改完就落库，直接作为历史参与后面的请求。RP 里只想修掉某一段不满意的描写时，
  * 重跑会连带丢掉后面已经满意的剧情。
  */
@@ -813,11 +825,12 @@ private fun EditAssistantMessageDialog(
         )
     }
     val canConfirm = text.text.isNotBlank()
+    val guardedDismiss = com.muxuechat.presentation.common.components.rememberGuardedDismiss(text.text != initialContent, onDismiss)
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = guardedDismiss,
         title = { Text("编辑模型回复") },
         text = {
-            Column {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text(
                     text = "只改这一条，不会重新生成，也不会删除后面的消息。" +
                         "保存后的正文会作为历史参与下一次请求。",
@@ -844,7 +857,7 @@ private fun EditAssistantMessageDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = guardedDismiss) {
                 Text("取消")
             }
         },
@@ -959,18 +972,4 @@ private fun PendingDraftBanner(
             }
         }
     }
-}
-
-/**
- * 顶栏副标题：服务名 + 主机名。
- *
- * 自定义供应商的完整 Base URL 可能很长且含端口/路径，这里只取 host，
- * 既避免顶栏被撑爆，也不把完整地址长期展示在界面上。
- */
-private fun buildTopBarSubtitle(settings: ChatSettings): String {
-    val host = settings.activeBaseUrl
-        .removePrefix("https://")
-        .removePrefix("http://")
-        .substringBefore('/')
-    return if (host.isBlank()) settings.activeProviderLabel else "${settings.activeProviderLabel} · $host"
 }

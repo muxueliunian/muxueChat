@@ -22,6 +22,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import com.muxuechat.presentation.common.components.EditorSheet
+import com.muxuechat.presentation.common.components.rememberGuardedDismiss
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,28 +47,40 @@ fun WorldSettingEditorSheet(
     onSave: (WorldSettingDraft) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     var title by remember(initialDraft) { mutableStateOf(initialDraft.title) }
     var content by remember(initialDraft) { mutableStateOf(initialDraft.content) }
 
     val canSave = title.trim().isNotEmpty()
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        containerColor = MaterialTheme.colorScheme.surface,
-        contentWindowInsets = { WindowInsets(0) },
+    val guardedDismiss = rememberGuardedDismiss(title != initialDraft.title || content != initialDraft.content, onDismiss)
+    EditorSheet(
+        onDismiss = guardedDismiss,
+        actions = {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                TextButton(onClick = guardedDismiss) {
+                    Text("取消")
+                }
+                Button(
+                    onClick = {
+                        onSave(
+                            WorldSettingDraft(
+                                title = title.trim(),
+                                content = content.trim(),
+                            ),
+                        )
+                    },
+                    enabled = canSave,
+                ) {
+                    Text("保存")
+                }
+            }
+        },
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .imePadding()
-                .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(horizontal = 20.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
             Text(
                 text = if (isEditing) "编辑世界观" else "新建世界观",
                 style = MaterialTheme.typography.titleLarge,
@@ -118,30 +132,6 @@ fun WorldSettingEditorSheet(
                 )
             }
 
-            Spacer(Modifier.height(8.dp))
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                TextButton(onClick = onDismiss) {
-                    Text("取消")
-                }
-                Button(
-                    onClick = {
-                        onSave(
-                            WorldSettingDraft(
-                                title = title.trim(),
-                                content = content.trim(),
-                            ),
-                        )
-                    },
-                    enabled = canSave,
-                ) {
-                    Text("保存")
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-        }
+
     }
 }

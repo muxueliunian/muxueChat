@@ -23,6 +23,8 @@ fun SliderField(
     range: ClosedFloatingPointRange<Float>,
     steps: Int = 0,
     enabled: Boolean = true,
+    /** 禁用原因或补充说明。禁用时必须给出原因，否则用户只看到一个拖不动的滑块。 */
+    supportingText: String? = null,
 ) {
     Column(
         modifier = Modifier
@@ -41,6 +43,13 @@ fun SliderField(
             Text(
                 text = String.format(Locale.US, "%.2f", value),
                 style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (!supportingText.isNullOrBlank()) {
+            Text(
+                text = supportingText,
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }

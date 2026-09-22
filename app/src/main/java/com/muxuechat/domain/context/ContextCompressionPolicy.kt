@@ -24,18 +24,22 @@ enum class ContextCompressionMode(val storageValue: String) {
  * 上下文压缩策略。
  *
  * 三层概念要分清：
- * 1. **预算** [budgetChars]：一次请求愿意携带的历史字符上限。
+ * 1. **预算**：一次请求可用的输入 token 上限。它**不再**由本策略持有，
+ *    而是由 [ModelContextSpec.inputBudgetTokens] 按模型真实窗口算出——
+ *    旧版把一个写死的 40,000 字符预算塞在这里，导致 UI、裁剪和压缩用的是一个
+ *    与模型能力无关的人造数字。
  * 2. **压缩**：把最老的一段历史换成一份摘要，用一次额外请求换取剧情连续性。
  *    没有它，长 RP 会话被裁掉的前情就是彻底丢失，沉浸感断裂。
  * 3. **硬裁剪**：不可关闭的安全网。即使压缩关闭或摘要请求失败，也必须保证请求不超长。
+ *
+ * 本策略只描述「在预算的百分之多少处动手」，绝对值由调用方传入预算后现算。
  */
 data class ContextCompressionPolicy(
     val mode: ContextCompressionMode = ContextCompressionMode.DEFAULT,
-    /** 占用达到预算的百分之多少时自动压缩。 */
+    /** 占用达到输入预算的百分之多少时自动压缩。 */
     val autoTriggerPercent: Int = DEFAULT_AUTO_TRIGGER_PERCENT,
-    /** 压缩后希望把逐字部分降到预算的百分之多少。 */
+    /** 压缩后希望把总输入降到输入预算的百分之多少。 */
     val targetPercent: Int = DEFAULT_TARGET_PERCENT,
-    val budgetChars: Int = DEFAULT_BUDGET_CHARS,
 ) {
     fun normalized(): ContextCompressionPolicy {
         val trigger = autoTriggerPercent.coerceIn(MIN_AUTO_TRIGGER_PERCENT, MAX_AUTO_TRIGGER_PERCENT)
@@ -46,17 +50,16 @@ data class ContextCompressionPolicy(
                 MIN_TARGET_PERCENT,
                 (trigger - MIN_TRIGGER_TARGET_GAP).coerceAtLeast(MIN_TARGET_PERCENT),
             ),
-            budgetChars = budgetChars.coerceIn(MIN_BUDGET_CHARS, MAX_BUDGET_CHARS),
         )
     }
 
-    /** 触发压缩的绝对字符数。 */
-    val autoTriggerChars: Int
-        get() = (budgetChars.toLong() * autoTriggerPercent / 100).toInt()
+    /** 触发压缩的绝对输入 token 数。 */
+    fun autoTriggerTokens(inputBudgetTokens: Long): Long =
+        if (inputBudgetTokens <= 0L) 0L else inputBudgetTokens * autoTriggerPercent / 100
 
-    /** 压缩后逐字部分的目标字符数。 */
-    val targetChars: Int
-        get() = (budgetChars.toLong() * targetPercent / 100).toInt()
+    /** 压缩后总输入的目标 token 数。 */
+    fun targetTokens(inputBudgetTokens: Long): Long =
+        if (inputBudgetTokens <= 0L) 0L else inputBudgetTokens * targetPercent / 100
 
     companion object {
         /** 推荐区间 50%~90%；允许用户自定义到更宽的范围。 */
@@ -72,15 +75,6 @@ data class ContextCompressionPolicy(
 
         /** 触发线与目标线之间至少要拉开的差距，防止压缩后立刻再次触发。 */
         const val MIN_TRIGGER_TARGET_GAP = 10
-
-        const val MIN_BUDGET_CHARS = 4_000
-        const val MAX_BUDGET_CHARS = 200_000
-
-        /**
-         * 默认逐字历史预算。DeepSeek V4 上下文足够长，真正的约束是费用而非长度。
-         * 4 万字符在中文下约合 2.5~3 万 token，够覆盖几十轮 RP 正文。
-         */
-        const val DEFAULT_BUDGET_CHARS = 40_000
     }
 }
 

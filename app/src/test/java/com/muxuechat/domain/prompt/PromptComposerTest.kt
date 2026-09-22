@@ -390,6 +390,22 @@ class PromptComposerTest {
         )
         assertFalse(
             composer.shouldInjectDeepSeekRpMarker(
+                modelApiName = "deepseek-v4-flash-vision-exp",
+                thinkingModeEnabled = true,
+                isRpEnabled = true,
+                rpMarkerMode = RpMarkerMode.ROLE_IMMERSION,
+            ),
+        )
+        assertFalse(
+            composer.shouldInjectDeepSeekRpMarker(
+                modelApiName = "deepseek-v4-future",
+                thinkingModeEnabled = true,
+                isRpEnabled = true,
+                rpMarkerMode = RpMarkerMode.ROLE_IMMERSION,
+            ),
+        )
+        assertFalse(
+            composer.shouldInjectDeepSeekRpMarker(
                 modelApiName = "deepseek-v4-pro",
                 thinkingModeEnabled = true,
                 isRpEnabled = false,

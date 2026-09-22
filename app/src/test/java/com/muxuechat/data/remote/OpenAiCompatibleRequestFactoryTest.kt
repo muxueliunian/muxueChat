@@ -77,6 +77,121 @@ class OpenAiCompatibleRequestFactoryTest {
         assertEquals(0.2, summary.temperature!!, 0.0001)
     }
 
+    /**
+     * `stream_options` 默认必须完全不出现在请求体里。
+     *
+     * 它是可选字段，只支持普通聊天的旧反代收到未知字段可能直接 400——
+     * 为了拿用量而让所有存量供应商冒这个风险是不划算的。
+     */
+    @Test
+    fun streamOptions_areOmittedByDefault() {
+        val request = OpenAiCompatibleRequestFactory.build(
+            settings = settings,
+            model = "grok-4.5",
+            messages = messages,
+            purpose = OpenAiCompatibleRequestFactory.Purpose.CHAT,
+        )
+
+        assertNull(request.streamOptions)
+        assertFalse(json.encodeToString(request).contains("stream_options"))
+    }
+
+    @Test
+    fun streamOptions_areSentOnlyWhenExplicitlyEnabled() {
+        val request = OpenAiCompatibleRequestFactory.build(
+            settings = settings,
+            model = "grok-4.5",
+            messages = messages,
+            purpose = OpenAiCompatibleRequestFactory.Purpose.CHAT,
+            includeStreamUsage = true,
+        )
+
+        assertTrue(request.stream)
+        assertEquals(true, request.streamOptions?.includeUsage)
+        assertTrue(json.encodeToString(request).contains("\"include_usage\":true"))
+    }
+
+    /** 非流式响应的 usage 本来就在响应体里，多发这个字段只会增加被拒的风险。 */
+    @Test
+    fun streamOptions_areOmittedForNonStreamingRequests() {
+        val request = OpenAiCompatibleRequestFactory.build(
+            settings = settings.copy(streamEnabled = false),
+            model = "grok-4.5",
+            messages = messages,
+            purpose = OpenAiCompatibleRequestFactory.Purpose.CHAT,
+            includeStreamUsage = true,
+        )
+
+        assertFalse(request.stream)
+        assertNull(request.streamOptions)
+    }
+
+    /** 内部结构化请求一律不带该字段。 */
+    @Test
+    fun streamOptions_areNeverSentForInternalPurposes() {
+        listOf(
+            OpenAiCompatibleRequestFactory.Purpose.RP_METADATA,
+            OpenAiCompatibleRequestFactory.Purpose.RP_STATE_UPDATE,
+            OpenAiCompatibleRequestFactory.Purpose.CONTEXT_SUMMARY,
+        ).forEach { purpose ->
+            val request = OpenAiCompatibleRequestFactory.build(
+                settings = settings,
+                model = "grok-4.5",
+                messages = messages,
+                purpose = purpose,
+                includeStreamUsage = true,
+            )
+            assertNull(purpose.name, request.streamOptions)
+        }
+    }
+
+    /**
+     * 摘要请求的输出上限必须和上下文规划器为它预留的空间是同一个数字。
+     * 两边各写一份迟早漂移，届时规划器会以为还装得下，而服务端已经拒绝了。
+     */
+    @Test
+    fun summaryMaxTokens_matchesThePlannerReservation() {
+        assertEquals(
+            com.muxuechat.domain.context.ChatContextPlanner.SUMMARY_OUTPUT_RESERVE_TOKENS,
+            OpenAiCompatibleRequestFactory.CONTEXT_SUMMARY_MAX_TOKENS,
+        )
+        assertEquals(
+            com.muxuechat.domain.context.ChatContextPlanner.SUMMARY_OUTPUT_RESERVE_TOKENS,
+            DeepSeekRequestFactory.CONTEXT_SUMMARY_MAX_TOKENS,
+        )
+    }
+
+    @Test
+    fun providerSamplingSwitches_canOmitTemperatureAndTopPIndependently() {
+        val provider = settings.customProviders.single()
+        val withoutTemperature = settings.copy(
+            customProviders = listOf(provider.copy(sendTemperature = false, sendTopP = true)),
+        )
+        val withoutTopP = settings.copy(
+            customProviders = listOf(provider.copy(sendTemperature = true, sendTopP = false)),
+        )
+
+        val temperatureDisabled = OpenAiCompatibleRequestFactory.build(
+            settings = withoutTemperature,
+            model = "grok-4.5",
+            messages = messages,
+            purpose = OpenAiCompatibleRequestFactory.Purpose.CHAT,
+        )
+        val topPDisabled = OpenAiCompatibleRequestFactory.build(
+            settings = withoutTopP,
+            model = "grok-4.5",
+            messages = messages,
+            purpose = OpenAiCompatibleRequestFactory.Purpose.RP_METADATA,
+        )
+
+        assertNull(temperatureDisabled.temperature)
+        assertEquals(0.8, temperatureDisabled.topP!!, 0.0001)
+        assertFalse(json.encodeToString(temperatureDisabled).contains("\"temperature\""))
+        assertNull(topPDisabled.topP)
+        assertEquals(0.35, topPDisabled.temperature!!, 0.0001)
+        assertFalse(json.encodeToString(topPDisabled).contains("\"top_p\""))
+    }
+
     /** 用户没填思考等级时，请求体里绝不能出现 reasoning_effort：不支持的模型会直接 400。 */
     @Test
     fun chat_omitsReasoningEffortWhenUserLeftItBlank() {

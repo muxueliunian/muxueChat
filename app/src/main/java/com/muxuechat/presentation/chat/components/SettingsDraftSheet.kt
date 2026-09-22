@@ -17,6 +17,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import com.muxuechat.presentation.common.components.EditorSheet
+import com.muxuechat.presentation.common.components.rememberGuardedDismiss
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -55,7 +57,6 @@ fun SettingsDraftSheet(
     onDiscard: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     var roleCard by remember(draft.id) { mutableStateOf(draft.roleCard) }
     var worldSetting by remember(draft.id) { mutableStateOf(draft.worldSetting) }
@@ -67,23 +68,41 @@ fun SettingsDraftSheet(
         worldSetting?.title?.isNotBlank() == true ||
         writingStyle?.name?.isNotBlank() == true
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        // AI 角色卡草稿是长表单。滚动到边界时不能把剩余拖动交给外层 Sheet，
-        // 否则会与 verticalScroll 竞争并造成上下回弹。
-        sheetGesturesEnabled = false,
-        dragHandle = null,
-        containerColor = MaterialTheme.colorScheme.surface,
+    val discardGuard = rememberGuardedDismiss(true, { onDiscard(draft.id) }, enabled = !isSaving)
+    val guardedDismiss = rememberGuardedDismiss(roleCard != draft.roleCard || worldSetting != draft.worldSetting || writingStyle != draft.writingStyle || bindToConversation, onDismiss, enabled = !isSaving)
+    EditorSheet(
+        onDismiss = guardedDismiss,
+        actions = {
+            androidx.compose.foundation.layout.FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                TextButton(
+                    onClick = discardGuard,
+                    enabled = !isSaving,
+                ) {
+                    Text("丢弃")
+                }
+                TextButton(onClick = guardedDismiss, enabled = !isSaving) { Text("收起") }
+                Button(
+                    onClick = {
+                        onConfirm(
+                            SettingsDraftConfirmation(
+                                draftId = draft.id,
+                                roleCard = roleCard,
+                                worldSetting = worldSetting,
+                                writingStyle = writingStyle,
+                                bindToConversation = bindToConversation,
+                            ),
+                        )
+                    },
+                    enabled = canSave && !isSaving,
+                ) {
+                    Text(if (isSaving) "保存中…" else "保存")
+                }
+            }
+        },
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp)
-                .padding(top = 16.dp, bottom = 32.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
             Text(
                 text = "${draft.typeLabel}草稿",
                 style = MaterialTheme.typography.titleMedium,
@@ -153,34 +172,7 @@ fun SettingsDraftSheet(
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                TextButton(
-                    onClick = { onDiscard(draft.id) },
-                    enabled = !isSaving,
-                ) {
-                    Text("丢弃")
-                }
-                Button(
-                    onClick = {
-                        onConfirm(
-                            SettingsDraftConfirmation(
-                                draftId = draft.id,
-                                roleCard = roleCard,
-                                worldSetting = worldSetting,
-                                writingStyle = writingStyle,
-                                bindToConversation = bindToConversation,
-                            ),
-                        )
-                    },
-                    enabled = canSave && !isSaving,
-                ) {
-                    Text(if (isSaving) "保存中…" else "保存")
-                }
-            }
-        }
+
     }
 }
 

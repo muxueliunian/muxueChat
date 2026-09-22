@@ -17,22 +17,37 @@ import javax.crypto.spec.GCMParameterSpec
  * 迁移完成后这里的密文会被清空，但类本身要保留，
  * 否则从旧版本直接升级上来的用户会丢掉已保存的 Key。
  */
-class EncryptedCliProxyApiKeyStore(context: Context) {
-    private val preferences = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+interface LegacyCliProxyCredentialStore {
+    suspend fun getApiKey(): String?
+    suspend fun saveApiKey(apiKey: String)
+    suspend fun clearApiKey()
+}
+
+class EncryptedCliProxyApiKeyStore internal constructor(
+    context: Context,
+    preferencesName: String,
+    private val keyAlias: String,
+) : LegacyCliProxyCredentialStore {
+    constructor(context: Context) : this(context, PREFS_NAME, KEY_ALIAS)
+
+    private val preferences =
+        context.applicationContext.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
     private val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
 
-    suspend fun saveApiKey(apiKey: String) {
+    override suspend fun saveApiKey(apiKey: String) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecretKey())
 
         val encrypted = cipher.doFinal(apiKey.toByteArray(Charsets.UTF_8))
-        preferences.edit()
-            .putString(KEY_CIPHERTEXT, encrypted.base64())
-            .putString(KEY_IV, cipher.iv.base64())
-            .apply()
+        check(
+            preferences.edit()
+                .putString(KEY_CIPHERTEXT, encrypted.base64())
+                .putString(KEY_IV, cipher.iv.base64())
+                .commit(),
+        ) { "旧 API Key 密文持久化失败" }
     }
 
-    suspend fun getApiKey(): String? {
+    override suspend fun getApiKey(): String? {
         val ciphertext = preferences.getString(KEY_CIPHERTEXT, null)?.fromBase64() ?: return null
         val iv = preferences.getString(KEY_IV, null)?.fromBase64() ?: return null
 
@@ -41,19 +56,22 @@ class EncryptedCliProxyApiKeyStore(context: Context) {
         return cipher.doFinal(ciphertext).toString(Charsets.UTF_8)
     }
 
-    suspend fun clearApiKey() {
-        preferences.edit()
-            .remove(KEY_CIPHERTEXT)
-            .remove(KEY_IV)
-            .apply()
+    override suspend fun clearApiKey() {
+        check(
+            preferences.edit()
+                .remove(KEY_CIPHERTEXT)
+                .remove(KEY_IV)
+                .commit(),
+        ) { "旧 API Key 密文清理失败" }
+        keyStore.deleteEntry(keyAlias)
     }
 
     private fun getOrCreateSecretKey(): SecretKey {
-        (keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
+        (keyStore.getEntry(keyAlias, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
 
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
         val spec = KeyGenParameterSpec.Builder(
-            KEY_ALIAS,
+            keyAlias,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
         )
             .setBlockModes(KeyProperties.BLOCK_MODE_GCM)

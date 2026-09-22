@@ -1,5 +1,6 @@
 package com.muxuechat.domain.model
 
+import com.muxuechat.domain.context.ModelContextCatalog
 import java.net.URI
 
 /**
@@ -26,6 +27,10 @@ data class CustomProvider(
      * 对应供应商设置中按服务实际能力显式开启；这不是 Gemini 等厂商的特判。
      */
     val toolCallingEnabled: Boolean = false,
+    /** 是否在该供应商的请求体中发送全局 temperature；关闭时字段完全省略。 */
+    val sendTemperature: Boolean = true,
+    /** 是否在该供应商的请求体中发送全局 top_p；关闭时字段完全省略。 */
+    val sendTopP: Boolean = true,
     /**
      * OpenAI 系的 `reasoning_effort` 取值，例如 low / medium / high。
      *
@@ -35,6 +40,21 @@ data class CustomProvider(
      * 预设只是 UI 的快捷填充。
      */
     val reasoningEffort: String = "",
+    /**
+     * 该供应商下每个模型的上下文窗口（tokens）。
+     *
+     * 标准 `GET /models` 只保证返回 `id`，拿不到 context 长度，而 App 不解析任何厂商私有字段，
+     * 所以这里只接受用户逐模型手填。未配置的模型会回退到
+     * [ModelContextCatalog.FALLBACK_CONTEXT_TOKENS] 并在 UI 上警告。
+     */
+    val modelContextWindows: Map<String, Long> = emptyMap(),
+    /**
+     * 是否在流式请求中附带 `stream_options: {"include_usage": true}`。
+     *
+     * 默认关闭：这是一个可选字段，只支持普通聊天的旧反代收到未知字段可能直接 400。
+     * 不开启时流式用量为尽力读取——上游若不主动返回 usage，界面会如实标注「本次上游未返回用量」。
+     */
+    val streamUsageEnabled: Boolean = false,
 ) {
     /** 名称、地址、模型三者齐备才可发起请求。 */
     val isConfigured: Boolean
@@ -59,6 +79,9 @@ data class CustomProvider(
             // 选中的模型未必在列表里（用户手填、或服务端未列出），这是允许的。
             selectedModel = normalizedSelected.ifBlank { normalizedModels.firstOrNull().orEmpty() },
             reasoningEffort = reasoningEffort.trim().take(MAX_REASONING_EFFORT_LENGTH),
+            // 刻意不按 models 裁剪：`/models` 刷新时上游临时不列出某个模型，
+            // 不应把用户手填过的窗口悄悄删掉。只有设置页显式移除模型才删对应项。
+            modelContextWindows = ChatSettings.normalizeContextWindows(modelContextWindows),
         )
     }
 

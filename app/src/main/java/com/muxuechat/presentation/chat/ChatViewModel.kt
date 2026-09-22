@@ -30,7 +30,7 @@ import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.Conversation
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.CustomProvider
-import com.muxuechat.domain.model.DeepSeekModel
+import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
 import com.muxuechat.domain.model.MessageStatus
@@ -57,19 +57,24 @@ import com.muxuechat.domain.usecase.RenameConversationUseCase
 import com.muxuechat.domain.usecase.RetryRpOptionsUseCase
 import com.muxuechat.domain.usecase.SendMessageUseCase
 import com.muxuechat.domain.usecase.StopGenerationUseCase
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -93,7 +98,7 @@ class ChatViewModel(
 ) : ViewModel() {
     private val activeConversationId = MutableStateFlow<String?>(null)
     private val transient = MutableStateFlow(TransientState())
-    private var generationJob: Job? = null
+    private var generationSession: UiGenerationSession? = null
 
     init {
         viewModelScope.launch {
@@ -116,6 +121,30 @@ class ChatViewModel(
         if (conversationId == null) flowOf(null) else rpRepository.observeRpStatusPanel(conversationId)
     }
 
+    /**
+     * 上下文占用。
+     *
+     * 以前只有用户点开底部面板才算一次，于是顶栏百分比在第一次点开前一直是空的、之后一直是旧值。
+     * 现在由 Repository 持续推送，顶栏和面板消费同一份数据。
+     */
+    private val contextWindowPlan: Flow<ContextWindowPlan?> = activeConversationId
+        .flatMapLatest { conversationId ->
+            if (conversationId == null) {
+                flowOf(null)
+            } else {
+                chatRepository.observeContextWindow(conversationId)
+                    .map<ContextWindowPlan, ContextWindowPlan?> { it }
+                    // 估算失败不能把聊天页拖垮：占用显示不出来最多是少一个提示。
+                    .catch { error ->
+                        Log.w(TAG, "Observing context window failed: ${error.message}", error)
+                        emit(null)
+                    }
+                    // 上游做了防抖，首个规划结果要等一小段时间。uiState 是 combine 出来的，
+                    // 不先给一个占位值的话，切换会话后整页（消息、设置、RP）都会跟着一起空等。
+                    .onStart { emit(null) }
+            }
+        }
+
     private val coreState = combine(
         chatRepository.observeConversations(),
         activeConversationId,
@@ -131,11 +160,12 @@ class ChatViewModel(
             isGenerating = transient.isGenerating,
             retryingRpOptionsMessageId = transient.retryingRpOptionsMessageId,
             errorMessage = transient.errorMessage,
-            contextWindowPlan = transient.contextWindowPlan,
             isCompactingContext = transient.isCompactingContext,
             isSavingSettingsDraft = transient.isSavingSettingsDraft,
             pendingAttachment = transient.pendingAttachment,
             providersWithSavedKey = transient.providersWithSavedKey,
+            isImportingAttachment = transient.isImportingAttachment,
+            modelRefreshErrors = transient.modelRefreshErrors,
             refreshingModelsProviderId = transient.refreshingModelsProviderId,
         )
     }
@@ -168,7 +198,8 @@ class ChatViewModel(
         rpState,
         toolState,
         settingsRepository.displaySettings,
-    ) { core, rp, tool, display ->
+        contextWindowPlan,
+    ) { core, rp, tool, display, contextPlan ->
         ChatUiState(
             conversations = core.conversations,
             activeConversationId = core.activeConversationId,
@@ -188,12 +219,14 @@ class ChatViewModel(
             activeWritingStyle = rp.writingStyleProfiles
                 .firstOrNull { it.id == rp.activeRpSettings?.writingStyleId },
             enrichingMessageIds = tool.enrichingMessageIds,
-            contextWindowPlan = core.contextWindowPlan,
+            contextWindowPlan = contextPlan,
             isCompactingContext = core.isCompactingContext,
             settingsToolDrafts = tool.drafts,
             isSavingSettingsDraft = core.isSavingSettingsDraft,
             pendingAttachment = core.pendingAttachment,
             providersWithSavedKey = core.providersWithSavedKey,
+            isImportingAttachment = core.isImportingAttachment,
+            modelRefreshErrors = core.modelRefreshErrors,
             refreshingModelsProviderId = core.refreshingModelsProviderId,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ChatUiState())
@@ -219,7 +252,10 @@ class ChatViewModel(
 
     /** 选择本地 .txt/.md 文件作为附件。提取失败时只提示，不改变已有附件。 */
     fun attachDocument(uri: Uri) {
+        if (transient.value.isImportingAttachment) return
+        transient.update { it.copy(isImportingAttachment = true) }
         viewModelScope.launch {
+            try {
             when (val result = documentTextExtractor.extract(uri)) {
                 is DocumentImportResult.Success -> {
                     Log.i(
@@ -241,6 +277,9 @@ class ChatViewModel(
                 is DocumentImportResult.Failure -> {
                     transient.update { it.copy(errorMessage = result.reason) }
                 }
+            }
+            } finally {
+                transient.update { it.copy(isImportingAttachment = false) }
             }
         }
     }
@@ -286,43 +325,32 @@ class ChatViewModel(
         )
         if (composed.isBlank()) return
 
-        generationJob?.cancel()
-        generationJob = viewModelScope.launch {
+        transient.update { it.copy(pendingAttachment = null) }
+        startGeneration(
+            initialConversationId = currentConversationId,
+            autoSelectCreatedConversation = currentConversationId == null,
+            operationLabel = "Sending message",
+            fallbackError = "发送失败",
+        ) {
             Log.i(
                 TAG,
                 "Sending message: conversationId=$currentConversationId length=${composed.length} " +
                     "hasAttachment=${attachment != null}",
             )
-            transient.update {
-                it.copy(isGenerating = true, errorMessage = null, pendingAttachment = null)
-            }
             sendMessageUseCase(currentConversationId, composed)
-                .catch { error ->
-                    Log.w(TAG, "Send message failed: ${error.message}", error)
-                    transient.update { it.copy(errorMessage = error.message ?: "发送失败") }
-                }
-                .collect { message ->
-                    handleGenerationMessage(message)
-                }
-            transient.update { it.copy(isGenerating = false) }
         }
     }
 
     fun regenerateLastResponse() {
         val conversationId = activeConversationId.value ?: return
-        generationJob?.cancel()
-        generationJob = viewModelScope.launch {
+        startGeneration(
+            initialConversationId = conversationId,
+            autoSelectCreatedConversation = false,
+            operationLabel = "Regenerate",
+            fallbackError = "重新生成失败",
+        ) {
             Log.i(TAG, "Regenerating last response: conversationId=$conversationId")
-            transient.update { it.copy(isGenerating = true, errorMessage = null) }
             regenerateLastResponseUseCase(conversationId)
-                .catch { error ->
-                    Log.w(TAG, "Regenerate failed: ${error.message}", error)
-                    transient.update { it.copy(errorMessage = error.message ?: "重新生成失败") }
-                }
-                .collect { message ->
-                    handleGenerationMessage(message)
-                }
-            transient.update { it.copy(isGenerating = false) }
         }
     }
 
@@ -349,18 +377,21 @@ class ChatViewModel(
                     errorMessage = null,
                 )
             }
-            retryRpOptionsUseCase(conversationId)
-                .catch { error ->
-                    Log.w(TAG, "Retrying RP options failed: ${error.message}", error)
-                    transient.update {
-                        it.copy(errorMessage = error.message ?: "剧情推进建议生成失败，可稍后重试")
-                    }
-                }
-                .collect {
-                    activeConversationId.value = it.conversationId
+            try {
+                retryRpOptionsUseCase(conversationId).collect {
+                    // 用户已切换会话时只让 Room 自然更新原会话，不能把界面强制切回。
                     transient.update { state -> state.copy(errorMessage = "剧情推进建议已更新") }
                 }
-            transient.update { it.copy(retryingRpOptionsMessageId = null) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w(TAG, "Retrying RP options failed: ${error.javaClass.simpleName}")
+                transient.update {
+                    it.copy(errorMessage = error.message ?: "剧情推进建议生成失败，可稍后重试")
+                }
+            } finally {
+                transient.update { it.copy(retryingRpOptionsMessageId = null) }
+            }
         }
     }
 
@@ -370,18 +401,17 @@ class ChatViewModel(
             return
         }
 
-        generationJob = viewModelScope.launch {
+        startGeneration(
+            initialConversationId = uiState.value.messages
+                .firstOrNull { message -> message.id == messageId }
+                ?.conversationId
+                ?: activeConversationId.value,
+            autoSelectCreatedConversation = false,
+            operationLabel = "Editing user message",
+            fallbackError = "编辑历史消息失败",
+        ) {
             Log.i(TAG, "Editing user message and regenerating: messageId=$messageId length=${content.length}")
-            transient.update { it.copy(isGenerating = true, errorMessage = null) }
             editUserMessageAndRegenerateUseCase(messageId, content)
-                .catch { error ->
-                    Log.w(TAG, "Editing user message failed: ${error.message}", error)
-                    transient.update { it.copy(errorMessage = error.message ?: "编辑历史消息失败") }
-                }
-                .collect { message ->
-                    handleGenerationMessage(message)
-                }
-            transient.update { it.copy(isGenerating = false) }
         }
     }
 
@@ -410,11 +440,20 @@ class ChatViewModel(
     }
 
     fun stopGeneration() {
+        val session = generationSession ?: return
         viewModelScope.launch {
-            Log.i(TAG, "Stopping generation")
-            generationJob?.cancel()
-            stopGenerationUseCase()
-            transient.update { it.copy(isGenerating = false) }
+            Log.i(TAG, "Stopping generation: sessionId=${session.sessionId} conversationId=${session.conversationId}")
+            runCatching {
+                // Repository 先按 conversation 定向取消并收束消息状态；若尚未注册，再取消 UI Job 兜底。
+                stopGenerationUseCase(session.conversationId)
+                session.job.cancelAndJoin()
+            }.onFailure { error ->
+                if (error !is CancellationException) {
+                    Log.w(TAG, "Stopping generation failed: ${error.javaClass.simpleName}")
+                    transient.update { it.copy(errorMessage = "停止生成失败，请重试") }
+                }
+            }
+            finishUiGenerationSession(session.sessionId)
         }
     }
 
@@ -426,7 +465,12 @@ class ChatViewModel(
                 if (activeConversationId.value == conversationId) {
                     activeConversationId.value = null
                 }
-                transient.update { it.copy(errorMessage = "会话已删除") }
+                transient.update {
+                    it.copy(
+                        isGenerating = generationSession?.job?.isActive == true,
+                        errorMessage = "会话已删除",
+                    )
+                }
             }.onFailure { error ->
                 Log.w(TAG, "Deleting conversation failed: ${error.message}", error)
                 transient.update { it.copy(errorMessage = "删除会话失败：${error.message ?: "未知错误"}") }
@@ -449,28 +493,45 @@ class ChatViewModel(
 
     fun clearConversation(conversationId: String) {
         viewModelScope.launch {
-            generationJob?.cancel()
             runCatching {
-                stopGenerationUseCase()
                 clearConversationUseCase(conversationId)
             }.onSuccess {
-                transient.update { it.copy(isGenerating = false, errorMessage = "会话已清空") }
+                transient.update {
+                    it.copy(
+                        isGenerating = generationSession?.job?.isActive == true,
+                        errorMessage = "会话已清空",
+                    )
+                }
             }.onFailure { error ->
                 Log.w(TAG, "Clearing conversation failed: ${error.message}", error)
-                transient.update { it.copy(isGenerating = false, errorMessage = "清空会话失败：${error.message ?: "未知错误"}") }
+                transient.update {
+                    it.copy(
+                        isGenerating = generationSession?.job?.isActive == true,
+                        errorMessage = "清空会话失败：${error.message ?: "未知错误"}",
+                    )
+                }
             }
         }
     }
 
-    fun updateSettings(settings: ChatSettings) {
+    fun updateSettings(transform: (ChatSettings) -> ChatSettings) {
         viewModelScope.launch {
-            settingsRepository.updateSettings(settings)
+            runCatching { settingsRepository.updateSettings(transform) }
+                .onFailure { error ->
+                    Log.w(TAG, "Saving settings failed: ${error.javaClass.simpleName}")
+                    transient.update { it.copy(errorMessage = "设置保存失败，请重试") }
+                }
         }
     }
 
     fun updateDisplayScale(scale: DisplayScale) {
         viewModelScope.launch {
-            settingsRepository.updateDisplaySettings(DisplaySettings(displayScale = scale))
+            runCatching {
+                settingsRepository.updateDisplaySettings(DisplaySettings(displayScale = scale))
+            }.onFailure { error ->
+                Log.w(TAG, "Saving display settings failed: ${error.javaClass.simpleName}")
+                transient.update { it.copy(errorMessage = "显示设置保存失败，请重试") }
+            }
         }
     }
 
@@ -479,6 +540,7 @@ class ChatViewModel(
             runCatching {
                 settingsRepository.saveApiKey(apiKey)
             }.onSuccess {
+                refreshSavedProviderKeys()
                 Log.i(TAG, "API key saved")
                 transient.update { it.copy(errorMessage = "API Key 已保存") }
             }.onFailure { error ->
@@ -493,6 +555,7 @@ class ChatViewModel(
             runCatching {
                 settingsRepository.clearApiKey()
             }.onSuccess {
+                refreshSavedProviderKeys()
                 Log.i(TAG, "API key cleared")
                 transient.update { it.copy(errorMessage = "API Key 已清除") }
             }.onFailure { error ->
@@ -545,7 +608,9 @@ class ChatViewModel(
                 baseUrl = baseUrl,
             ).normalized()
             if (provider.baseUrl.isBlank()) {
-                transient.update { it.copy(errorMessage = "Base URL 无效：只支持 https:// 地址") }
+                transient.update {
+                    it.copy(errorMessage = "Base URL 无效：请填写 http:// 或 https:// 开头的地址")
+                }
                 return@launch
             }
 
@@ -563,10 +628,13 @@ class ChatViewModel(
     }
 
     /** 编辑已有供应商的名称、地址或手填模型列表。 */
-    fun updateCustomProvider(provider: CustomProvider) {
+    fun updateCustomProvider(
+        providerId: String,
+        transform: (CustomProvider) -> CustomProvider,
+    ) {
         viewModelScope.launch {
             runCatching {
-                settingsRepository.upsertCustomProvider(provider.normalized())
+                settingsRepository.updateCustomProvider(providerId, transform)
             }.onFailure { error ->
                 Log.w(TAG, "Updating provider failed: ${error.message}", error)
                 transient.update { it.copy(errorMessage = "供应商保存失败：${error.message ?: "未知错误"}") }
@@ -589,13 +657,9 @@ class ChatViewModel(
     }
 
     /** 聊天页选择 DeepSeek 的某个模型：同时把路由切回 DeepSeek。 */
-    fun selectDeepSeekModel(model: DeepSeekModel) {
-        viewModelScope.launch {
-            val current = settingsRepository.settings.first()
-            settingsRepository.updateSettings(
-                current.copy(provider = ChatProviderId.DEEPSEEK, model = model),
-            )
-        }
+    fun selectDeepSeekModel(modelId: String) {
+        val normalized = DeepSeekModels.normalizeSelectedId(modelId)
+        updateSettings { it.copy(provider = ChatProviderId.DEEPSEEK, model = normalized) }
     }
 
     /** 聊天页选择某个自定义供应商的模型：同时把路由切到该供应商。 */
@@ -610,20 +674,31 @@ class ChatViewModel(
         }
     }
 
+    fun refreshDeepSeekModels() {
+        refreshProviderModels(ChatProviderId.DEEPSEEK.storageValue)
+    }
+
     /** 拉取模型列表。失败只提示，已缓存的列表保持不变，用户仍可手填。 */
     fun refreshProviderModels(providerId: String) {
         if (transient.value.refreshingModelsProviderId != null) return
 
+        transient.update { it.copy(refreshingModelsProviderId = providerId, modelRefreshErrors = it.modelRefreshErrors - providerId) }
         viewModelScope.launch {
-            transient.update { it.copy(refreshingModelsProviderId = providerId) }
             runCatching {
-                settingsRepository.refreshProviderModels(providerId)
+                if (providerId == ChatProviderId.DEEPSEEK.storageValue) {
+                    settingsRepository.refreshDeepSeekModels()
+                } else {
+                    settingsRepository.refreshProviderModels(providerId)
+                }
             }.onSuccess { models ->
                 transient.update { it.copy(errorMessage = "已获取 ${models.size} 个模型") }
             }.onFailure { error ->
                 Log.w(TAG, "Fetching provider models failed: ${error.javaClass.simpleName}")
                 transient.update {
-                    it.copy(errorMessage = error.message ?: "模型列表获取失败，请手动填写模型名")
+                    it.copy(
+                        errorMessage = error.message ?: "模型列表获取失败，请手动填写模型名",
+                        modelRefreshErrors = it.modelRefreshErrors + (providerId to "刷新失败，仍保留旧目录与当前选择。请检查连接与 Key 后重试。"),
+                    )
                 }
             }
             transient.update { it.copy(refreshingModelsProviderId = null) }
@@ -633,9 +708,10 @@ class ChatViewModel(
     /** Keystore 读写属于磁盘 I/O，不能在 Composable 里同步调用，统一在这里刷新。 */
     private fun refreshSavedProviderKeys() {
         viewModelScope.launch {
-            val providerIds = settingsRepository.settings.first().customProviders.map { it.id }
+            val providerIds = settingsRepository.currentSettings().customProviders.map { it.id }
             val ids = withContext(Dispatchers.IO) {
-                providerIds.filter { settingsRepository.hasProviderKey(it) }.toSet()
+                providerIds.filter { settingsRepository.hasProviderKey(it) }.toSet() +
+                    if (!settingsRepository.getApiKey().isNullOrBlank()) setOf(ChatProviderId.DEEPSEEK.storageValue) else emptySet()
             }
             transient.update { it.copy(providersWithSavedKey = ids) }
         }
@@ -789,22 +865,6 @@ class ChatViewModel(
 
     // ---------- 上下文 ----------
 
-    /** 打开上下文视窗时刷新一次构成，避免展示过期数据。 */
-    fun refreshContextWindow() {
-        val conversationId = activeConversationId.value
-        if (conversationId == null) {
-            transient.update { it.copy(contextWindowPlan = null) }
-            return
-        }
-        viewModelScope.launch {
-            runCatching { chatRepository.planContextWindow(conversationId) }
-                .onSuccess { plan -> transient.update { it.copy(contextWindowPlan = plan) } }
-                .onFailure { error ->
-                    Log.w(TAG, "Planning context window failed: ${error.message}", error)
-                }
-        }
-    }
-
     fun compactContextNow() {
         val conversationId = activeConversationId.value ?: return
         if (transient.value.isCompactingContext) return
@@ -824,20 +884,24 @@ class ChatViewModel(
                     transient.update { it.copy(errorMessage = error.message ?: "压缩失败") }
                 }
             transient.update { it.copy(isCompactingContext = false) }
-            refreshContextWindow()
         }
     }
 
+    // 压缩与阈值改动都会经由设置流回到 observeContextWindow，不需要再手动刷新一次。
     fun updateCompressionMode(mode: ContextCompressionMode) {
-        val settings = uiState.value.settings
-        updateSettings(settings.copy(contextCompressionMode = mode))
-        refreshContextWindow()
+        updateSettings { it.copy(contextCompressionMode = mode) }
     }
 
     fun updateCompressionTriggerPercent(percent: Int) {
-        val settings = uiState.value.settings
-        updateSettings(settings.copy(contextAutoTriggerPercent = percent))
-        refreshContextWindow()
+        updateSettings { it.copy(contextAutoTriggerPercent = percent) }
+    }
+
+    fun updateContextCostCapEnabled(enabled: Boolean) {
+        updateSettings { it.copy(contextCostCapEnabled = enabled) }
+    }
+
+    fun updateContextCostCapTokens(tokens: Long) {
+        updateSettings { it.copy(contextCostCapTokens = tokens) }
     }
 
     // ---------- 工具草稿 ----------
@@ -921,23 +985,136 @@ class ChatViewModel(
         }
     }
 
-    private fun handleGenerationMessage(message: ChatMessage) {
-        activeConversationId.value = message.conversationId
+    private fun startGeneration(
+        initialConversationId: String?,
+        autoSelectCreatedConversation: Boolean,
+        operationLabel: String,
+        fallbackError: String,
+        flowFactory: () -> Flow<ChatMessage>,
+    ) {
+        generationSession?.job?.cancel(CancellationException("已开始新的生成"))
+
+        val sessionId = UUID.randomUUID().toString()
+        val settingsSnapshot = uiState.value.settings
+        val providerSnapshot = UiProviderSnapshot(
+            provider = settingsSnapshot.provider,
+            baseUrl = settingsSnapshot.activeBaseUrl,
+            model = settingsSnapshot.activeModel,
+        )
+        transient.update { it.copy(isGenerating = true, errorMessage = null) }
+
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                flowFactory().collect { message ->
+                    handleGenerationMessage(
+                        sessionId = sessionId,
+                        message = message,
+                        autoSelectCreatedConversation = autoSelectCreatedConversation,
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w(TAG, "$operationLabel failed: ${error.javaClass.simpleName}")
+                if (generationSession?.sessionId == sessionId) {
+                    transient.update { it.copy(errorMessage = error.message ?: fallbackError) }
+                }
+            } finally {
+                finishUiGenerationSession(sessionId)
+            }
+        }
+        generationSession = UiGenerationSession(
+            sessionId = sessionId,
+            conversationId = initialConversationId,
+            assistantMessageId = null,
+            job = job,
+            providerSnapshot = providerSnapshot,
+            status = UiGenerationStatus.STARTING,
+            hasAutoSelectedConversation = false,
+        )
+        job.start()
+    }
+
+    private fun handleGenerationMessage(
+        sessionId: String,
+        message: ChatMessage,
+        autoSelectCreatedConversation: Boolean,
+    ) {
+        val session = generationSession?.takeIf { it.sessionId == sessionId } ?: return
+        val shouldConsumeAutoSelection = autoSelectCreatedConversation &&
+            !session.hasAutoSelectedConversation
+        generationSession = session.copy(
+            conversationId = message.conversationId,
+            assistantMessageId = message.id,
+            status = message.status.toUiGenerationStatus(),
+            // 第一条有效消息到达后即永久消费机会；即使当时用户已经切到别处，也不能在后续 delta 重试。
+            hasAutoSelectedConversation = session.hasAutoSelectedConversation || shouldConsumeAutoSelection,
+        )
+        // 只有“空白页首次发送”可以自动选中新建会话；用户随后主动切到 B 时，A 的 delta 只落库。
+        if (shouldConsumeAutoSelection && activeConversationId.value == null) {
+            activeConversationId.value = message.conversationId
+        }
         if (message.status == MessageStatus.COMPLETED && !message.errorMessage.isNullOrBlank()) {
             transient.update { it.copy(errorMessage = message.errorMessage) }
         }
+    }
+
+    private fun finishUiGenerationSession(sessionId: String) {
+        if (generationSession?.sessionId != sessionId) return
+        generationSession = null
+        transient.update { it.copy(isGenerating = false) }
+    }
+
+    override fun onCleared() {
+        generationSession?.job?.cancel(CancellationException("聊天界面已关闭"))
+        generationSession = null
+        chatRepository.cancelAllWork()
+        super.onCleared()
+    }
+
+    private fun MessageStatus.toUiGenerationStatus(): UiGenerationStatus = when (this) {
+        MessageStatus.PENDING -> UiGenerationStatus.STARTING
+        MessageStatus.STREAMING -> UiGenerationStatus.STREAMING
+        MessageStatus.COMPLETED -> UiGenerationStatus.COMPLETED
+        MessageStatus.CANCELLED -> UiGenerationStatus.CANCELLED
+        MessageStatus.FAILED -> UiGenerationStatus.FAILED
+    }
+
+    private data class UiGenerationSession(
+        val sessionId: String,
+        val conversationId: String?,
+        val assistantMessageId: String?,
+        val job: Job,
+        val providerSnapshot: UiProviderSnapshot,
+        val status: UiGenerationStatus,
+        val hasAutoSelectedConversation: Boolean,
+    )
+
+    private data class UiProviderSnapshot(
+        val provider: ChatProviderId,
+        val baseUrl: String,
+        val model: String,
+    )
+
+    private enum class UiGenerationStatus {
+        STARTING,
+        STREAMING,
+        COMPLETED,
+        CANCELLED,
+        FAILED,
     }
 
     private data class TransientState(
         val isGenerating: Boolean = false,
         val retryingRpOptionsMessageId: String? = null,
         val errorMessage: String? = null,
-        val contextWindowPlan: ContextWindowPlan? = null,
         val isCompactingContext: Boolean = false,
         val isSavingSettingsDraft: Boolean = false,
         val pendingAttachment: PendingAttachment? = null,
         /** 已保存 API Key 的供应商 id；只表示"有没有"，不含明文。 */
         val providersWithSavedKey: Set<String> = emptySet(),
+        val isImportingAttachment: Boolean = false,
+        val modelRefreshErrors: Map<String, String> = emptyMap(),
         val refreshingModelsProviderId: String? = null,
     )
 
@@ -949,11 +1126,12 @@ class ChatViewModel(
         val isGenerating: Boolean,
         val retryingRpOptionsMessageId: String?,
         val errorMessage: String?,
-        val contextWindowPlan: ContextWindowPlan?,
         val isCompactingContext: Boolean,
         val isSavingSettingsDraft: Boolean,
         val pendingAttachment: PendingAttachment?,
         val providersWithSavedKey: Set<String>,
+        val isImportingAttachment: Boolean,
+        val modelRefreshErrors: Map<String, String>,
         val refreshingModelsProviderId: String?,
     )
 
@@ -980,17 +1158,19 @@ class ChatViewModel(
                 val database = ChatDatabase.getInstance(application)
                 // 模型列表与聊天走同一个 client 实例：共用连接池，且"停止生成"不会误伤模型拉取。
                 val openAiCompatibleClient = OpenAiCompatibleClient()
+                val deepSeekApiClient = DeepSeekApiClient()
                 val settingsRepository = SettingsRepositoryImpl(
                     settingsDataStore = SettingsDataStore(application),
                     apiKeyStore = EncryptedApiKeyStore(application),
                     providerKeyStore = EncryptedProviderKeyStore(application),
                     openAiCompatibleClient = openAiCompatibleClient,
+                    deepSeekApiClient = deepSeekApiClient,
                     legacyCliProxyApiKeyStore = EncryptedCliProxyApiKeyStore(application),
                 )
                 val chatRepository = ChatRepositoryImpl(
                     chatDao = database.chatDao(),
                     settingsRepository = settingsRepository,
-                    apiClient = DeepSeekApiClient(),
+                    apiClient = deepSeekApiClient,
                     openAiCompatibleClient = openAiCompatibleClient,
                 )
                 val rpRepository = RpRepositoryImpl(database = database)

@@ -25,6 +25,7 @@ private enum class Destination { Chat, Settings }
 @Composable
 fun MuxueChatApp(viewModel: ChatViewModel) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val saveableStateHolder = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
     var destination by rememberSaveable { mutableStateOf(Destination.Chat) }
 
     // Settings 是同一 Activity 内的界面状态，不会自动进入 Android 返回栈。
@@ -43,6 +44,7 @@ fun MuxueChatApp(viewModel: ChatViewModel) {
                 transitionSpec = { fadeIn() togetherWith fadeOut() },
                 label = "destination",
             ) { target ->
+                saveableStateHolder.SaveableStateProvider(target) {
                 when (target) {
                     Destination.Chat -> ChatScreen(
                         state = state,
@@ -90,7 +92,6 @@ fun MuxueChatApp(viewModel: ChatViewModel) {
                         onEditAssistantMessage = viewModel::editAssistantMessage,
                         onAttachDocument = viewModel::attachDocument,
                         onRemoveAttachment = viewModel::clearAttachment,
-                        onRefreshContextWindow = viewModel::refreshContextWindow,
                         onCompactContextNow = viewModel::compactContextNow,
                         onCompressionModeChange = viewModel::updateCompressionMode,
                         onCompressionTriggerChange = viewModel::updateCompressionTriggerPercent,
@@ -112,6 +113,7 @@ fun MuxueChatApp(viewModel: ChatViewModel) {
                         settings = state.settings,
                         displaySettings = state.displaySettings,
                         statusMessage = state.errorMessage,
+                        refreshErrors = state.modelRefreshErrors,
                         onSettingsChange = viewModel::updateSettings,
                         onDisplayScaleChange = viewModel::updateDisplayScale,
                         onSaveApiKey = viewModel::saveApiKey,
@@ -126,6 +128,7 @@ fun MuxueChatApp(viewModel: ChatViewModel) {
                         onRefreshProviderModels = viewModel::refreshProviderModels,
                         onBack = { destination = Destination.Chat },
                     )
+                }
                 }
             }
         }

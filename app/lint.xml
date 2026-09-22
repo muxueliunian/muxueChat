@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!--
+        这三个凭据存储必须使用同步 commit() 并检查返回值。
+        SharedPreferences.edit KTX 扩展会丢弃 commit() 的 Boolean 结果，无法保持当前的失败感知语义。
+    -->
+    <issue id="UseKtx">
+        <ignore path="src/main/java/com/muxuechat/data/local/EncryptedApiKeyStore.kt" />
+        <ignore path="src/main/java/com/muxuechat/data/local/EncryptedCliProxyApiKeyStore.kt" />
+        <ignore path="src/main/java/com/muxuechat/data/local/EncryptedProviderKeyStore.kt" />
+    </issue>
+</lint>

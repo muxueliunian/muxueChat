@@ -20,6 +20,12 @@ import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.runtime.*
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -80,7 +86,7 @@ private fun UserMessage(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.End,
     ) {
-        val bubbleShape = RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 4.dp)
+        val bubbleShape = com.muxuechat.presentation.theme.Corner.Bubble
         Box(
             modifier = Modifier
                 .widthIn(max = 560.dp)
@@ -88,7 +94,7 @@ private fun UserMessage(
                 .background(MaterialTheme.colorScheme.secondaryContainer)
                 .then(
                     if (editable) {
-                        Modifier.clickable { onEditUserMessage(message) }
+                        Modifier.clickable(onClickLabel = "编辑并重新发送这条消息") { onEditUserMessage(message) }
                     } else {
                         Modifier
                     },
@@ -133,12 +139,12 @@ private fun AssistantMessage(
             )
         }
         if (message.content.isNotBlank()) {
-            Text(
+            SelectionContainer { Text(
                 text = message.content,
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.fillMaxWidth(),
-            )
+            ) }
         } else if (streaming) {
             TypingIndicator(modifier = Modifier.padding(vertical = 4.dp))
         }
@@ -164,12 +170,25 @@ private fun AssistantMessage(
                 maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
             )
+        } else if (message.status == MessageStatus.COMPLETED && !message.errorMessage.isNullOrBlank()) {
+            // COMPLETED 上的 errorMessage 是历史派生状态失效/状态栏未更新等中性提示，
+            // 不能套用红色“生成失败”，但也不能静默隐藏。
+            Text(
+                text = "提示：${message.errorMessage}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
         } else if (message.status == MessageStatus.CANCELLED) {
             Text(
                 text = "已停止生成",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        if (!streaming && canRegenerate && (message.status == MessageStatus.FAILED || message.status == MessageStatus.CANCELLED)) {
+            TextButton(onClick = onRegenerate, enabled = !isGenerating) { Text("重试这条回复") }
         }
         if (!streaming && !isGenerating && message.content.isNotBlank()) {
             MessageActionsRow(
@@ -291,35 +310,20 @@ private fun MessageActionsRow(
     onRetryRpOptions: (() -> Unit)?,
     isRetryingRpOptions: Boolean,
 ) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        modifier = Modifier.padding(top = 2.dp),
-    ) {
-        ActionPill(
-            icon = Icons.Outlined.ContentCopy,
-            label = "复制",
-            onClick = onCopy,
-        )
-        ActionPill(
-            icon = Icons.Outlined.Edit,
-            label = "编辑",
-            onClick = onEdit,
-        )
-        if (onRetryRpOptions != null) {
-            ActionPill(
-                icon = Icons.Outlined.Refresh,
-                label = if (isRetryingRpOptions) "重试中" else "重试建议",
-                enabled = !isRetryingRpOptions,
-                onClick = onRetryRpOptions,
-            )
+    var expanded by remember { mutableStateOf(false) }
+    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        ActionPill(Icons.Outlined.ContentCopy, "复制", onClick = onCopy)
+        Box {
+            ActionPill(Icons.Outlined.MoreHoriz, "更多", onClick = { expanded = true })
+            DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
+                DropdownMenuItem(text = { Text("编辑正文") }, onClick = { expanded = false; onEdit() })
+                onRegenerate?.let {
+                    DropdownMenuItem(text = { Text("重新生成") }, onClick = { expanded = false; it() })
+                }
+            }
         }
-        if (onRegenerate != null) {
-            ActionPill(
-                icon = Icons.Outlined.Refresh,
-                label = "重新生成",
-                onClick = onRegenerate,
-            )
+        onRetryRpOptions?.let {
+            ActionPill(Icons.Outlined.Refresh, if (isRetryingRpOptions) "建议补写中" else "重试建议", !isRetryingRpOptions, it)
         }
     }
 }

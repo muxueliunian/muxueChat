@@ -7,6 +7,7 @@ import androidx.room.PrimaryKey
 import com.muxuechat.domain.model.ChatMessage
 import com.muxuechat.domain.model.ChatRole
 import com.muxuechat.domain.model.ConversationRpSettings
+import com.muxuechat.domain.model.ConversationTokenUsage
 import com.muxuechat.domain.model.Conversation
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.RoleCard
@@ -179,6 +180,58 @@ data class ConversationContextEntity(
         coveredMessageCount = coveredMessageCount,
     )
 }
+
+/**
+ * 会话最近一次正文请求的真实 token 用量。
+ *
+ * 同样单独建表：它每轮都会被覆盖，而会话列表是常驻 Flow，没必要为此让抽屉重新发射。
+ * 三个 token 列可空——上游不返回 usage 是常态，用 0 冒充会让界面撒谎。
+ */
+@Entity(
+    tableName = "conversation_token_usage",
+    foreignKeys = [
+        ForeignKey(
+            entity = ConversationEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conversationId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+)
+data class ConversationTokenUsageEntity(
+    @PrimaryKey val conversationId: String,
+    /** DeepSeek 固定为 "DEEPSEEK"，自定义供应商为其 id。切换供应商后据此标注「旧模型数据」。 */
+    val providerKey: String,
+    val model: String,
+    val promptTokens: Int?,
+    val completionTokens: Int?,
+    val totalTokens: Int?,
+    /** 采集当时该模型的 95% 安全窗口，用于解释这份用量占了多少。 */
+    val effectiveContextTokens: Long,
+    val capturedAtMillis: Long,
+) {
+    fun toDomain() = ConversationTokenUsage(
+        conversationId = conversationId,
+        providerKey = providerKey,
+        model = model,
+        promptTokens = promptTokens,
+        completionTokens = completionTokens,
+        totalTokens = totalTokens,
+        effectiveContextTokens = effectiveContextTokens,
+        capturedAtMillis = capturedAtMillis,
+    )
+}
+
+fun ConversationTokenUsage.toEntity() = ConversationTokenUsageEntity(
+    conversationId = conversationId,
+    providerKey = providerKey,
+    model = model,
+    promptTokens = promptTokens,
+    completionTokens = completionTokens,
+    totalTokens = totalTokens,
+    effectiveContextTokens = effectiveContextTokens,
+    capturedAtMillis = capturedAtMillis,
+)
 
 @Entity(
     tableName = "conversation_rp_settings",
@@ -358,6 +411,7 @@ fun ConversationRpSettings.toEntity() = ConversationRpSettingsEntity(
     isRpEnabled = isRpEnabled,
     roleCardId = roleCardId,
     worldSettingId = worldSettingId,
+    writingStyleId = writingStyleId,
     protagonistName = protagonistName,
     protagonistDescription = protagonistDescription,
     protagonistInitialState = protagonistInitialState,

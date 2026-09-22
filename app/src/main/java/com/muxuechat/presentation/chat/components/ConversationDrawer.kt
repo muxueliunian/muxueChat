@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,6 +34,9 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -63,10 +67,14 @@ fun ConversationDrawer(
     var clearTarget by remember { mutableStateOf<Conversation?>(null) }
 
     ModalDrawerSheet(
-        modifier = modifier.fillMaxHeight(),
+        // 不限宽的话会取 M3 默认的 360dp，在 361dp 宽的机器上遮罩只剩 1dp，用户没法点空白处关闭。
+        // 留出至少 60dp 的可点击遮罩。
+        modifier = modifier
+            .fillMaxHeight()
+            .widthIn(max = 300.dp),
         drawerContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         drawerContentColor = MaterialTheme.colorScheme.onSurface,
-        drawerShape = RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp),
+        drawerShape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp),
     ) {
         Column(
             modifier = Modifier
@@ -203,11 +211,12 @@ private fun ConversationRow(
             .heightIn(min = 48.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(background)
+            .semantics { this.selected = selected }
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
         Icon(
-            imageVector = Icons.Outlined.ChatBubbleOutline,
+            imageVector = if (selected) Icons.Outlined.Check else Icons.Outlined.ChatBubbleOutline,
             contentDescription = null,
             tint = if (selected) contentColor else MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.size(18.dp),
@@ -238,7 +247,7 @@ private fun ConversationRow(
             ) {
                 Icon(
                     imageVector = Icons.Outlined.MoreVert,
-                    contentDescription = "会话操作",
+                    contentDescription = "会话操作：${conversation.title.ifBlank { "未命名会话" }}",
                     tint = if (selected) contentColor else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -279,8 +288,9 @@ private fun RenameConversationDialog(
     onDismiss: () -> Unit,
 ) {
     var title by remember(initialTitle) { mutableStateOf(initialTitle) }
+    val guardedDismiss = com.muxuechat.presentation.common.components.rememberGuardedDismiss(title != initialTitle, onDismiss)
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = guardedDismiss,
         title = { Text("重命名会话") },
         text = {
             OutlinedTextField(
@@ -299,7 +309,7 @@ private fun RenameConversationDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = guardedDismiss) {
                 Text("取消")
             }
         },

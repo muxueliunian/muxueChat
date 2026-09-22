@@ -56,28 +56,37 @@ class ContextCompressionPolicyTest {
         assertEquals(ContextCompressionPolicy.MIN_TARGET_PERCENT, policy.targetPercent)
     }
 
+    /**
+     * 阈值现在是相对**模型输入 token 预算**的百分比，不再有任何写死的字符预算。
+     * 用 DeepSeek 默认的 945,904 做一次端到端核对。
+     */
     @Test
-    fun budgetChars_isClampedIntoAllowedRange() {
-        assertEquals(
-            ContextCompressionPolicy.MAX_BUDGET_CHARS,
-            ContextCompressionPolicy(budgetChars = 10_000_000).normalized().budgetChars,
-        )
-        assertEquals(
-            ContextCompressionPolicy.MIN_BUDGET_CHARS,
-            ContextCompressionPolicy(budgetChars = 1).normalized().budgetChars,
-        )
-    }
-
-    @Test
-    fun triggerAndTargetChars_areDerivedFromBudget() {
+    fun triggerAndTargetTokens_areDerivedFromInputBudget() {
         val policy = ContextCompressionPolicy(
             autoTriggerPercent = 75,
             targetPercent = 45,
-            budgetChars = 40_000,
         ).normalized()
 
-        assertEquals(30_000, policy.autoTriggerChars)
-        assertEquals(18_000, policy.targetChars)
+        val budget = 945_904L
+        assertEquals(709_428L, policy.autoTriggerTokens(budget))
+        assertEquals(425_656L, policy.targetTokens(budget))
+    }
+
+    /** 预算非法时不能除出负数或抛异常，直接退化成 0。 */
+    @Test
+    fun triggerAndTargetTokens_areZeroForNonPositiveBudget() {
+        val policy = ContextCompressionPolicy().normalized()
+
+        assertEquals(0L, policy.autoTriggerTokens(0L))
+        assertEquals(0L, policy.targetTokens(-1L))
+    }
+
+    /** 百万级预算下不能因为先乘后除溢出。 */
+    @Test
+    fun triggerTokens_doesNotOverflowForHugeBudgets() {
+        val policy = ContextCompressionPolicy(autoTriggerPercent = 90, targetPercent = 45).normalized()
+
+        assertEquals(9_000_000_000L, policy.autoTriggerTokens(10_000_000_000L))
     }
 
     @Test

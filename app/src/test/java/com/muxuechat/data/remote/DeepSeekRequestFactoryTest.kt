@@ -145,6 +145,55 @@ class DeepSeekRequestFactoryTest {
     }
 
     @Test
+    fun selectedModelId_isPassedThroughEvenIfUnknownToTheClient() {
+        val request = DeepSeekRequestFactory.build(
+            settings = ChatSettings(model = "deepseek-v4-future-pro"),
+            messages = messages,
+            purpose = DeepSeekRequestFactory.Purpose.CHAT,
+        )
+
+        assertEquals("deepseek-v4-future-pro", request.model)
+        assertTrue(json.encodeToString(request).contains("\"model\":\"deepseek-v4-future-pro\""))
+    }
+
+    @Test
+    fun thinkingEnabled_serializesLowHighAndMaxReasoningEffort() {
+        listOf(
+            ReasoningEffort.LOW to "low",
+            ReasoningEffort.HIGH to "high",
+            ReasoningEffort.MAX to "max",
+        ).forEach { (effort, apiName) ->
+            val request = DeepSeekRequestFactory.build(
+                settings = ChatSettings(
+                    thinkingMode = ThinkingMode.ENABLED,
+                    reasoningEffort = effort,
+                ),
+                messages = messages,
+                purpose = DeepSeekRequestFactory.Purpose.CHAT,
+            )
+            assertEquals(apiName, request.thinking?.reasoningEffort)
+            val encoded = json.encodeToString(request)
+            assertTrue(encoded.contains("\"reasoning_effort\":\"$apiName\""))
+            assertTrue(encoded.contains("\"thinking\":{\"type\":\"enabled\",\"reasoning_effort\":\"$apiName\"}"))
+        }
+    }
+
+    @Test
+    fun thinkingDisabled_omitsLowReasoningEffort() {
+        val request = DeepSeekRequestFactory.build(
+            settings = ChatSettings(
+                thinkingMode = ThinkingMode.DISABLED,
+                reasoningEffort = ReasoningEffort.LOW,
+            ),
+            messages = messages,
+            purpose = DeepSeekRequestFactory.Purpose.CHAT,
+        )
+
+        assertNull(request.thinking?.reasoningEffort)
+        assertFalse(json.encodeToString(request).contains("reasoning_effort"))
+    }
+
+    @Test
     fun chatPurpose_keepsStreamFlagInEncodedBody() {
         val request = DeepSeekRequestFactory.build(
             settings = ChatSettings(streamEnabled = true),

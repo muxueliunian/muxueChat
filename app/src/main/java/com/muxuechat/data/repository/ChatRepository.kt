@@ -7,8 +7,13 @@ import com.muxuechat.domain.tool.SettingsToolDraft
 import kotlinx.coroutines.flow.Flow
 
 interface ChatRepository {
-    /** 计算当前会话下一次请求会携带的上下文构成，供「上下文视窗」展示。 */
-    suspend fun planContextWindow(conversationId: String): ContextWindowPlan
+    /**
+     * 上下文占用的响应式视图。
+     *
+     * 消息、摘要、RP 配置、全局设置或上次 API 用量任一变化都会重新发射，
+     * 因此顶栏与底部面板消费的是同一份数据，不会再出现「顶栏还是旧值」。
+     */
+    fun observeContextWindow(conversationId: String): Flow<ContextWindowPlan>
 
     /**
      * 主动压缩：把最老的一段历史换成摘要。
@@ -41,7 +46,11 @@ interface ChatRepository {
      * 用来在 RP 里手工修掉不满意的段落而不打断已有剧情。
      */
     suspend fun editAssistantMessage(messageId: String, content: String)
-    suspend fun stopGeneration()
+    /** 只停止指定会话拥有的正文 session；null 表示停止当前唯一 session。 */
+    suspend fun stopGeneration(conversationId: String? = null)
+
+    /** ViewModel 销毁时取消正文与 Repository 自有的后台补写 scope。 */
+    fun cancelAllWork()
     suspend fun deleteConversation(conversationId: String)
     suspend fun renameConversation(conversationId: String, title: String)
     suspend fun clearConversation(conversationId: String)

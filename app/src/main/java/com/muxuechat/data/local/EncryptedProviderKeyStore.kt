@@ -16,22 +16,38 @@ import javax.crypto.spec.GCMParameterSpec
  * 每个供应商使用**独立的 Keystore alias 与独立的密文键**，
  * 供应商之间、以及与 DeepSeek 的 [EncryptedApiKeyStore] 之间都无法互读或误清。
  */
-class EncryptedProviderKeyStore(context: Context) {
-    private val preferences = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+interface ProviderCredentialStore {
+    suspend fun getApiKey(providerId: String): String?
+    suspend fun saveApiKey(providerId: String, apiKey: String)
+    suspend fun clearApiKey(providerId: String)
+    fun hasApiKey(providerId: String): Boolean
+}
+
+class EncryptedProviderKeyStore internal constructor(
+    context: Context,
+    preferencesName: String,
+    private val keyAliasPrefix: String,
+) : ProviderCredentialStore {
+    constructor(context: Context) : this(context, PREFS_NAME, KEY_ALIAS_PREFIX)
+
+    private val preferences =
+        context.applicationContext.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
     private val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
 
-    suspend fun saveApiKey(providerId: String, apiKey: String) {
+    override suspend fun saveApiKey(providerId: String, apiKey: String) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecretKey(providerId))
 
         val encrypted = cipher.doFinal(apiKey.toByteArray(Charsets.UTF_8))
-        preferences.edit()
-            .putString(ciphertextKey(providerId), encrypted.base64())
-            .putString(ivKey(providerId), cipher.iv.base64())
-            .apply()
+        check(
+            preferences.edit()
+                .putString(ciphertextKey(providerId), encrypted.base64())
+                .putString(ivKey(providerId), cipher.iv.base64())
+                .commit(),
+        ) { "API Key 密文持久化失败" }
     }
 
-    suspend fun getApiKey(providerId: String): String? {
+    override suspend fun getApiKey(providerId: String): String? {
         val ciphertext = preferences.getString(ciphertextKey(providerId), null)?.fromBase64() ?: return null
         val iv = preferences.getString(ivKey(providerId), null)?.fromBase64() ?: return null
 
@@ -45,16 +61,18 @@ class EncryptedProviderKeyStore(context: Context) {
     }
 
     /** 供 UI 展示"是否已保存"，不返回明文。 */
-    fun hasApiKey(providerId: String): Boolean =
+    override fun hasApiKey(providerId: String): Boolean =
         preferences.contains(ciphertextKey(providerId))
 
     /** 删除供应商时必须调用，避免密文和 Keystore 条目成为孤儿。 */
-    suspend fun clearApiKey(providerId: String) {
-        preferences.edit()
-            .remove(ciphertextKey(providerId))
-            .remove(ivKey(providerId))
-            .apply()
-        runCatching { keyStore.deleteEntry(alias(providerId)) }
+    override suspend fun clearApiKey(providerId: String) {
+        check(
+            preferences.edit()
+                .remove(ciphertextKey(providerId))
+                .remove(ivKey(providerId))
+                .commit(),
+        ) { "API Key 密文清理失败" }
+        keyStore.deleteEntry(alias(providerId))
     }
 
     private fun getOrCreateSecretKey(providerId: String): SecretKey {
@@ -85,8 +103,11 @@ class EncryptedProviderKeyStore(context: Context) {
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_TAG_BITS = 128
 
-        fun alias(providerId: String) = "muxuechat_provider_key_$providerId"
+        const val KEY_ALIAS_PREFIX = "muxuechat_provider_key_"
+
         fun ciphertextKey(providerId: String) = "${providerId}_ciphertext"
         fun ivKey(providerId: String) = "${providerId}_iv"
     }
+
+    private fun alias(providerId: String) = "$keyAliasPrefix$providerId"
 }

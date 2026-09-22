@@ -29,7 +29,7 @@ class ChatSettingsProviderTest {
 
         assertEquals(ChatProviderId.DEEPSEEK, settings.provider)
         assertEquals(ChatSettings.DEFAULT_BASE_URL, settings.activeBaseUrl)
-        assertEquals(DeepSeekModel.V4_FLASH.apiName, settings.activeModel)
+        assertEquals(DeepSeekModels.DEFAULT_ID, settings.activeModel)
         assertTrue(settings.usesDeepSeekParameters)
         assertFalse(settings.isCustomProvider)
         assertTrue(settings.samplingParametersEffective)
@@ -40,7 +40,7 @@ class ChatSettingsProviderTest {
         val settings = ChatSettings(
             provider = ChatProviderId.CUSTOM_OPENAI,
             baseUrl = "https://custom.deepseek.example",
-            model = DeepSeekModel.V4_PRO,
+            model = DeepSeekModels.V4_PRO,
             customProviders = listOf(provider(baseUrl = " https://192.168.10.20:8317/v1/ ")),
             activeCustomProviderId = "p1",
             thinkingMode = ThinkingMode.ENABLED,
@@ -145,6 +145,37 @@ class ChatSettingsProviderTest {
         assertTrue(enabled.settingsToolsEnabledForActiveProvider)
         assertFalse(enabled.copy(settingsToolsEnabled = false).settingsToolsEnabledForActiveProvider)
         assertTrue(ChatSettings().settingsToolsEnabledForActiveProvider)
+    }
+
+    @Test
+    fun unknownDeepSeekModelId_survivesNormalizationAndStaysSelected() {
+        val settings = ChatSettings(model = "  deepseek-v4-future  ").normalized()
+
+        assertEquals("deepseek-v4-future", settings.model)
+        assertEquals("deepseek-v4-future", settings.activeModel)
+        assertTrue(settings.deepSeekModelDirectory.selectedMissingFromCatalog)
+        assertEquals(
+            DeepSeekModels.BUILTIN_FALLBACK_IDS + "deepseek-v4-future",
+            settings.deepSeekModelDirectory.visibleModelIds,
+        )
+        assertEquals(
+            DeepSeekModelDirectorySource.BUILTIN_FALLBACK,
+            settings.deepSeekModelDirectory.source,
+        )
+    }
+
+    @Test
+    fun cachedDeepSeekModels_areDistinctFromBuiltinFallback() {
+        val settings = ChatSettings(
+            model = DeepSeekModels.FLASH,
+            deepSeekCachedModelIds = listOf(" deepseek-flash ", "deepseek-flash", "future-id"),
+            deepSeekModelsUpdatedAtMillis = 42L,
+        ).normalized()
+
+        assertEquals(listOf("deepseek-flash", "future-id"), settings.deepSeekCachedModelIds)
+        assertTrue(settings.deepSeekModelDirectory.isFromServerCache)
+        assertEquals(listOf("deepseek-flash", "future-id"), settings.deepSeekModelDirectory.catalogIds)
+        assertFalse(settings.deepSeekModelDirectory.selectedMissingFromCatalog)
     }
 
     @Test

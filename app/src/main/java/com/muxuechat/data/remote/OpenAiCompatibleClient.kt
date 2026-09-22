@@ -1,15 +1,18 @@
 package com.muxuechat.data.remote
 
-import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -17,6 +20,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okio.BufferedSource
 import java.io.IOException
 import java.net.ConnectException
 import java.net.URI
@@ -26,6 +30,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
 
+/** 标记消息已经过客户端清理，可以由 Repository 原样展示。 */
+internal interface OpenAiCompatibleUserFacingError
+
 /**
  * 所有自定义供应商共用的 OpenAI 兼容客户端。
  *
@@ -33,19 +40,31 @@ import javax.net.ssl.SSLException
  * 上游服务自己的 OAuth 与账号体系完全由该服务处理，客户端不会接触、保存或
  * 透传任何 OAuth 凭据，只携带用户填写的 API Key。
  */
-class OpenAiCompatibleClient(
-    private val okHttpClient: OkHttpClient = defaultOkHttpClient(),
-    private val json: Json = Json {
-        ignoreUnknownKeys = true
-        encodeDefaults = false
-    },
-    private val parser: OpenAiCompatibleStreamParser = OpenAiCompatibleStreamParser(json),
+class OpenAiCompatibleClient private constructor(
+    private val okHttpClient: OkHttpClient,
+    private val json: Json,
+    private val parser: OpenAiCompatibleStreamParser,
+    private val logger: RemoteClientLogger,
 ) {
+    constructor(
+        okHttpClient: OkHttpClient = defaultOkHttpClient(),
+        json: Json = defaultJson(),
+        parser: OpenAiCompatibleStreamParser = OpenAiCompatibleStreamParser(json),
+    ) : this(okHttpClient, json, parser, AndroidRemoteClientLogger(TAG))
+
+    internal constructor(
+        okHttpClient: OkHttpClient,
+        logger: RemoteClientLogger,
+        json: Json = defaultJson(),
+        parser: OpenAiCompatibleStreamParser = OpenAiCompatibleStreamParser(json),
+    ) : this(okHttpClient, json, parser, logger)
+
     /**
      * RP 正文完成后可能还会后台补写元数据；这些请求与下一条正文请求可以短暂重叠。
      * 因此必须追踪全部在途 Call，停止生成时不能只取消最后创建的一条。
      */
     private val activeCalls = ConcurrentHashMap.newKeySet<Call>()
+    private val modelCatalogRequester = ModelCatalogRequester(okHttpClient, json, logger)
 
     fun streamChat(
         apiKey: String,
@@ -61,61 +80,92 @@ class OpenAiCompatibleClient(
         )
 
         return callbackFlow {
-            Log.i(TAG, "Starting OpenAI-compatible stream request: model=${requestDto.model}")
+            logger.info("Starting OpenAI-compatible stream request")
             val call = okHttpClient.newCall(request)
             activeCalls.add(call)
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    if (call.isCanceled()) {
-                        close(CancellationException("供应商请求已取消"))
-                        return
+            try {
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        if (call.isCanceled()) {
+                            close(CancellationException("供应商请求已取消"))
+                            return
+                        }
+
+                        logger.warn("OpenAI-compatible stream request failed: ${e.javaClass.simpleName}")
+                        close(toUserReadableNetworkError(e))
                     }
 
-                    Log.w(TAG, "OpenAI-compatible stream request failed: ${e.javaClass.simpleName}")
-                    close(toUserReadableNetworkError(e))
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    response.use {
-                        if (!it.isSuccessful) {
-                            Log.w(TAG, "OpenAI-compatible stream HTTP ${it.code}")
-                            close(httpError(it.code))
-                            return
-                        }
-
-                        val source = it.body?.source()
-                        if (source == null) {
-                            close(IOException("供应商返回了空响应"))
-                            return
-                        }
-
+                    override fun onResponse(call: Call, response: Response) {
                         try {
-                            while (true) {
-                                val line = source.readUtf8Line() ?: break
-                                val event = parser.parseLine(line) ?: continue
-                                if (trySend(event).isFailure) break
-                                if (event == OpenAiCompatibleStreamEvent.Done) break
+                            response.use {
+                                if (!it.isSuccessful) {
+                                    logger.warn("OpenAI-compatible stream HTTP ${it.code}")
+                                    close(httpError(it, apiKey))
+                                    return
+                                }
+
+                                val source = it.body?.source()
+                                if (source == null) {
+                                    close(OpenAiCompatibleResponseException("供应商返回了空响应"))
+                                    return
+                                }
+
+                                var eventCount = 0L
+                                while (true) {
+                                    val line = readSseLineWithinLimit(source) ?: break
+                                    val event = try {
+                                        parser.parseLine(line)
+                                    } catch (error: Exception) {
+                                        logger.warn(
+                                            "OpenAI-compatible stream parsing failed: ${error.javaClass.simpleName}",
+                                        )
+                                        throw OpenAiCompatibleResponseException("供应商返回内容无法解析")
+                                    } ?: continue
+                                    eventCount++
+                                    val sendResult = trySendBlocking(event)
+                                    if (sendResult.isFailure) {
+                                        // 通道只会在下游取消或关闭后发送失败。缓冲区满时这里会等待，
+                                        // 从而把背压传回 OkHttp 读取线程，不能把它误判成流结束。
+                                        call.cancel()
+                                        return
+                                    }
+                                    if (event == OpenAiCompatibleStreamEvent.Done) break
+                                }
+                                logger.info("OpenAI-compatible stream request finished: events=$eventCount")
+                                close()
                             }
-                            Log.i(TAG, "OpenAI-compatible stream request finished")
-                            close()
                         } catch (error: IOException) {
                             if (call.isCanceled()) {
                                 close(CancellationException("供应商请求已取消"))
                             } else {
-                                Log.w(TAG, "OpenAI-compatible stream read failed: ${error.javaClass.simpleName}")
-                                close(toUserReadableNetworkError(error))
+                                if (error !is OpenAiCompatibleResponseException) {
+                                    logger.warn(
+                                        "OpenAI-compatible stream read failed: ${error.javaClass.simpleName}",
+                                    )
+                                }
+                                close(
+                                    if (error is OpenAiCompatibleResponseException) {
+                                        error
+                                    } else {
+                                        toUserReadableNetworkError(error)
+                                    },
+                                )
                             }
-                        } catch (error: Throwable) {
+                        } catch (error: Exception) {
                             if (call.isCanceled()) {
                                 close(CancellationException("供应商请求已取消"))
                             } else {
-                                Log.w(TAG, "OpenAI-compatible stream parsing failed: ${error.javaClass.simpleName}")
-                                close(IOException("供应商返回内容无法解析"))
+                                logger.warn("OpenAI-compatible stream response failed: ${error.javaClass.simpleName}")
+                                close(OpenAiCompatibleResponseException("供应商返回内容无法解析"))
                             }
                         }
                     }
-                }
-            })
+                })
+            } catch (_: RuntimeException) {
+                activeCalls.remove(call)
+                call.cancel()
+                close(OpenAiCompatibleResponseException("供应商请求无法启动"))
+            }
 
             awaitClose {
                 activeCalls.remove(call)
@@ -128,7 +178,7 @@ class OpenAiCompatibleClient(
         apiKey: String,
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
-    ): OpenAiCompatibleChatChunkDto = withContext(Dispatchers.IO) {
+    ): OpenAiCompatibleChatChunkDto = suspendCancellableCoroutine { continuation ->
         require(!requestDto.stream) { "供应商非流式请求必须设置 stream=false" }
         val request = buildRequest(
             apiKey = apiKey,
@@ -136,43 +186,75 @@ class OpenAiCompatibleClient(
             requestDto = requestDto,
             acceptsEventStream = false,
         )
-        Log.i(TAG, "Starting OpenAI-compatible non-stream request: model=${requestDto.model}")
+        logger.info("Starting OpenAI-compatible non-stream request")
 
         val call = okHttpClient.newCall(request)
         activeCalls.add(call)
-        val response = try {
-            call.execute()
-        } catch (error: IOException) {
-            if (call.isCanceled()) {
-                throw CancellationException("供应商请求已取消")
-            }
-            throw toUserReadableNetworkError(error)
-        }
-
-        try {
-            response.use {
-                if (!it.isSuccessful) {
-                    Log.w(TAG, "OpenAI-compatible non-stream HTTP ${it.code}")
-                    throw httpError(it.code)
-                }
-
-                val responseBody = it.body?.string()
-                    ?: throw OpenAiCompatibleResponseException("供应商返回了空响应")
-                Log.i(TAG, "OpenAI-compatible non-stream request finished")
-                try {
-                    json.decodeFromString<OpenAiCompatibleChatChunkDto>(responseBody)
-                } catch (error: Throwable) {
-                    Log.w(TAG, "OpenAI-compatible non-stream parsing failed: ${error.javaClass.simpleName}")
-                    throw OpenAiCompatibleResponseException("供应商返回内容无法解析")
-                }
-            }
-        } catch (error: IOException) {
-            if (call.isCanceled()) {
-                throw CancellationException("供应商请求已取消")
-            }
-            throw if (error is OpenAiCompatibleResponseException) error else toUserReadableNetworkError(error)
-        } finally {
+        continuation.invokeOnCancellation {
+            // Job 与 Call 一一绑定；取消正文不会再通过全局 activeCalls 误伤 RP 补写。
             activeCalls.remove(call)
+            call.cancel()
+        }
+        try {
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    activeCalls.remove(call)
+                    val error = if (call.isCanceled()) {
+                        CancellationException("供应商请求已取消")
+                    } else {
+                        toUserReadableNetworkError(e)
+                    }
+                    continuation.resumeWith(Result.failure(error))
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    val result = runCatching {
+                        response.use {
+                            if (!it.isSuccessful) {
+                                logger.warn("OpenAI-compatible non-stream HTTP ${it.code}")
+                                throw httpError(it, apiKey)
+                            }
+
+                            val responseBody = readBodyWithinLimit(
+                                response = it,
+                                maxBytes = MAX_NON_STREAM_RESPONSE_BYTES,
+                                tooLargeMessage = "供应商响应过大，已停止解析",
+                            )
+                            try {
+                                json.decodeFromString<OpenAiCompatibleChatChunkDto>(responseBody).also {
+                                    logger.info("OpenAI-compatible non-stream request finished")
+                                }
+                            } catch (error: Exception) {
+                                logger.warn(
+                                    "OpenAI-compatible non-stream parsing failed: ${error.javaClass.simpleName}",
+                                )
+                                throw OpenAiCompatibleResponseException("供应商返回内容无法解析")
+                            }
+                        }
+                    }
+                    activeCalls.remove(call)
+                    result.fold(
+                        onSuccess = { value ->
+                            continuation.resumeWith(Result.success(value))
+                        },
+                        onFailure = { error ->
+                            val terminalError = when {
+                                call.isCanceled() -> CancellationException("供应商请求已取消")
+                                error is OpenAiCompatibleResponseException -> error
+                                error is IOException -> toUserReadableNetworkError(error)
+                                else -> OpenAiCompatibleResponseException("供应商返回内容无法解析")
+                            }
+                            continuation.resumeWith(Result.failure(terminalError))
+                        },
+                    )
+                }
+            })
+        } catch (_: RuntimeException) {
+            activeCalls.remove(call)
+            call.cancel()
+            continuation.resumeWith(
+                Result.failure(OpenAiCompatibleResponseException("供应商请求无法启动")),
+            )
         }
     }
 
@@ -183,56 +265,16 @@ class OpenAiCompatibleClient(
      * 因此这里失败就抛可读异常，由上层降级到手填，绝不能影响聊天本身。
      * 请求不进 [activeCalls]：它与生成无关，"停止生成"不应该把它一起取消。
      */
-    suspend fun listModels(apiKey: String, baseUrl: String): List<String> = withContext(Dispatchers.IO) {
-        val requestUrl = "${normalizeBaseUrl(baseUrl)}/models"
-        val proxyApiKey = apiKey.trim().also { key ->
-            require(key.isNotEmpty()) { "请先在设置中保存供应商 API Key" }
-            require(key.none { it == '\r' || it == '\n' }) { "供应商 API Key 格式无效" }
-        }
-        val request = Request.Builder()
-            .url(requestUrl)
-            .header("Authorization", "Bearer $proxyApiKey")
-            .get()
-            .build()
-
-        Log.i(TAG, "Fetching model list")
-        val response = try {
-            okHttpClient.newCall(request).execute()
-        } catch (error: IOException) {
-            throw toUserReadableNetworkError(error)
-        }
-
-        response.use {
-            if (!it.isSuccessful) {
-                Log.w(TAG, "Model list HTTP ${it.code}")
-                throw if (it.code == 404) {
-                    OpenAiCompatibleResponseException("该供应商不提供模型列表接口（404），请手动填写模型名")
-                } else {
-                    httpError(it.code)
-                }
-            }
-
-            val body = it.body?.string()
-                ?: throw OpenAiCompatibleResponseException("供应商返回了空响应")
-            val models = runCatching {
-                json.decodeFromString<OpenAiCompatibleModelsResponseDto>(body)
-            }.getOrElse { error ->
-                Log.w(TAG, "Model list parsing failed: ${error.javaClass.simpleName}")
-                throw OpenAiCompatibleResponseException("模型列表格式无法解析，请手动填写模型名")
-            }
-                .data
-                .map { model -> model.id.trim() }
-                .filter { id -> id.isNotEmpty() }
-                .distinct()
-                .sorted()
-
-            if (models.isEmpty()) {
-                throw OpenAiCompatibleResponseException("供应商返回的模型列表为空，请手动填写模型名")
-            }
-            Log.i(TAG, "Model list fetched: count=${models.size}")
-            models
-        }
-    }
+    suspend fun listModels(apiKey: String, baseUrl: String): List<String> =
+        modelCatalogRequester.listModels(
+            apiKey = apiKey,
+            baseUrl = baseUrl,
+            normalizeBaseUrl = { url -> normalizeBaseUrl(url) },
+            copy = ModelCatalogRequester.OPENAI_COMPATIBLE_COPY,
+            wrap = { message -> OpenAiCompatibleResponseException(message) },
+            mapHttpError = { response, key -> httpError(response, key) },
+            mapNetworkError = { error -> toUserReadableNetworkError(error) },
+        )
 
     /** 取消当前所有进行中的流式或非流式请求。 */
     fun cancelActiveRequest() {
@@ -274,17 +316,121 @@ class OpenAiCompatibleClient(
             .build()
     }
 
-    private class OpenAiCompatibleResponseException(message: String) : IOException(message)
+    /** 仅承载本客户端生成并已做凭据清理、长度限制的用户可见错误。 */
+    private class OpenAiCompatibleResponseException(message: String) :
+        IOException(message),
+        OpenAiCompatibleUserFacingError,
+        ModelCatalogUserFacingError
+
+    /**
+     * 读取供应商明确返回的结构化错误，而不是只保留 HTTP 状态码。
+     *
+     * 错误正文来自不受信任的远端：只接受 `code` / `message`，限制读取与展示长度，
+     * 并清除当前 API Key、Bearer 凭据及控制字符。完整正文绝不进入日志或异常。
+     */
+    private fun httpError(response: Response, apiKey: String): IOException {
+        val details = readProviderErrorDetails(response, apiKey)
+        if (details == null) return httpError(response.code)
+
+        val title = when (response.code) {
+            401 -> "供应商鉴权失败"
+            402 -> "供应商服务余额或订阅不可用"
+            403 -> "供应商拒绝访问"
+            429 -> "供应商请求过于频繁"
+            in 500..599 -> "供应商服务暂时不可用"
+            else -> "供应商请求失败"
+        }
+        val status = buildString {
+            append("HTTP ")
+            append(response.code)
+            details.code?.let {
+                append("，错误码 ")
+                append(it)
+            }
+        }
+        return OpenAiCompatibleResponseException(
+            buildString {
+                append(title)
+                append('（')
+                append(status)
+                append('）')
+                details.message?.let {
+                    append('：')
+                    append(it)
+                }
+            },
+        )
+    }
+
+    private fun readProviderErrorDetails(response: Response, apiKey: String): ProviderErrorDetails? {
+        val body = runCatching {
+            readBodyWithinLimit(
+                response = response,
+                maxBytes = MAX_ERROR_RESPONSE_BYTES,
+                tooLargeMessage = "供应商错误响应过大",
+            )
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: return null
+
+        val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
+        val source = (root["error"] as? JsonObject) ?: root
+        val code = (source["code"] as? JsonPrimitive)
+            ?.contentOrNull
+            ?.trim()
+            ?.takeIf { SAFE_ERROR_CODE.matches(it) }
+        val message = (source["message"] as? JsonPrimitive)
+            ?.contentOrNull
+            ?.let { sanitizeProviderErrorMessage(it, apiKey) }
+        return ProviderErrorDetails(code = code, message = message)
+            .takeIf { it.code != null || it.message != null }
+    }
+
+    private fun sanitizeProviderErrorMessage(message: String, apiKey: String): String? {
+        var sanitized = message
+        apiKey.trim().takeIf { it.isNotEmpty() }?.let { sanitized = sanitized.replace(it, REDACTED) }
+        sanitized = sanitized
+            .replace(BEARER_CREDENTIAL, "Bearer $REDACTED")
+            .replace(CONTROL_CHARACTERS, " ")
+            .replace(REPEATED_WHITESPACE, " ")
+            .trim()
+        if (sanitized.isEmpty()) return null
+        return if (sanitized.length <= MAX_ERROR_MESSAGE_CHARS) {
+            sanitized
+        } else {
+            sanitized.take(MAX_ERROR_MESSAGE_CHARS) + "…"
+        }
+    }
+
+    private data class ProviderErrorDetails(
+        val code: String?,
+        val message: String?,
+    )
 
     companion object {
+        internal const val MAX_SSE_LINE_BYTES = 1_048_576L
+        internal const val MAX_NON_STREAM_RESPONSE_BYTES = 8_388_608L
+        internal const val MAX_MODELS_RESPONSE_BYTES = ModelCatalogParser.MAX_RESPONSE_BYTES
+        internal const val MAX_ERROR_RESPONSE_BYTES = 65_536L
+        internal const val MAX_MODEL_COUNT = ModelCatalogParser.MAX_MODEL_COUNT
+        internal const val MAX_MODEL_ID_LENGTH = ModelCatalogParser.MAX_MODEL_ID_LENGTH
+        internal const val MAX_ERROR_MESSAGE_CHARS = 300
         private const val TAG = "muxueChat.OpenAiCompatible"
+        private const val REDACTED = "<已隐藏>"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val SAFE_ERROR_CODE = Regex("[A-Za-z0-9._-]{1,64}")
+        private val BEARER_CREDENTIAL = Regex("(?i)Bearer\\s+[^\\s,;]+")
+        private val CONTROL_CHARACTERS = Regex("[\\p{Cc}\\p{Cf}]")
+        private val REPEATED_WHITESPACE = Regex("\\s+")
 
         private fun defaultOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
+
+        private fun defaultJson(): Json = Json {
+            ignoreUnknownKeys = true
+            encodeDefaults = false
+        }
 
         /**
          * 允许 http 与 https。
@@ -329,6 +475,36 @@ class OpenAiCompatibleClient(
             is SocketTimeoutException -> IOException("连接供应商超时，请检查网络和服务状态")
             is SSLException -> IOException("供应商的 HTTPS 证书校验失败")
             else -> IOException("供应商网络请求失败，请检查网络连接和服务状态")
+        }
+
+        private fun readSseLineWithinLimit(source: BufferedSource): String? {
+            val newlineIndex = source.indexOf(
+                '\n'.code.toByte(),
+                0L,
+                MAX_SSE_LINE_BYTES + 1L,
+            )
+            if (newlineIndex >= 0L) return source.readUtf8Line()
+            if (source.buffer.size > MAX_SSE_LINE_BYTES) {
+                throw OpenAiCompatibleResponseException("供应商流式响应单行过大，已停止解析")
+            }
+            return if (source.buffer.size == 0L) null else source.readUtf8()
+        }
+
+        private fun readBodyWithinLimit(
+            response: Response,
+            maxBytes: Long,
+            tooLargeMessage: String,
+        ): String {
+            val body = response.body
+                ?: throw OpenAiCompatibleResponseException("供应商返回了空响应")
+            if (body.contentLength() > maxBytes) {
+                throw OpenAiCompatibleResponseException(tooLargeMessage)
+            }
+            val source = body.source()
+            if (source.request(maxBytes + 1L)) {
+                throw OpenAiCompatibleResponseException(tooLargeMessage)
+            }
+            return source.readUtf8()
         }
     }
 }

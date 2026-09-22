@@ -47,5 +47,7 @@ data class ChatUiState(
     /** 已保存 API Key 的自定义供应商 id；只用于显示状态，不含明文。 */
     val providersWithSavedKey: Set<String> = emptySet(),
     /** 正在拉取模型列表的供应商 id。 */
+    val isImportingAttachment: Boolean = false,
+    val modelRefreshErrors: Map<String, String> = emptyMap(),
     val refreshingModelsProviderId: String? = null,
 )

@@ -26,6 +26,11 @@ android {
         arg("room.schemaLocation", "$projectDir/schemas")
     }
 
+    // MigrationTestHelper 从测试 APK 的 assets 读取导出的 schema JSON（8.json → 9.json 真实升级测试）。
+    sourceSets {
+        getByName("androidTest").assets.srcDir("$projectDir/schemas")
+    }
+
     buildFeatures {
         compose = true
     }
@@ -67,4 +72,10 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+
+    // DAO 数据完整性回归需要在真实 SQLite/Room 外键语义下运行；
+    // room-testing 提供 MigrationTestHelper，用导出的 8.json/9.json 做真实 schema 升级校验。
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
+    androidTestImplementation("androidx.room:room-testing:$roomVersion")
 }

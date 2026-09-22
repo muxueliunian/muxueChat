@@ -1,5 +1,6 @@
 package com.muxuechat.data.remote
 
+import com.muxuechat.domain.context.ChatContextPlanner
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.ThinkingMode
 
@@ -41,13 +42,19 @@ object DeepSeekRequestFactory {
         streamOverride: Boolean? = null,
         tools: List<DeepSeekToolDto>? = null,
         toolChoice: String? = null,
+        /**
+         * 覆盖本次请求使用的模型名，留空或 null 表示用设置里的正文模型。
+         *
+         * 只有 RP 辅助请求会用到：它们只要结构化 JSON，可以走更便宜的模型。
+         */
+        modelOverride: String? = null,
     ): DeepSeekChatRequest {
         val normalized = settings.normalized()
         val thinkingEnabled = purpose.thinkingEnabled(normalized)
         val samplingEffective = !thinkingEnabled
 
         return DeepSeekChatRequest(
-            model = normalized.model.apiName,
+            model = modelOverride?.trim()?.ifBlank { null } ?: normalized.model,
             messages = messages,
             stream = streamOverride ?: (purpose == Purpose.CHAT && normalized.streamEnabled),
             maxTokens = purpose.maxTokens(normalized),
@@ -98,7 +105,13 @@ object DeepSeekRequestFactory {
     const val RP_METADATA_MAX_TOKENS = 900
     const val RP_STATE_UPDATE_MAX_TOKENS = 512
     const val SETTINGS_GENERATION_MAX_TOKENS = 12_000
-    const val CONTEXT_SUMMARY_MAX_TOKENS = 2_000
+    /**
+     * 摘要请求的输出上限。
+     *
+     * 直接引用规划器的常量：上下文规划器要用同一个数字为摘要请求预留输出空间，
+     * 两边各写一份迟早会漂移，届时规划器会以为还装得下，而服务端已经拒绝了。
+     */
+    const val CONTEXT_SUMMARY_MAX_TOKENS = ChatContextPlanner.SUMMARY_OUTPUT_RESERVE_TOKENS
 
     private const val RP_METADATA_TEMPERATURE = 0.35
     private const val RP_STATE_UPDATE_TEMPERATURE = 0.1
