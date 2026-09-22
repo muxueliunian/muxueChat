@@ -7,7 +7,7 @@
 - 所有交流、总结、注释性文档优先使用中文。
 - 用户系统环境是 Windows 11，常用开发环境是 Android Studio。
 - 本项目是个人使用 App，不做账号系统、云同步、埋点、推送通知、多用户权限或后台服务，且 App 自身不部署、运维或代理后台服务。
-- App 可以作为客户端调用用户自行配置的 OpenAI 兼容 `chat/completions` 端点（自定义供应商，可保存多个，允许 http 或 https）；这些服务本身的部署、账号、OAuth 登录与运维均不在本项目范围内。
+- App 可以作为客户端调用用户自行配置的 OpenAI 兼容 `chat/completions` 端点（自定义供应商，可保存多个，允许 http 或 https）；这些服务本身的部署、账号、OAuth 登录与运维均不在本项目范围内（唯一例外见 §2「xAI 订阅登录例外」）。
 - 本项目只考虑 Android 16 及以上：
   - `minSdk = 36`
   - `targetSdk = 36`
@@ -35,7 +35,13 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 - 自定义供应商的思考等级走 OpenAI 系的顶层 `reasoning_effort` 字段，取值由用户自行填写，App 不做枚举校验（各家档位不统一）。留空时**必须完全不发送该字段**——不支持思考的模型收到未知字段可能直接 400。
 - `reasoning_effort` 只随正文对话发送；RP 元数据、状态兜底、上下文摘要一律不发。
 - 每个自定义供应商的 API Key 与 DeepSeek API Key 分别保存，各占独立的 Android Keystore alias；删除供应商必须同时删除其 Key。
-- App 不实现、发起、保存或复用任何 OAuth：不得包含 OAuth client ID、授权码、access token、refresh token、Cookie 或第三方 CLI 的登录身份。用户只能填写服务已签发的 API Key。
+- App 默认不实现、发起、保存或复用任何 OAuth：不得包含 OAuth client ID、授权码、access token、refresh token、Cookie 或第三方 CLI 的登录身份，用户只能填写服务已签发的 API Key。**唯一例外是 xAI 订阅登录**（用户 2026-09-22 批准），边界如下：
+  - 仅限 xAI：OAuth 端点钉死 `https://auth.x.ai`，服务地址钉死 `https://cli-chat-proxy.grok.com/v1`，不接受用户编辑，不适用明文 HTTP 放行策略；任何情况下不得把 `Authorization` 头发往非钉死主机，禁止跟随跨主机重定向。
+  - 复用 Grok CLI 公开 client_id 构成客户端身份冒用，可能违反 xAI 服务条款乃至导致账号被封，风险由用户承担；设置页必须如实提示。
+  - 仍然禁止：读取任何第三方 CLI 的本地凭据文件（如 `~/.grok/auth.json`）、保存或读取浏览器 Cookie、Token 手工导入。
+  - xAI 认证模块本身属于该例外，不视为请求层的厂商特判。
+  - 不得借此为其他厂商或其他 OAuth 场景开口；新增任何 OAuth 厂商须由用户另行批准并修改本条。
+  - 该例外不改变「App 不做后台服务」的约束：token 刷新只在前台按需进行，不得为刷新引入后台任务或定时器。
 - 自定义供应商同时接受 `https://` 与 `http://` 端点。明文 HTTP 是**用户明确要求并接受风险**的能力，用于接入没有证书的局域网自建服务；应用层不再限制地址范围，但 UI 必须在选中 http 端点时给出明文提示。
 - 「一般化」的边界到此为止：不引入通用多 Provider SDK，不为 Anthropic、Gemini 等非 OpenAI 协议新增适配层。用户需要这些服务时，应填写它们的 OpenAI 兼容端点。
 - 设置页必须明确告知用户「只支持 DeepSeek 协议与 OpenAI 兼容格式」，不要让用户以为填任意厂商地址都能用。
@@ -135,9 +141,10 @@ com.muxuechat
 
 规则：
 
-- DeepSeek API Key 与每个自定义供应商的 API Key 必须分别保存到 Android Keystore；不得明文写入 Room、DataStore、日志、错误提示或测试快照。
+- DeepSeek API Key、每个自定义供应商的 API Key 与 xAI OAuth 凭据必须分别用 Android Keystore 保护；不得明文写入 Room、DataStore、日志、错误提示或测试快照。
 - 供应商的名称、Base URL、模型列表属于普通设置，可以进 DataStore；Key 绝不可以。
-- App 不保存任何 OAuth 凭据、浏览器会话或第三方 CLI 登录状态。
+- App 不保存浏览器会话、Cookie 或第三方 CLI 登录状态。
+- xAI OAuth 凭据（access / refresh / id token）与 API Key 同法保存：独立 Keystore alias 持有 AES 密钥，AES/GCM 密文与 IV 写入应用私有 SharedPreferences，明文只在内存中存在。解密失败按未登录处理并清理残留密文，不得崩溃；登出同时删除密文与 alias。
 - 会话和消息数据优先通过 DAO 暴露，避免 UI 层直接操作数据库。
 - 删除会话应依赖 Room 外键级联删除消息，避免手工多处删除导致不一致。
 
@@ -151,8 +158,8 @@ com.muxuechat
 规则：
 
 - 协议实现严格限于两条：DeepSeek 专属协议与 OpenAI 兼容协议。自定义供应商共用后者的同一套 DTO、Client 和 RequestFactory，不允许按供应商名称新增代码分支；两条协议均可承载标准 function tools，但 DeepSeek 私有 thinking/RP Marker 绝不进入 OpenAI 兼容请求。
-- `OpenAiCompatibleClient` 请求用户配置的 `http(s)://` 端点；不允许 App 内 OAuth。地址仍不得包含 user-info、query 或 fragment。
-- 上游服务的 OAuth、令牌刷新、部署和运维均由该服务自身负责，App 不参与。
+- `OpenAiCompatibleClient` 请求用户配置的 `http(s)://` 端点；除 §2 的 xAI 例外外，不允许 App 内 OAuth。地址仍不得包含 user-info、query 或 fragment。
+- 对自定义 OpenAI 兼容供应商，上游服务的 OAuth、令牌刷新、部署和运维均由该服务自身负责，App 不参与。
 - `GET {base}/models` 只用于填充模型选择列表；服务不支持时必须优雅降级到手填，不能阻断聊天。
 - 思考内容的响应字段名不统一：`reasoning_content`（DeepSeek/Qwen/GLM 等）与 `reasoning`（OpenRouter）都要解析，取先出现的非空值。这是字段别名，不是厂商特判。
 - DeepSeek Base URL 默认：
@@ -318,7 +325,7 @@ DeepSeek 官方文档明确：**`thinking` 的缺省值是 `enabled`**（默认 
 - Room entity 与 domain model 分离。
 - Entity 到 domain 的转换放在 local 层或邻近文件。
 - DataStore 用于普通设置（含自定义供应商列表：名称、Base URL、模型列表、当前选中项），不存任何 Provider 凭据。
-- DeepSeek API Key 与各自定义供应商的 API Key 只能通过 Keystore 加密存储；OAuth 凭据不属于 App 数据模型。
+- DeepSeek API Key 与各自定义供应商的 API Key 只能通过 Keystore 加密存储；OAuth 凭据仅限 xAI，同样只能通过 Keystore 加密存储，不进 DataStore、Room。
 
 ### 5.4 网络
 
@@ -348,6 +355,7 @@ DeepSeek 官方文档明确：**`thinking` 的缺省值是 `enabled`**（默认 
 
 - API Key。
 - Authorization header。
+- OAuth 的 access token、refresh token、id token、授权码、`device_code`、`user_code`、PKCE `code_verifier`、`state`。
 - 完整用户消息。
 - 完整 system prompt。
 - 角色卡敏感内容。
@@ -421,7 +429,7 @@ Windows 下优先使用：
 - 各 Provider 的 API Key 手动保存，且不展示已保存明文。
 - 其他设置实时保存。
 - 必须提示”设置会在下一次发送消息时生效”。
-- 设置页不提供任何 OAuth 登录、Token 导入或第三方 CLI 身份复用入口。
+- 设置页不提供 Token 导入或第三方 CLI 身份复用入口。唯一允许的登录入口是 xAI 订阅登录，入口旁必须显示账号风险提示；登出必须二次确认（与「清除 Key」一致）。
 - 供应商地址为 http 时，设置页必须显示明文风险提示。
 - 供应商的增删改在设置页完成；删除供应商必须二次确认，并同时清除其 Keystore 条目。
 - thinking mode、reasoning effort 及其采样参数提示仅适用于 DeepSeek；自定义供应商下不得误导性展示为可生效的 DeepSeek 专属配置。
@@ -465,7 +473,7 @@ Windows 下优先使用：
 - 禁止把 API Key 明文保存到 Room/DataStore。
 - 禁止擅自降级 Android SDK。
 - 禁止把 OpenAI 兼容链路扩展成通用多 Provider 框架，或为某个具体厂商新增私有协议适配。
-- 禁止在 App 内实现或复用任何 OAuth、浏览器 Cookie、第三方 CLI client ID、access token、refresh token 或登录身份。
+- 禁止在 App 内实现或复用任何 OAuth、浏览器 Cookie、第三方 CLI client ID、access token、refresh token 或登录身份。唯一例外为 §2 所述 xAI 订阅登录；该例外内仍禁止读取第三方 CLI 本地凭据文件、保存浏览器 Cookie、将 OAuth token 发往非钉死主机。
 - 禁止在未经用户确认的情况下改动明文 HTTP 策略（收紧或进一步放开都算）。
 - 禁止把任一供应商的 API Key 写入 DataStore、Room 或供应商列表 JSON。
 - 禁止把 RP 模式直接做成一段不可维护的硬编码 prompt。
