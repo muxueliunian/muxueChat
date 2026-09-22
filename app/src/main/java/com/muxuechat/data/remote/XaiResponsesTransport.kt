@@ -1,5 +1,6 @@
 package com.muxuechat.data.remote
 
+import com.muxuechat.domain.model.CustomProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.ChannelResult
@@ -29,7 +30,7 @@ import java.util.concurrent.TimeUnit
 /**
  * xAI 订阅链路的传输实现：把 OpenAI 兼容请求翻译成 Responses 协议，再把 SSE 翻译回来。
  *
- * 这是 AGENT.md §2 / §6 批准的唯一一个非标准传输实现。**翻译完全封在本类内部**：
+ * 这是 AGENT.md §2 / §3.3 批准的唯一一个非标准传输实现。**翻译完全封在本类内部**：
  * 上层构造的仍是 [OpenAiCompatibleChatRequest]，收到的仍是 [OpenAiCompatibleStreamEvent]，
  * 调用方不知道自己走的是哪个实现。
  *
@@ -188,18 +189,22 @@ class XaiResponsesTransport private constructor(
         emit: (OpenAiCompatibleStreamEvent) -> ChannelResult<Unit>,
     ) {
         if (!response.isSuccessful) {
-            // 上游明确拒绝时，它的说明往往是唯一能定位原因的线索（例如 426 会写清最低版本）。
-            // 只记日志、不进消息表；先去掉可能出现的凭据再截断。
-            logger.warn("xAI Responses stream HTTP ${response.code}: ${readErrorDetail(response)}")
+            // 只记状态码。**不要记录上游响应体**：它可能回显本次请求的正文或系统提示，
+            // 而 AGENT.md 禁止把用户消息与系统提示写进日志。靠几条 token 正则做脱敏
+            // 是黑名单思路，覆盖不到裸 JWT、JSON 里的 token 字段与回显的 prompt。
+            // 需要诊断上游拒绝原因时，临时打一个带正文日志的调试包，不要常驻。
+            logger.warn("xAI Responses stream HTTP ${response.code}")
             throw httpError(response.code)
         }
         val source = response.body?.source() ?: throw XaiResponsesException("xAI 返回了空响应")
 
+        // 解析器持有流级状态（并发正文项检测），每条流必须用独立会话。
+        val session = parser.newSession()
         var sawCompleted = false
         var eventCount = 0L
         while (true) {
             val line = readSseLineWithinLimit(source) ?: break
-            val parsed = parser.parseLine(line) ?: continue
+            val parsed = session.parseLine(line) ?: continue
             eventCount++
             if (emit(parsed.delta).isFailure) {
                 // 通道只在下游取消或关闭后失败；缓冲区满时会阻塞并把背压传回读取线程。
@@ -228,12 +233,21 @@ class XaiResponsesTransport private constructor(
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
     ): Request {
-        require(requestDto.tools.isNullOrEmpty()) {
-            "xAI 订阅链路暂不支持工具调用，请在该供应商设置中关闭「启用标准工具调用」"
+        // 必须抛带标记的异常：普通 IllegalArgumentException 会落到上层按关键字收敛的
+        // 兜底映射上，而「订阅」二字会被误判成额度不足，把真正的原因盖掉。
+        if (!requestDto.tools.isNullOrEmpty()) {
+            throw XaiResponsesException("xAI 链路暂不支持工具调用，请在该供应商设置中关闭工具开关")
         }
+        // 发送凭据的最后一道关口自己校验，不依赖调用方自律：
+        // 冻结器已经钉死地址，但本类是唯一附加 Authorization 的地方（AGENT.md §2）。
+        val normalized = baseUrl.trim().trimEnd('/')
+        if (!normalized.equals(CustomProvider.XAI_SUBSCRIPTION_BASE_URL, ignoreCase = true)) {
+            throw XaiResponsesException("xAI 服务地址不合法，已中止请求")
+        }
+        warnUnsupportedSamplingParams(requestDto)
         val payload = json.encodeToString(toResponsesRequest(requestDto))
         return Request.Builder()
-            .url("${baseUrl.trimEnd('/')}/responses")
+            .url("$normalized/responses")
             .post(payload.toRequestBody(JSON_MEDIA_TYPE))
             .header("Authorization", "Bearer $accessToken")
             .header("Accept", "text/event-stream")
@@ -248,6 +262,23 @@ class XaiResponsesTransport private constructor(
             .header("x-grok-model-override", requestDto.model)
             .header("x-authenticateresponse", "authenticate-response")
             .build()
+    }
+
+    /**
+     * temperature / top_p 在抓包中**从未出现**，因此不翻译。
+     *
+     * 但也不能静默丢弃：上层如果配置了它们却不生效，用户看到的行为与设置不符。
+     * 这里显式记一条日志（只记字段名，不记取值），并在 `docs/XAI_WIRE_FORMAT.md`
+     * 标注为未支持。要支持必须先补采，不能照 OpenAI Responses 的文档猜字段名。
+     */
+    private fun warnUnsupportedSamplingParams(requestDto: OpenAiCompatibleChatRequest) {
+        val dropped = buildList {
+            if (requestDto.temperature != null) add("temperature")
+            if (requestDto.topP != null) add("top_p")
+        }
+        if (dropped.isNotEmpty()) {
+            logger.warn("xAI Responses dropped unsupported sampling params: ${dropped.joinToString()}")
+        }
     }
 
     private fun toResponsesRequest(requestDto: OpenAiCompatibleChatRequest) = XaiResponsesRequest(
@@ -283,7 +314,9 @@ class XaiResponsesTransport private constructor(
     private fun jsonArrayOf(vararg elements: JsonElement) = JsonArray(elements.toList())
 
     private fun httpError(code: Int): XaiResponsesException = when {
-        code == 401 || code == 403 -> XaiResponsesException("xAI 拒绝了本次请求，请重新登录后重试")
+        // 401 单独成型：调用方要能据此判断「这个 token 被拒了」，从而刷新后重试一次。
+        code == 401 -> XaiUnauthorizedException()
+        code == 403 -> XaiResponsesException("xAI 拒绝了本次请求，请重新登录后重试")
         code == 429 -> XaiResponsesException("xAI 请求过于频繁或已达订阅额度，请稍后重试")
         code >= 500 -> XaiResponsesException("xAI 服务暂时不可用（HTTP $code），请稍后重试")
         else -> XaiResponsesException("xAI 请求失败（HTTP $code）")
@@ -291,32 +324,6 @@ class XaiResponsesTransport private constructor(
 
     private fun networkError(error: IOException): IOException =
         XaiResponsesException("无法连接 xAI，请检查网络后重试").also { it.initCause(error) }
-
-    /**
-     * 读取被拒绝请求的响应说明，用于诊断。
-     *
-     * 只写日志，绝不进消息表或 UI：内容来自上游，形状不可控。
-     * 先抹掉任何 Bearer 凭据与控制字符，再截断到 [MAX_ERROR_DETAIL_CHARS]。
-     */
-    private fun readErrorDetail(response: Response): String {
-        val raw = runCatching {
-            val source = response.body?.source() ?: return "(empty)"
-            if (source.request(MAX_ERROR_DETAIL_BYTES + 1L)) return "(too large)"
-            source.readUtf8()
-        }.getOrElse { return "(unreadable)" }
-
-        val sanitized = raw
-            .replace(BEARER_CREDENTIAL, "Bearer <redacted>")
-            .replace(CONTROL_CHARACTERS, " ")
-            .replace(REPEATED_WHITESPACE, " ")
-            .trim()
-        if (sanitized.isEmpty()) return "(empty)"
-        return if (sanitized.length <= MAX_ERROR_DETAIL_CHARS) {
-            sanitized
-        } else {
-            sanitized.take(MAX_ERROR_DETAIL_CHARS) + "…"
-        }
-    }
 
     private fun readSseLineWithinLimit(source: BufferedSource): String? {
         val newlineIndex = source.indexOf('\n'.code.toByte(), 0L, MAX_SSE_LINE_BYTES + 1L)
@@ -331,21 +338,25 @@ class XaiResponsesTransport private constructor(
      * 文案完全由 App 生成，不含 token、地址或上游响应原文，可直接展示。
      * 复用 [OpenAiCompatibleUserFacingError] 标记，走与自定义供应商相同的错误映射。
      */
-    internal class XaiResponsesException(message: String) :
+    internal open class XaiResponsesException(message: String) :
         IOException(message),
         OpenAiCompatibleUserFacingError
+
+    /**
+     * 上游以 401 拒绝了本次使用的 access token。
+     *
+     * 与其它错误分开，是为了让 [com.muxuechat.data.repository.ChatTransportRouter]
+     * 能带着被拒的 token 强制刷新一次并重试——token 可能在冻结之后、请求发出之前失效，
+     * 尤其是正文结束后才发出的 RP 补写。
+     */
+    internal class XaiUnauthorizedException :
+        XaiResponsesException("xAI 拒绝了本次请求，请重新登录后重试")
 
     internal companion object {
         private const val TAG = "muxueChat.XaiResponses"
         const val CLIENT_IDENTIFIER = "muxuechat"
-        const val DEFAULT_CLIENT_VERSION = "1.0"
+        const val DEFAULT_CLIENT_VERSION = "1.0.0"
         const val MAX_SSE_LINE_BYTES = 1_048_576L
-        private const val MAX_ERROR_DETAIL_BYTES = 8_192L
-        private const val MAX_ERROR_DETAIL_CHARS = 400
-
-        private val BEARER_CREDENTIAL = Regex("""(?i)Bearer\s+[^\s,;]+""")
-        private val CONTROL_CHARACTERS = Regex("""[\p{Cc}\p{Cf}]""")
-        private val REPEATED_WHITESPACE = Regex("""\s+""")
 
         private const val ROLE_SYSTEM = "system"
         private const val ROLE_DEVELOPER = "developer"
@@ -366,16 +377,23 @@ class XaiResponsesTransport private constructor(
          * 若将来上游把门槛提到 1.0.0 以上，这里会再次 426，届时应由用户决定怎么办。
          */
         internal fun toSemver(version: String): String {
-            val parts = version.trim().split('.')
-            return when {
-                parts.size >= 3 -> version.trim()
-                parts.size == 2 -> "${parts[0]}.${parts[1]}.0"
-                parts.size == 1 && parts[0].isNotBlank() -> "${parts[0]}.0.0"
-                else -> "$DEFAULT_CLIENT_VERSION.0.0"
-            }
+            // 只取前三段数字，多余的段（4 段版本、prerelease 后缀）一律丢掉，
+            // 缺的段补 0。空串或完全不含数字时回退到默认版本。
+            val numeric = version.trim()
+                .substringBefore('-')
+                .substringBefore('+')
+                .split('.')
+                .map { it.filter(Char::isDigit) }
+                .filter { it.isNotEmpty() }
+            if (numeric.isEmpty()) return DEFAULT_CLIENT_VERSION
+            val padded = (numeric + listOf("0", "0")).take(3)
+            return padded.joinToString(".")
         }
 
         fun defaultOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
+            // 与 XaiAuthClient 一致：Authorization 头绝不跟随跳转离开钉死的主机。
+            .followRedirects(false)
+            .followSslRedirects(false)
             .connectTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)

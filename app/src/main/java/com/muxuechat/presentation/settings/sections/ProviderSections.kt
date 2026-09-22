@@ -626,8 +626,18 @@ fun CustomProviderSection(
         },
     )
 
-    com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具调用与流式用量统计") {
-        ProviderToolCallingSection(provider = provider, onUpdate = onUpdate)
+    // xAI 订阅链路不支持工具调用：结果回传的形状没有采集到，适配器会直接拒绝带 tools
+    // 的请求。既然开了也用不了，就不提供这个开关，免得用户以为是自己配错了。
+    if (!provider.usesXaiOAuth) {
+        com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具调用与流式用量统计") {
+            ProviderToolCallingSection(provider = provider, onUpdate = onUpdate)
+        }
+    } else {
+        com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "该链路的能力限制") {
+            SettingsSection(title = "工具调用") {
+                MetaLine("xAI 订阅链路暂不支持工具调用，因此不提供该开关。")
+            }
+        }
     }
 
     SettingsSection(title = "移除供应商") {

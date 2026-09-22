@@ -1192,7 +1192,12 @@ class ChatViewModel(
                 val openAiCompatibleClient = OpenAiCompatibleClient()
                 val deepSeekApiClient = DeepSeekApiClient()
                 // 只建一个：cancelActiveRequest 依赖同一个实例追踪在途 Call。
-                val xaiResponsesTransport = XaiResponsesTransport()
+                // 版本号取包信息里的真实 versionName，不硬编码——上游会按它做版本门槛，
+                // 写死会在 App 升级后继续上报旧版本。
+                val appVersion = runCatching {
+                    application.packageManager.getPackageInfo(application.packageName, 0).versionName
+                }.getOrNull().orEmpty()
+                val xaiResponsesTransport = XaiResponsesTransport(clientVersion = appVersion)
                 val settingsRepository = SettingsRepositoryImpl(
                     settingsDataStore = SettingsDataStore(application),
                     apiKeyStore = EncryptedApiKeyStore(application),

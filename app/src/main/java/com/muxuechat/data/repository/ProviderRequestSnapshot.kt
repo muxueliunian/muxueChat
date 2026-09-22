@@ -1,5 +1,6 @@
 package com.muxuechat.data.repository
 
+import com.muxuechat.data.remote.SafeUserFacingError
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.CustomProvider
@@ -27,12 +28,6 @@ internal sealed interface ProviderCredential {
 interface XaiAccessTokenSource {
     suspend fun getValidAccessToken(rejectedAccessToken: String? = null): String
 }
-
-/**
- * 文案完全由 App 生成、保证不含任何凭据，因此可以原样展示给用户，
- * 不必再经过按 Provider 收敛的兜底文案。
- */
-internal interface SafeUserFacingError
 
 /**
  * xAI 供应商的地址由 App 钉死、也不使用 API Key，唯一可能缺的就是模型名。

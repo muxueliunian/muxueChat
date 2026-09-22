@@ -134,15 +134,25 @@ class XaiAuthRepository internal constructor(
      *
      * 失败时抛出 [XaiAuthException]：只有 [XaiAuthException.AuthorizationRevoked] 会清除凭据。
      */
-    override suspend fun getValidAccessToken(rejectedAccessToken: String?): String = refreshMutex.withLock {
+    override suspend fun getValidAccessToken(rejectedAccessToken: String?): String {
+        // **进入刷新锁之前**先记下世代号。只在锁内取会留一个窗口：
+        // 调用方排队等锁期间用户登出并换号登录，拿到锁后读到的就是另一个账号的凭据，
+        // 登出前编好的这条消息会被发到新账号名下。
+        val enqueuedGeneration = storeMutex.withLock { generation }
+        return refreshMutex.withLock { refreshLocked(rejectedAccessToken, enqueuedGeneration) }
+    }
+
+    private suspend fun refreshLocked(rejectedAccessToken: String?, enqueuedGeneration: Long): String {
         val (credential, refreshGeneration) = storeMutex.withLock { io { store.load() } to generation }
+        // 排队期间发生过登出（可能还换了账号）：这次请求属于上一个登录会话，直接作废。
+        if (refreshGeneration != enqueuedGeneration) throw XaiAuthException.NotSignedIn()
         if (credential == null) {
             syncSignedOutState()
             throw XaiAuthException.NotSignedIn()
         }
         val forced = rejectedAccessToken != null && rejectedAccessToken == credential.accessToken
         if (!forced && credential.expiresAtMillis - REFRESH_MARGIN_MILLIS > clock()) {
-            return@withLock credential.accessToken
+            return credential.accessToken
         }
 
         val refreshToken = credential.refreshToken ?: run {
@@ -157,13 +167,18 @@ class XaiAuthRepository internal constructor(
         }
 
         val refreshed = tokens.toCredential(previous = credential)
-        storeMutex.withLock {
-            // 刷新请求在途时用户登出了：新 token 直接丢弃，不写回。
-            if (generation != refreshGeneration) throw XaiAuthException.NotSignedIn()
-            io { store.save(refreshed) }
-            _state.value = XaiAuthState.SignedIn(refreshed.account)
+        // 服务端已经轮换过 refresh token，这一段**不可取消**。
+        // 否则「停止生成」或紧接着发下一条消息取消掉本协程时，新凭据来不及落盘，
+        // 本机只剩已经作废的旧 refresh token，用户被迫重新登录。
+        withContext(NonCancellable) {
+            storeMutex.withLock {
+                // 刷新请求在途时用户登出了：新 token 直接丢弃，不写回。
+                if (generation != refreshGeneration) throw XaiAuthException.NotSignedIn()
+                io { store.save(refreshed) }
+                _state.value = XaiAuthState.SignedIn(refreshed.account)
+            }
         }
-        refreshed.accessToken
+        return refreshed.accessToken
     }
 
     /**

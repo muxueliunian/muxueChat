@@ -10,7 +10,7 @@ import kotlinx.serialization.json.JsonElement
  * xAI 订阅链路的 Responses 协议 DTO。
  *
  * **全部字段形状来自 `docs/XAI_WIRE_FORMAT.md` 的实测记录**，未实测的字段一律不构造，
- * 也不按 OpenAI Responses 的公开文档补全（AGENT.md §6）。
+ * 也不按 OpenAI Responses 的公开文档补全（AGENT.md §3.3）。
  *
  * 这些类型只在 [XaiResponsesTransport] 内部使用，绝不外泄到上层：
  * 上层只认 OpenAI 兼容的请求 DTO 与流式事件。

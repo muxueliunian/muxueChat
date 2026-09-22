@@ -68,8 +68,19 @@ class EncryptedXaiCredentialStore internal constructor(
     private val json = Json { ignoreUnknownKeys = true }
 
     override suspend fun load(): XaiCredential? {
-        val ciphertext = preferences.getString(KEY_CIPHERTEXT, null) ?: return null
-        val iv = preferences.getString(KEY_IV, null) ?: return null
+        val ciphertext = preferences.getString(KEY_CIPHERTEXT, null)
+        val iv = preferences.getString(KEY_IV, null)
+        if (ciphertext == null || iv == null) {
+            // 两半只剩一半（写入中途被杀、或上次清理只成功了一部分）：
+            // 这份凭据已经不可能解开，直接按未登录处理并把残留一并清掉，
+            // 否则 alias 与半截密文会一直留着，下次 save 还会复用一个错误的密钥状态。
+            if (ciphertext != null || iv != null) {
+                Log.w(TAG, "xAI credential storage is half-written, clearing residue")
+                runCatching { clear() }
+                    .onFailure { Log.w(TAG, "xAI residue cleanup failed: ${it.javaClass.simpleName}") }
+            }
+            return null
+        }
 
         return try {
             val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -78,10 +89,14 @@ class EncryptedXaiCredentialStore internal constructor(
             val plaintext = cipher.doFinal(ciphertext.fromBase64()).toString(Charsets.UTF_8)
             json.decodeFromString(XaiCredential.serializer(), plaintext)
         } catch (error: Exception) {
-            // 锁屏凭据变更等原因会让 Keystore 密钥失效；此时密文永远无法再解开，
+            // 密钥失效、密文损坏或格式变更都会走到这里；此时密文无法再解开，
             // 按未登录处理并清理残留，而不是每次启动都崩一次。
+            // （本实现未要求用户认证，因此「改锁屏密码必然使密钥失效」并非已验证前提，
+            //  不要据此推断具体成因，只按「解不开」处理。）
             Log.w(TAG, "xAI credential could not be decrypted: ${error.javaClass.simpleName}")
+            // 清理失败不能静默吞掉：留着残留会让下一次启动重复走这条路径。
             runCatching { clear() }
+                .onFailure { Log.w(TAG, "xAI credential cleanup failed: ${it.javaClass.simpleName}") }
             null
         }
     }
@@ -101,13 +116,22 @@ class EncryptedXaiCredentialStore internal constructor(
     }
 
     override suspend fun clear() {
-        check(
-            preferences.edit()
-                .remove(KEY_CIPHERTEXT)
-                .remove(KEY_IV)
-                .commit(),
-        ) { "xAI 凭据密文清理失败" }
-        keyStore.deleteEntry(keyAlias)
+        // 密文与 Keystore alias 是两类资源，必须**分别尝试**：
+        // 先删密文失败就直接抛，会把 alias 永久留成孤儿。两边都试完再报第一个错误。
+        val removedCiphertext = runCatching {
+            check(
+                preferences.edit()
+                    .remove(KEY_CIPHERTEXT)
+                    .remove(KEY_IV)
+                    .commit(),
+            ) { "xAI 凭据密文清理失败" }
+        }
+        val removedAlias = runCatching { keyStore.deleteEntry(keyAlias) }
+
+        removedCiphertext.exceptionOrNull()?.let { throw it }
+        removedAlias.exceptionOrNull()?.let {
+            throw IllegalStateException("xAI 凭据密钥清理失败", it)
+        }
     }
 
     override fun isLoginInProgress(): Boolean = preferences.getBoolean(KEY_LOGIN_IN_PROGRESS, false)

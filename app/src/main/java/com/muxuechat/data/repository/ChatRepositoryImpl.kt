@@ -22,7 +22,7 @@ import com.muxuechat.data.remote.DeepSeekStreamEvent
 import com.muxuechat.data.remote.DeepSeekToolCallAccumulator
 import com.muxuechat.data.remote.DeepSeekToolCallDto
 import com.muxuechat.data.remote.SettingsToolCatalog
-import com.muxuechat.data.remote.XaiAuthException
+import com.muxuechat.data.remote.SafeUserFacingError
 import com.muxuechat.data.remote.XaiResponsesTransport
 import com.muxuechat.domain.tool.SettingsTool
 import com.muxuechat.domain.tool.SettingsToolArgumentParser
@@ -106,7 +106,8 @@ class ChatRepositoryImpl(
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) : ChatRepository {
     private val providerRequestFreezer = ProviderRequestFreezer(settingsRepository, xaiAccessTokens)
-    private val chatTransport = ChatTransportRouter(openAiCompatibleClient, xaiResponsesTransport)
+    private val chatTransport =
+        ChatTransportRouter(openAiCompatibleClient, xaiResponsesTransport, xaiAccessTokens)
     private val generationSessions = GenerationSessionRegistry()
     private val enrichmentTasks = RpEnrichmentTaskRegistry()
 
@@ -2402,9 +2403,9 @@ class ChatRepositoryImpl(
 
     /** 本地预检失败只落固定安全文案，不把异常原文、地址或凭据相关内容写进消息。 */
     private fun Throwable.toSendPreflightUserFacingMessage(provider: ChatProviderId): String {
-        // 这些文案完全由 App 生成、保证不含 token，原样展示才能让用户知道到底缺什么；
-        // 按 Provider 收敛的兜底句会提到 Base URL 与 API Key，而 xAI 供应商没有这两项。
-        if (this is XaiAuthException || this is SafeUserFacingError) return message.orEmpty()
+        // 带安全文案标记的异常原样展示：它们的文案由 App 生成、保证不含凭据。
+        // 这里刻意只认通用标记，不认任何厂商专属异常类型（AGENT.md §2）。
+        if (this is SafeUserFacingError) return message.orEmpty()
         val mentionsApiKey = message.orEmpty().contains("API Key", ignoreCase = true)
         return when (provider) {
             ChatProviderId.DEEPSEEK -> if (mentionsApiKey) {

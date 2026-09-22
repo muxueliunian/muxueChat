@@ -211,7 +211,10 @@ class XaiResponsesTransportTest {
         assertEquals("1.0.0", XaiResponsesTransport.toSemver("1.0"))
         assertEquals("2.0.0", XaiResponsesTransport.toSemver("2"))
         assertEquals("1.6.0", XaiResponsesTransport.toSemver("1.6.0"))
-        assertEquals("1.2.3.4", XaiResponsesTransport.toSemver("1.2.3.4"))
+        assertEquals("1.2.3", XaiResponsesTransport.toSemver("1.2.3.4"))
+        assertEquals("1.2.3", XaiResponsesTransport.toSemver("1.2.3-beta"))
+        assertEquals("1.0.0", XaiResponsesTransport.toSemver(""))
+        assertEquals("1.0.0", XaiResponsesTransport.toSemver("   "))
 
         collect(INTERLEAVED_SSE).getOrThrow()
         assertEquals("9.9.9", recorded.get()!!.header("x-grok-client-version"))
@@ -232,6 +235,127 @@ class XaiResponsesTransportTest {
         }.exceptionOrNull()
 
         assertTrue(error?.message.orEmpty().contains("暂不支持工具调用"))
+    }
+
+    // ------------------------------------------------------------------ 评审修复项
+
+    @Test
+    fun malformedEvent_failsInsteadOfBeingTreatedAsUnknownType() {
+        // 「合法但没见过的类型」可以忽略；「解析不了」不行——否则残缺正文会照样成功落库。
+        val sse = """
+            data: {"type":"response.output_text.delta","output_index":1,"delta":"前半"}
+            data: {"type":"response.output_text.delta","delta":
+            data: {"type":"response.completed","response":{"status":"completed"}}
+        """.trimIndent()
+
+        val error = collect(sse).exceptionOrNull()
+
+        assertTrue(error is XaiResponsesTransport.XaiResponsesException)
+        assertEquals("xAI 返回内容无法解析", error?.message)
+    }
+
+    @Test
+    fun concurrentMessageItems_failRatherThanInterleaveText() {
+        // 按事件名路由解决了跨类型串台，解决不了同类型的顺序。
+        // 两个并发正文项的合并语义没有采集过，宁可失败也不拼出顺序不明的正文。
+        val sse = """
+            data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message"}}
+            data: {"type":"response.output_text.delta","output_index":1,"delta":"A1"}
+            data: {"type":"response.output_item.added","output_index":2,"item":{"id":"msg_2","type":"message"}}
+            data: {"type":"response.completed","response":{"status":"completed"}}
+        """.trimIndent()
+
+        val error = collect(sse).exceptionOrNull()
+
+        assertTrue(error?.message.orEmpty().contains("多段并行正文"))
+    }
+
+    @Test
+    fun completedWithUnknownStatus_isNotTreatedAsSuccess() {
+        // 只承认实测过的 "completed"。其它 status 的含义（截断？失败？）未采集。
+        val sse = """
+            data: {"type":"response.output_text.delta","output_index":1,"delta":"半句"}
+            data: {"type":"response.completed","response":{"status":"incomplete"}}
+        """.trimIndent()
+
+        val error = collect(sse).exceptionOrNull()
+
+        assertEquals("xAI 回复未正常结束，请重试", error?.message)
+    }
+
+    @Test
+    fun nonPinnedAddress_isRejectedBeforeAnyCredentialLeavesTheApp() {
+        // 冻结器已经钉死地址，但本类是唯一附加 Authorization 的地方，自己再挡一道。
+        val error = runCatching {
+            runBlocking {
+                transportReturning(INTERLEAVED_SSE)
+                    .streamChat(TOKEN, "https://evil.example/v1", request(listOf(userMessage())))
+                    .toList()
+            }
+        }.exceptionOrNull()
+
+        assertEquals("xAI 服务地址不合法，已中止请求", error?.message)
+        assertNull("凭据不得离开 App", recorded.get())
+    }
+
+    @Test
+    fun toolRejection_carriesSafeMessageMarkerSoItIsNotMappedToQuotaError() {
+        // 普通 IllegalArgumentException 会落到上层按关键字收敛的兜底上，
+        // 文案里的「订阅」二字会被误判成额度不足，把真正原因盖掉。
+        val tool = OpenAiCompatibleToolDto(
+            function = OpenAiCompatibleFunctionDto("f", "d", JsonObject(emptyMap())),
+        )
+        val error = runCatching {
+            runBlocking {
+                transportReturning(INTERLEAVED_SSE)
+                    .streamChat(TOKEN, BASE_URL, request(listOf(userMessage()), tools = listOf(tool)))
+                    .toList()
+            }
+        }.exceptionOrNull()
+
+        assertTrue(error is OpenAiCompatibleUserFacingError)
+        assertFalse("不能含「订阅」，否则被映射成额度不足", error!!.message.orEmpty().contains("订阅"))
+    }
+
+    @Test
+    fun unauthorized_isDistinctSoCallerCanRefreshAndRetry() {
+        val error = collect("", 401).exceptionOrNull()
+        assertTrue(error is XaiResponsesTransport.XaiUnauthorizedException)
+    }
+
+    @Test
+    fun unsupportedSamplingParams_areReportedRatherThanSilentlyDropped() {
+        val logger = RecordingAuthLogger()
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("synthetic")
+                    .body(INTERLEAVED_SSE.toResponseBody("text/event-stream".toMediaType()))
+                    .build()
+            }
+            .build()
+        runBlocking {
+            XaiResponsesTransport(client, logger).streamChat(
+                TOKEN,
+                BASE_URL,
+                OpenAiCompatibleChatRequest(
+                    model = "grok-4.7",
+                    messages = listOf(userMessage()),
+                    stream = true,
+                    temperature = 0.7,
+                    topP = 0.9,
+                ),
+            ).toList()
+        }
+
+        val warning = logger.messages.single { it.contains("sampling params") }
+        assertTrue(warning.contains("temperature"))
+        assertTrue(warning.contains("top_p"))
+        // 只记字段名，不记取值。
+        assertFalse(warning.contains("0.7"))
     }
 
     // ------------------------------------------------------------------ 非流式语义

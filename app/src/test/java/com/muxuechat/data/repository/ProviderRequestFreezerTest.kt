@@ -4,6 +4,7 @@ import com.muxuechat.data.local.XaiCredential
 import com.muxuechat.data.remote.FakeAuthReply
 import com.muxuechat.data.remote.FakeXaiAuthServer
 import com.muxuechat.data.remote.InMemoryXaiCredentialStore
+import com.muxuechat.data.remote.SafeUserFacingError
 import com.muxuechat.data.remote.XaiAuthException
 import com.muxuechat.data.remote.XaiFixtures
 import com.muxuechat.domain.model.ChatProviderId

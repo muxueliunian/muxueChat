@@ -10,7 +10,7 @@ package com.muxuechat.data.remote
 sealed class XaiAuthException(
     message: String,
     val keepsCredential: Boolean = true,
-) : Exception(message) {
+) : Exception(message), SafeUserFacingError {
     class Network : XaiAuthException("无法连接 xAI 认证服务，请检查网络后重试")
 
     class Server(code: Int) : XaiAuthException("xAI 认证服务暂时不可用（HTTP $code），请稍后重试")
