@@ -205,6 +205,19 @@ class XaiResponsesTransportTest {
     }
 
     @Test
+    fun clientVersionHeader_isAlwaysThreePartSemver() {
+        // 实测：上游对两段版本号解析失败，会以 HTTP 426 回「version (1.0) is outdated」，
+        // 尽管 1.0 语义上大于它要求的 0.1.202。只补格式，不谎报版本。
+        assertEquals("1.0.0", XaiResponsesTransport.toSemver("1.0"))
+        assertEquals("2.0.0", XaiResponsesTransport.toSemver("2"))
+        assertEquals("1.6.0", XaiResponsesTransport.toSemver("1.6.0"))
+        assertEquals("1.2.3.4", XaiResponsesTransport.toSemver("1.2.3.4"))
+
+        collect(INTERLEAVED_SSE).getOrThrow()
+        assertEquals("9.9.9", recorded.get()!!.header("x-grok-client-version"))
+    }
+
+    @Test
     fun toolRequests_areRejectedBecauseResultRoundTripWasNeverCaptured() {
         val tool = OpenAiCompatibleToolDto(
             function = OpenAiCompatibleFunctionDto("f", "d", JsonObject(emptyMap())),

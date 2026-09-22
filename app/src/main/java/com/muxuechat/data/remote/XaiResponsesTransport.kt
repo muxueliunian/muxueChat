@@ -188,7 +188,9 @@ class XaiResponsesTransport private constructor(
         emit: (OpenAiCompatibleStreamEvent) -> ChannelResult<Unit>,
     ) {
         if (!response.isSuccessful) {
-            logger.warn("xAI Responses stream HTTP ${response.code}")
+            // 上游明确拒绝时，它的说明往往是唯一能定位原因的线索（例如 426 会写清最低版本）。
+            // 只记日志、不进消息表；先去掉可能出现的凭据再截断。
+            logger.warn("xAI Responses stream HTTP ${response.code}: ${readErrorDetail(response)}")
             throw httpError(response.code)
         }
         val source = response.body?.source() ?: throw XaiResponsesException("xAI 返回了空响应")
@@ -238,7 +240,7 @@ class XaiResponsesTransport private constructor(
             // 实测：发送方自报身份即可，不需要冒充 Grok CLI（线上格式 §1.1）。
             .header("X-XAI-Token-Auth", "xai-grok-cli")
             .header("x-grok-client-identifier", CLIENT_IDENTIFIER)
-            .header("x-grok-client-version", clientVersion)
+            .header("x-grok-client-version", toSemver(clientVersion))
             .header("x-grok-client-mode", "interactive")
             .header("x-grok-conv-id", sessionId)
             .header("x-grok-session-id", sessionId)
@@ -290,6 +292,32 @@ class XaiResponsesTransport private constructor(
     private fun networkError(error: IOException): IOException =
         XaiResponsesException("无法连接 xAI，请检查网络后重试").also { it.initCause(error) }
 
+    /**
+     * 读取被拒绝请求的响应说明，用于诊断。
+     *
+     * 只写日志，绝不进消息表或 UI：内容来自上游，形状不可控。
+     * 先抹掉任何 Bearer 凭据与控制字符，再截断到 [MAX_ERROR_DETAIL_CHARS]。
+     */
+    private fun readErrorDetail(response: Response): String {
+        val raw = runCatching {
+            val source = response.body?.source() ?: return "(empty)"
+            if (source.request(MAX_ERROR_DETAIL_BYTES + 1L)) return "(too large)"
+            source.readUtf8()
+        }.getOrElse { return "(unreadable)" }
+
+        val sanitized = raw
+            .replace(BEARER_CREDENTIAL, "Bearer <redacted>")
+            .replace(CONTROL_CHARACTERS, " ")
+            .replace(REPEATED_WHITESPACE, " ")
+            .trim()
+        if (sanitized.isEmpty()) return "(empty)"
+        return if (sanitized.length <= MAX_ERROR_DETAIL_CHARS) {
+            sanitized
+        } else {
+            sanitized.take(MAX_ERROR_DETAIL_CHARS) + "…"
+        }
+    }
+
     private fun readSseLineWithinLimit(source: BufferedSource): String? {
         val newlineIndex = source.indexOf('\n'.code.toByte(), 0L, MAX_SSE_LINE_BYTES + 1L)
         if (newlineIndex >= 0L) return source.readUtf8Line()
@@ -312,6 +340,12 @@ class XaiResponsesTransport private constructor(
         const val CLIENT_IDENTIFIER = "muxuechat"
         const val DEFAULT_CLIENT_VERSION = "1.0"
         const val MAX_SSE_LINE_BYTES = 1_048_576L
+        private const val MAX_ERROR_DETAIL_BYTES = 8_192L
+        private const val MAX_ERROR_DETAIL_CHARS = 400
+
+        private val BEARER_CREDENTIAL = Regex("""(?i)Bearer\s+[^\s,;]+""")
+        private val CONTROL_CHARACTERS = Regex("""[\p{Cc}\p{Cf}]""")
+        private val REPEATED_WHITESPACE = Regex("""\s+""")
 
         private const val ROLE_SYSTEM = "system"
         private const val ROLE_DEVELOPER = "developer"
@@ -319,6 +353,27 @@ class XaiResponsesTransport private constructor(
         private const val ROLE_USER = "user"
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        /**
+         * 把版本号补足成三段 semver。
+         *
+         * 实测（2026-09-22）：发 `1.0` 会被上游以 HTTP 426 拒绝，回复
+         * 「Your Grok CLI version (1.0) is outdated. Please update to version 0.1.202 or later」。
+         * 注意 `1.0` 在语义上本就大于 `0.1.202`，被判过期只能是因为两段版本号解析失败。
+         *
+         * 因此这里只做格式补齐，**不谎报版本、也不去抓上游的版本号**：
+         * App 报的始终是自己的 `versionName`，只是写成合法形状。
+         * 若将来上游把门槛提到 1.0.0 以上，这里会再次 426，届时应由用户决定怎么办。
+         */
+        internal fun toSemver(version: String): String {
+            val parts = version.trim().split('.')
+            return when {
+                parts.size >= 3 -> version.trim()
+                parts.size == 2 -> "${parts[0]}.${parts[1]}.0"
+                parts.size == 1 && parts[0].isNotBlank() -> "${parts[0]}.0.0"
+                else -> "$DEFAULT_CLIENT_VERSION.0.0"
+            }
+        }
 
         fun defaultOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
