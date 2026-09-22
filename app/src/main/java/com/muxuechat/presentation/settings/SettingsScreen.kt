@@ -37,6 +37,7 @@ fun SettingsScreen(
     providersWithSavedKey: Set<String>,
     refreshingModelsProviderId: String?,
     onAddProvider: (name: String, baseUrl: String) -> Unit,
+    onAddXaiProvider: () -> Unit,
     onUpdateProvider: (providerId: String, transform: CustomProviderMutation) -> Unit,
     onDeleteProvider: (String) -> Unit,
     onSaveProviderKey: (providerId: String, apiKey: String) -> Unit,
@@ -135,6 +136,7 @@ fun SettingsScreen(
                         settings = settings,
                         onChange = { transform -> flushCoordinator.flush(); onSettingsChange(transform) },
                         onAddProvider = onAddProvider,
+                        onAddXaiProvider = { flushCoordinator.flush(); onAddXaiProvider() },
                         onDeleteProvider = { id -> flushCoordinator.flush(); onDeleteProvider(id) },
                     )
                     refreshErrors[if (settings.isCustomProvider) settings.activeCustomProvider?.id else ChatProviderId.DEEPSEEK.storageValue]?.let {
@@ -153,6 +155,15 @@ fun SettingsScreen(
                                 onSaveKey = { onSaveProviderKey(provider.id, it) },
                                 onClearKey = { onClearProviderKey(provider.id) },
                                 onRefreshModels = { onRefreshProviderModels(provider.id) },
+                                xaiAuthContent = {
+                                    XaiAuthSection(
+                                        state = xaiAuthState,
+                                        onLogin = onXaiLogin,
+                                        onCancelLogin = onXaiCancelLogin,
+                                        onSignOut = onXaiSignOut,
+                                        onBrowserUnavailable = onXaiBrowserUnavailable,
+                                    )
+                                },
                             )
                         } else {
                             SecureKeySection(

@@ -1,5 +1,6 @@
 package com.muxuechat.data.repository
 
+import com.muxuechat.data.remote.XaiAuthException
 import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -368,6 +369,11 @@ class ChatRepositoryTokenUsageTest {
         openAiCompatibleClient = openAiInterceptor
             ?.let { OpenAiCompatibleClient(clientWith(it)) }
             ?: OpenAiCompatibleClient(),
+        // 这些用例只覆盖 DeepSeek 与 API Key 型供应商；任何 xAI 取 token 都应视为未登录。
+        xaiAccessTokens = object : XaiAccessTokenSource {
+            override suspend fun getValidAccessToken(rejectedAccessToken: String?): String =
+                throw XaiAuthException.NotSignedIn()
+        },
         enrichmentScope = scope,
         clock = { 100L },
     )

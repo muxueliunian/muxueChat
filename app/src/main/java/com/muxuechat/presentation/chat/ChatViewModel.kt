@@ -23,6 +23,7 @@ import com.muxuechat.data.repository.RpRepository
 import com.muxuechat.data.repository.RpRepositoryImpl
 import com.muxuechat.data.repository.SettingsRepository
 import com.muxuechat.data.repository.SettingsRepositoryImpl
+import com.muxuechat.data.repository.XaiAuthRepository
 import com.muxuechat.domain.model.ChatMessage
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatRole
@@ -34,6 +35,7 @@ import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
 import com.muxuechat.domain.model.MessageStatus
+import com.muxuechat.domain.model.ProviderAuthKind
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpMarkerMode
@@ -627,6 +629,35 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * 添加 xAI 订阅供应商：认证类型固定为 OAuth，地址由 [CustomProvider.normalized] 钉死。
+     * 所有 xAI 供应商共用同一个登录，因此只允许存在一个。
+     */
+    fun addXaiProvider() {
+        viewModelScope.launch {
+            runCatching {
+                if (settingsRepository.currentSettings().customProviders.any { it.usesXaiOAuth }) {
+                    transient.update { it.copy(errorMessage = "已存在 xAI 订阅供应商") }
+                    return@launch
+                }
+                val provider = CustomProvider(
+                    id = UUID.randomUUID().toString(),
+                    name = CustomProvider.XAI_DEFAULT_NAME,
+                    baseUrl = CustomProvider.XAI_SUBSCRIPTION_BASE_URL,
+                    authKind = ProviderAuthKind.XAI_OAUTH,
+                ).normalized()
+                settingsRepository.upsertCustomProvider(provider)
+            }.onSuccess {
+                transient.update {
+                    it.copy(errorMessage = "已添加并切换到「${CustomProvider.XAI_DEFAULT_NAME}」，请登录 xAI 并填写模型名")
+                }
+            }.onFailure { error ->
+                Log.w(TAG, "Adding xAI provider failed: ${error.javaClass.simpleName}")
+                transient.update { it.copy(errorMessage = "供应商添加失败，请重试") }
+            }
+        }
+    }
+
     /** 编辑已有供应商的名称、地址或手填模型列表。 */
     fun updateCustomProvider(
         providerId: String,
@@ -1172,6 +1203,8 @@ class ChatViewModel(
                     settingsRepository = settingsRepository,
                     apiClient = deepSeekApiClient,
                     openAiCompatibleClient = openAiCompatibleClient,
+                    // 必须与设置页的 XaiAuthViewModel 共用同一个单例：刷新的串行化依赖同一把锁。
+                    xaiAccessTokens = XaiAuthRepository.getInstance(application),
                 )
                 val rpRepository = RpRepositoryImpl(database = database)
 

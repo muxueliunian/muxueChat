@@ -2,6 +2,10 @@
 
 状态：设计阶段，未实施。**排在 xAI 链路之后开工**（用户 2026-09-22 确认）。
 建立日期：2026-09-22
+版本：**v2**（2026-09-22，外部评审后重写。v1 被判定「不可按原稿实施」，
+主要缺陷是把「定义 → 当前值 → 消息快照 → 历史回滚 → 异步补写」当成一条链路，
+实际它们分散在五处各自持久化。）
+
 范围：新增配角实体；主角从三个字符串升格为独立实体；统一词条概念；
 状态面板支持手动编辑数值
 不在范围：多角色同场（群聊）、关键词触发世界书、角色图片、角色卡导入导出、长期记忆总结
@@ -10,10 +14,12 @@
 
 | 阶段 | 状态 | 阻塞于 |
 | --- | --- | --- |
-| 需求确认 | 完成（R1～R9） | — |
-| 现状核对 | 完成，见第 2 节 | — |
-| 本计划评审 | 未开始 | — |
-| RP-1 数据层 | 未开始 | xAI 链路收尾 |
+| 需求确认 | 完成（R1～R16） | — |
+| 现状核对 | 完成，见第 2 节（v2 已修正 v1 的三处错误） | — |
+| 外部评审第一轮 | 完成（2026-09-22）。结论：v1 不可实施 | — |
+| 本计划 v2 复审 | 未开始 | — |
+| RP-0 状态链路加固 | 未开始 | xAI 链路收尾 |
+| RP-1 数据层与迁移 | 未开始 | RP-0 |
 | RP-2 Prompt 与状态块 | 未开始 | RP-1 |
 | RP-3 UI | 未开始 | RP-2 |
 
@@ -21,7 +27,9 @@
 `message_attachments` 表，需改为 **v11**。两条线必须串行，当前顺序是
 xAI → 本计划 → MM-1a。实施本计划时需同步修订 `MULTIMODAL_PLAN.md`。
 
-## 1. 已确认的需求（2026-09-22）
+## 1. 已确认的需求
+
+R1～R13 于 2026-09-22 由用户确认；R14～R16 是评审后新增的设计约束。
 
 | # | 决策 |
 | --- | --- |
@@ -36,38 +44,82 @@ xAI → 本计划 → MM-1a。实施本计划时需同步修订 `MULTIMODAL_PLAN
 | R9 | 手动编辑是「修正当前值」而非「锁定」，模型下一轮仍可改动该值。因此**不引入 `updatedBy`** |
 | R10 | 定义快照存 `conversation_rp_settings`，不存 `rp_status_panels`。理由见 3.4 |
 | R11 | 前缀分隔符用 **`::`**，不用 `.`。理由见 3.3 |
-| R12 | 配角数量**不设硬上限**，改为显示已选数量与预计占用，超阈值给警告但不阻止。理由见 5.1 |
+| R12 | 配角数量**不设硬上限**，改为显示已选数量与预计占用，超阈值给警告但不阻止。理由见 6.2 |
 | R13 | 主角**不新增角色卡的专属字段**，需要时用文本词条表达。理由见 3.2 |
+| **R14** | 数值的**身份是 `entryId`，不是名字**。快照保存 `owner + entryId + wireName + displayName`，匹配优先按 `entryId`。理由见 3.5 |
+| **R15** | 状态块解析**匹配失败时保留当前值**，不回落初始值；未知键、重复键明确报告而不静默取第一项。理由见 3.6 |
+| **R16** | 兼容性**按数据版本判定，不按名字形状判定**。v9 的全部数值名一律视为角色侧遗留标签，包括本来就含 `::` 的。理由见 3.7 |
 
-关于 R9 的机制说明（已核实）：`PromptComposer.buildCurrentMetricLines` 从
-`panel.metrics` 按 name 取当前值写进 prompt。手动编辑只要落库到 `rp_status_panels`，
-下一轮请求就会带上修改后的值。但模型仍可在其状态块中输出新值并覆盖它，这是预期行为。
+关于 R9 的机制说明（已核实，但 v1 的表述不完整）：`PromptComposer.buildCurrentMetricLines`
+（`PromptComposer.kt:533-545`）从 `panel.metrics` 按名取当前值写进 prompt，
+手动编辑落库后下一轮请求确实会带上改后的值。**但 v1 漏掉了同一轮内的迟到覆盖**，
+见 2.3 与第 5 节——那不是 R9 承诺的「下一轮可被改变」，是修改当场被抹掉，必须修。
 
-## 2. 现状核对（实测，2026-09-22）
+## 2. 现状核对（实测，2026-09-22；v2 已修正）
 
-**现有 RP 相关表**（`data/local/ChatEntities.kt`）：
+### 2.1 v1 写错、v2 更正的三处
 
-```text
-role_cards、world_settings、writing_style_profiles
-conversation_rp_settings、rp_status_panels、message_rp_metadata
-```
+| v1 的说法 | 实际 | 证据 |
+| --- | --- | --- |
+| 主角字段「主代码 52 处引用」（后改为 102 处 / 10 文件） | **不分大小写检索 `protagonist`：12 个文件、124 行、155 处**。v1 只数了三个精确字段名，漏掉 `initialProtagonistName` / `draftProtagonistName` 等参数变体 | `RpSettingsSheet.kt` 实际 30 行（v1 写 3 行）；`ChatScreen.kt` 21 行；`PromptComposer.kt` 17 行 |
+| 世界观「只有两个字段，这正是写不下那么多的来源」 | **不成立**。实体另有 `id` 与两个时间戳；手动保存只做 `trim()`，**无长度截断**；20000 字符上限只存在于**设定生成工具** | `RpRepositoryImpl.kt:99-105`（只 trim）；`WorldSettingEditorSheet.kt:126`（`maxLines=20` 仅显示高度）；`SettingsToolArgumentParser.kt` 的 `MAX_LONG_TEXT_LENGTH` |
+| 第 7 节「新增三张表与关联表」 | 实际共 **3 张**：2 张实体表 + 1 张关联表 | 见 3.2 |
 
-关键事实：
+世界观真正的痛点是「缺结构化组织 + 全部常驻占预算」，不是写不下。
+**配角实体解决不了世界观的容量问题**，两者是不同的需求，不要在文档里互相当论据。
 
+### 2.2 v1 已核实无误的部分
+
+- RP 相关表六张：`role_cards`、`world_settings`、`writing_style_profiles`、
+  `conversation_rp_settings`、`rp_status_panels`、`message_rp_metadata`
+  （`ChatEntities.kt:89-150,237-353`）。Room 当前 v9（`ChatDatabase.kt:23`）。
 - `RoleCard` 字段：`id`、`name`、`description`、`persona`、`speakingStyle`、
-  `userIdentity`、`openingMessage`、`boundaries`、`metricDefinitions`、两个时间戳。
-- `ConversationRpSettings` 每个会话**只能绑一张角色卡**（`roleCardId: String?`，带外键）。
-- 主角是三个普通字符串：`protagonistName` / `protagonistDescription` /
-  `protagonistInitialState`，主代码中共 **52 处**引用。
-- `rp_status_panels` **主键是 `conversationId`**，一个会话一条记录，
-  一个扁平的 `metricsJson` 外加 `relationship` / `scene` / `rawJson`。
-- `<muxue_state>` 的契约是 `{"metrics":[{name,value,min,max}],"relationship":…,"scene":…}`，
-  **一个扁平数组**，目前只对应角色卡的 `metricDefinitions`。
-- `RpStatusPanelCard` **完全只读**，没有任何编辑控件。
-- `RpStateBlockFormat.currentValueOf` 按 **name 匹配**取值——这是现有隐患：
-  改了数值名称，历史值就丢失。R6 的快照机制同时修掉它。
-- 世界观（`WorldSetting`）只有 `title` + `content` 两个字段，是一段自由文本。
-  这正是「世界书写不了那么多」的来源。
+  `userIdentity`、`openingMessage`、`boundaries`、`metricDefinitions`、两个时间戳
+  （`RoleCard.kt:3-16`）。
+- 每会话只能绑一张角色卡，带外键（`ChatEntities.kt:246-251,267-271`）。
+- `rp_status_panels` 主键是 `conversationId`，一个会话一行，扁平 `metricsJson`
+  外加 `relationship` / `scene` / `rawJson`（`ChatEntities.kt:313-320`）。
+- `<muxue_state>` 契约是扁平数组，定义目前只来自角色卡
+  （`RpStateBlockFormat.kt:28-47`；`ChatRepositoryImpl.kt:2034-2036`）。
+  解析器本身不校验名字属于哪套定义，约束在 Repository 补
+  （`RpStateBlockParser.kt:54-60`；`ChatRepositoryImpl.kt:2331-2356`）。
+- `RpStatusPanelCard` 只有折叠，没有任何修改数值的回调
+  （`RpStatusPanelCard.kt:50-54,163-199`）。
+- `currentValueOf` 按 name 匹配，改名即丢值（`RpStateBlockFormat.kt:20-25`）。
+
+### 2.3 v1 完全没看到、但决定设计成败的五条事实
+
+这五条是评审挖出来的，已逐条验证。**它们是 v2 全部新增内容的来源。**
+
+1. **状态有两处持久化，不是一处。** 每条消息的 `message_rp_metadata` 也存完整
+   `metricsJson` / `relationship` / `scene` / `rawJson`（`ChatEntities.kt:346-384`）。
+   编辑与重生成从历史 metadata 恢复状态，而不是读当前面板
+   （`ChatRepositoryImpl.kt:2028-2044,2069-2102`）。
+   → v1 的 §6.3 只迁移 `rp_status_panels`，升级后一旦回滚历史就取到未迁移的旧名字。
+
+2. **名字对不上会静默重置为初始值，不是保留当前值。**
+   `normalizeRpMetrics`（`ChatRepositoryImpl.kt:2331-2356`）在 definitions 非空时
+   按 `metrics.firstOrNull { it.name == definition.name }` 匹配，匹配不上就取
+   `definition.initialValue`。
+   → 模型写错一次前缀、或迁移漏一处，玩家的数值当场归零且无任何提示。
+
+3. **换角色卡会按名字继承旧值。** `ensureInitialStatusPanel`
+   （`RpRepositoryImpl.kt:308-312`）用 `existing?.metrics?.firstOrNull { it.name == ... }`
+   取旧值。A 换 B，只要两张卡都有「好感度」，B 就继承 A 的数值。
+   → 加了前缀以后这个问题不会消失，因为 `角色::好感度` 在两张卡上仍然同名。
+
+4. **异步补写的提交守卫不看面板。** `commitRpEnrichment`（`ChatDao.kt:494-530`）
+   校验会话存在、消息未变、RP 配置未变（`matchesRpConfiguration`，`ChatDao.kt:602-612`
+   只比对 `ConversationRpSettingsEntity` 与 `RoleCardEntity`）、是否最新完成回复——
+   **唯独不比对 `rp_status_panels` 当前内容**。而正文完成后仍会继续异步补写，
+   metadata 返回的状态会成为候选面板（`ChatRepositoryImpl.kt:1844-1858,1964-1980`）。
+   → 用户把体力改成 80，上一轮的补写晚到，当场写回 40。
+   → 另外 `matchesRpConfiguration` 只认角色卡，主角与配角绑定变化它察觉不到。
+
+5. **没有角色卡就没有面板。** `getRpTurnConfigurationSnapshot`（`ChatDao.kt:112-126`）
+   的 `statusPanel = roleCard?.let { getRpStatusPanel(...) }`；
+   角色卡没有数值时还会直接删面板（`RpRepositoryImpl.kt:303-305`）。
+   → 「主角有数值、角色卡没有」这个本计划必然产生的组合，当前代码会把面板删掉。
 
 ## 3. 目标数据模型
 
@@ -75,16 +127,19 @@ conversation_rp_settings、rp_status_panels、message_rp_metadata
 
 ```kotlin
 sealed interface RpEntry {
+    val id: String
     val name: String
 
     /** 静态档案信息：年龄、身份、与主角的关系…… */
     data class Text(
+        override val id: String,
         override val name: String,
         val value: String,
     ) : RpEntry
 
     /** 数值，进状态面板并显示进度条 */
     data class Numeric(
+        override val id: String,
         override val name: String,
         val minValue: Int = 0,
         val maxValue: Int = 100,
@@ -96,7 +151,9 @@ sealed interface RpEntry {
 ```
 
 现有 `RpMetricDefinition`（`id`/`name`/`minValue`/`maxValue`/`initialValue`/
-`description`/`progressRule`）就是 `Numeric` 的雏形，按它改造，保留 `id`。
+`description`/`progressRule`）就是 `Numeric` 的雏形，按它改造，
+**`id` 必须保留并成为身份**（R14）。
+序列化的类型判别名固定写死，不随类名变化；未知类型逐条跳过而不是整体失败。
 
 **不引入 `updatedBy`**（R9）。
 
@@ -107,6 +164,11 @@ UI 与 prompt 拼装到处要判「这个字段对这个类型有没有意义」
 业界也是这样：Character Card V3 规范里根本没有玩家角色（persona）的定义，
 persona 是客户端概念，字段远少于角色卡。
 
+评审同意这一判断，并补充了抽取的正确边界：**抽行为，不抽实体**——
+共享 Text/Numeric 编辑器、校验、序列化与 prompt 格式化；
+不要为三条相似的 CRUD 建通用 Repository 基类（AGENT.md 反对过早抽象）。
+配角直接用 `List<RpEntry.Text>`，让「配角不能有数值」尽量成为**类型约束**而非运行时校验。
+
 | | 角色卡 | 主角 | 配角 |
 | --- | --- | --- | --- |
 | `name` / `description` | ✓ | ✓ | ✓ |
@@ -116,25 +178,20 @@ persona 是客户端概念，字段远少于角色卡。
 | `openingMessage`（开场白） | ✓ | 无意义 | — |
 | `boundaries` | ✓ | — | — |
 
-**主角不新增专属字段（R13）**：
+**主角不新增专属字段（R13）**：`userIdentity` 按定义是「这张角色卡眼中的玩家身份」，
+挂到主角上没有意义；`openingMessage` 是角色卡说的第一句话；
+`persona` / `speakingStyle` 这类需求用文本词条表达即可。
 
-- `userIdentity` 按定义就是「**这张角色卡**眼中的玩家身份」，挂到主角上没有意义。
-- `openingMessage` 是角色卡说的第一句话，主角不说开场白。
-- `persona` / `speakingStyle` 看似对主角也成立（尤其当 `RpNarrativePerspective` 让模型
-  代叙主角动作时），但这类需求**用文本词条表达即可**（例如一条名为「说话风格」的
-  `RpEntry.Text`）。这正是引入通用词条的目的——避免为每种角色再长一套专属字段。
-
-新增表：
+新增表（**共 3 张**）：
 
 ```text
-supporting_characters   id, name, description, entriesJson, createdAt, updatedAt
-protagonist_profiles    id, name, description, entriesJson, createdAt, updatedAt
+supporting_characters                id, name, description, entriesJson, createdAt, updatedAt
+protagonist_profiles                 id, name, description, entriesJson, createdAt, updatedAt
 conversation_supporting_characters   conversationId, supportingCharacterId, orderIndex
 ```
 
-`conversation_rp_settings` 增加 `protagonistProfileId: String?`。
+`conversation_rp_settings` 增加 `protagonistProfileId: String?` 与快照列（见 3.4）。
 配角走关联表（多对多），角色卡与主角各绑一个。
-
 `RoleCard.metricDefinitions` 迁移为 `entries`（文本词条初始为空）。
 
 ### 3.3 状态块契约（R5）
@@ -149,52 +206,171 @@ conversation_supporting_characters   conversationId, supportingCharacterId, orde
 ],"relationship":"…","scene":"…"}
 ```
 
-**分隔符用 `::`（R11）**，不用 `.`：
+**分隔符用 `::`（R11）**，不用 `.`：`.` 在数值名里很可能自然出现（`Lv.`、`H.P.`、
+小数写法），用 `.` 会让校验频繁误伤；`::` 几乎不会有人写进数值名；
+SillyTavern 的宏语法（`{{getvar::name}}`）也用 `::`，模型在该生态里见过这个形状。
 
-- `.` 在数值名里很可能自然出现（`Lv.`、`H.P.`、小数写法），用 `.` 会让校验频繁误伤，
-  用户得为了系统限制去改自己的命名。
-- `::` 几乎不会有人写进数值名，校验基本不会触发。
-- 多一个字符对 token 的影响可忽略。
-- SillyTavern 的宏语法（`{{getvar::name}}`）也用 `::`，该生态里模型见过这个形状。
-- 代价：`::` 比 `.` 略不常见，模型复现的稳定度需真机验收（见风险 5）。
+保持 JSON 形状不变的理由（**v1 的论据被评审推翻，这里用修正后的**）：
 
-理由：状态块是**模型输出的契约**。改 JSON 结构会让长会话里新旧两种示例并存，
-模型输出质量下降；而前缀只是字符串，模型无压力。SillyTavern 的变量系统同样是
-扁平命名空间 + 前缀约定。
+- v1 说「改 JSON 会让长会话里新旧示例并存」。**这条不成立**：状态块在保存前就被剥离
+  （`RpStateBlockParser.kt:29-38`；`ChatRepositoryImpl.kt:1871-1887`），
+  后续历史只发送保存的正文（`ChatRepositoryImpl.kt:1233-1240`），旧示例不会混进上下文。
+- 真正的理由只有一条：**改结构的收益不明确，而改结构的回归面比改名字大得多**。
+- 同样地，**不得宣称 `::` 比别的写法模型复现率更高**——没有实测支持。
+  稳定性不靠分隔符保证，靠 R14 的 `entryId` 身份与 R15 的失败保值兜底。
+
+考虑过但未采用的方案：`name` 传稳定短键（`r01` / `p01`），显示名放定义里映射。
+它能彻底解决身份与重名问题，但会让模型在状态块里看不到语义
+（`好感度` 变成 `r01`），对数值调整的合理性有负面影响。
+**若 RP-2 真机验收发现前缀复现不稳，这是第一退路**，
+且届时 R14 的快照结构已经能直接支撑它。
 
 实现要求：
 
-- 前缀分隔符集中定义为一个常量，且**必须校验用户自定义的词条名不含该分隔符**，
-  否则提示改名。
-- `RpStateBlockFormat` 负责加前缀与剥前缀，解析器只认带前缀的名字。
-- **向后兼容**：旧会话的 `metricsJson` 里没有前缀，读取时一律按「角色」归属补前缀。
-  该兼容逻辑需要单元测试覆盖。
+- 前缀分隔符集中定义为一个常量。
+- **只校验数值词条名**不含该分隔符；文本词条不进状态命名空间，不必限制。
+- 校验在 trim 与长度处理**之后**执行，且**同一归属内的最终 wireName 必须唯一**
+  （当前 `RoleCardEditorSheet.kt:179-189` 连点两次「添加状态条」就能造出两个同名项，
+  而 `RpStateBlockFormat.kt:20-25` 只取第一个）。
+- `RpStateBlockFormat` 负责加前缀与剥前缀。
 
-### 3.4 快照（R6）
+### 3.4 定义快照（R6 / R10）
 
-会话绑定角色卡/主角时，把当时的 `Numeric` 词条定义（name、min、max、initial、
-description、progressRule）快照一份存进会话，之后：
+会话绑定角色卡或主角时，把当时的 `Numeric` 词条定义快照一份存进
+**`conversation_rp_settings` 的新 JSON 列**。
 
-- 改档案不影响进行中的会话；
-- `currentValueOf` 改为按快照里的定义取值，不再直接引用档案；
-- 新会话才使用最新定义。
+快照的每一项存（R14）：
 
-**存放位置：`conversation_rp_settings` 新增一列 JSON（R10）**，不放 `rp_status_panels`。
+```text
+owner        ROLE_CARD | PROTAGONIST
+entryId      词条 id，身份的唯一依据
+wireName     发给模型、也写进 metricsJson 的名字，如「角色::好感度」
+displayName  UI 上显示的名字，如「好感度」
+minValue / maxValue / initialValue / description / progressRule
+```
 
-理由：
+**v1 漏掉的关键要求**：只新增这一列、只改 `PromptComposer`，
+实现不了「改档案不影响旧会话」。必须同时做到：
 
-- 语义上它是**会话配置**（这个会话在用哪套定义），不是运行时状态。
-- `rp_status_panels` 每轮都被改写（新数值落库），而快照绑定后不可变。
-  把不可变数据塞进高频改写的行，等于每轮重新序列化一遍快照，浪费且增加写坏的机会。
-  这与 `docs/MULTIMODAL_PLAN.md` 中「附件不随高频更新的 `messages` 反复序列化」
-  是同一条理由，保持一致。
-- 联表成本为零：`PromptContext` 本来就同时持有 `rpSettings` 与 `statusPanel`，
-  `currentValueOf` 取定义与取当前值各从一边拿，不需要新增读取路径。
+- 建立**唯一的「本会话有效数值定义」解析入口**，正文解析、metadata 解析、
+  兜底请求、历史回滚、面板重建全部走它。当前它们各自从实时角色卡读
+  （`ChatRepositoryImpl.kt:2034-2036,2070-2102,2131-2138,2215-2230`）。
+- **9→10 迁移时为已有绑定回填快照**。只对升级后新发生的绑定建快照，等于旧会话全部裸奔。
+  同时必须诚实说明：回填只能冻结**升级当刻**的定义，无法还原当初绑定时的定义。
+- 修改档案的 `Numeric` **不再重整旧会话面板**，也不应仅因改了档案就清空历史状态快照
+  （当前 `RpRepositoryImpl.kt:75-82,332-349` 会清）。
+- **R6 只冻结数值定义**。姓名、简介、文本词条是否实时跟随档案，另行规定：
+  本计划取「实时跟随」，因为它们不参与数值匹配，不会造成串位。
+  v1「改档案不影响进行中的会话」的表述过宽，v2 收窄到数值定义。
 
-## 4. Prompt 变更
+放 `conversation_rp_settings` 而非 `rp_status_panels` 的理由（**v2 修正**）：
+
+- 语义上它是会话配置，不是运行时状态。
+- v1 说「放面板会每轮重新序列化快照」——**评审指出这不必然**，局部 UPDATE 可以避免。
+  真正的优势是：**配置的生命周期独立于面板**。面板会被删除和重建
+  （关 RP 删面板 `RpRepositoryImpl.kt:284-294`；删角色卡连带删面板 `ChatDao.kt:230-260`），
+  快照跟着一起没了就失去了意义。
+- 联表成本为零：`PromptContext` 本来就同时持有 `rpSettings` 与 `statusPanel`。
+
+### 3.5 身份优先于名字（R14）
+
+匹配顺序固定为：
+
+1. 按 `entryId` 匹配——档案改名后仍能对上。
+2. `entryId` 缺失时（迁移产生的遗留项）按 `wireName` 精确匹配。
+3. 都对不上 → 走 3.6 的失败保值，**不得回落 `initialValue`**。
+
+数值范围一律以快照为准。**不要先按模型自报的 `min` / `max` 裁剪再丢弃原值**——
+当前 `normalizeRpMetrics` 在 definitions 为空的分支就是这么做的。
+
+### 3.6 解析失败的统一语义（R15）
+
+必须建立**统一的「按本轮快照解析 → 匹配 → 合并」入口**，供正文解析
+（`RpStateBlockParser.kt:40-60`）、metadata 解析（`RpMessageMetadataParser.kt:56-74`）
+与兜底请求共用。当前这三条路各自解析，结果可能不一致。
+
+| 情况 | 处理 |
+| --- | --- |
+| 快照里有、模型没输出 | **保留当前值**；当前值也没有时才用 `initialValue` |
+| 模型输出了未知键 | 丢弃并计数，不写库；日志只记条数，不输出正文 |
+| 同一 `wireName` 重复出现 | 拒绝该项并报告，**不得静默取第一个** |
+| 值越界 | 按快照的 min/max 收敛（模型输出才收敛，用户手输见 7.2） |
+| 整个状态块都对不上 | 不得当作「有效本地状态」影响兜底判断（当前 `ChatRepositoryImpl.kt:1894-1911` 会） |
+
+### 3.7 兼容性按数据版本判定（R16）
+
+**禁止用「名字里有没有 `::`」来猜它是新格式还是旧格式。**
+用户在 v9 完全可以把数值命名为 `主角::体力`（编辑器不限制，
+`RoleCardEditorSheet.kt:279-284`；Repository 也不校验，`RpRepositoryImpl.kt:367-389`），
+那时它仍然是**角色卡的数值**，升级后不能被解释成主角的数值。
+
+规则：
+
+- **v9 的全部数值名一律视为角色侧遗留标签**，迁移时统一映射到角色侧词条，
+  由迁移建立「遗留 name → entryId」的显式映射，而不是在运行时猜。
+- 运行期只接受快照中已知的 `wireName`。无前缀的名字**仅在唯一且无歧义时**才兼容，
+  绝不盲目归给角色。
+
+## 4. 状态生命周期（v1 完全缺失）
+
+前缀只能区分「角色 / 主角」，**区分不了「旧角色 / 新角色」**（见 2.3 第 3 条）。
+必须写死下面这套转换规则，首版取简单且可解释的语义：
+
+| 操作 | 定义快照 | 数值 | relationship / scene |
+| --- | --- | --- | --- |
+| 普通保存设置，绑定未变 | 不重拍 | 不动 | 不动 |
+| 换角色卡 | 仅重拍角色组 | 角色组重置为初始值，主角组不动 | 重置（现有行为） |
+| 换主角 | 仅重拍主角组 | 主角组重置为初始值，角色组不动 | 不动 |
+| 解绑角色卡 | 移除角色组 | 清角色组，保留主角组 | 重置 |
+| 解绑主角 | 移除主角组 | 清主角组，保留角色组 | 不动 |
+| 暂停 RP（`isRpEnabled=false`） | **保留** | **保留** | 保留 |
+| 删除角色卡档案 | 移除角色组 | 清角色组，**不得连带清主角组** | 重置 |
+| 增删配角 | 不影响 | 不影响 | 不影响 |
+
+要点：
+
+- **不按名字跨档案继承数值**，取代 `ensureInitialStatusPanel` 现在的行为。
+  以后若确实需要「换卡时带走数值」，做成显式操作。
+- **必须区分「暂停 RP」与「重置状态」**。当前关 RP 直接删面板
+  （`RpRepositoryImpl.kt:284-294`），重新打开就全没了，这次一并修掉。
+- 删角色卡时现有外键会关掉整个 RP 并删整张面板（`ChatDao.kt:230-260`），
+  有了主角数值之后这个行为必须收窄到角色组。
+- 面板必须能在**没有角色卡但有主角**时存在，移除 `ChatDao.kt:112-126` 与
+  `RpRepositoryImpl.kt:303-305` 的相关判断。
+
+## 5. 并发与提交守卫（v1 完全缺失）
+
+R9 说「手动改的值下一轮可被模型改变」，这是设计意图；
+但当前实现会**在同一轮当场抹掉**用户的修改（见 2.3 第 4 条），这是缺陷，必须在 RP-0 修掉。
+
+采用的方案：**扩展 `commitRpEnrichment` 的期望值比对**，与现有整实体比对的风格一致。
+
+- 把补写任务捕获时的 `RpStatusPanelEntity` 一并作为期望值传入，
+  提交前与库中当前行比对；不一致则**丢弃这次面板写入**
+  （metadata 仍可落到自己的消息上，这是现有行为，保留）。
+- `matchesRpConfiguration` 扩展到 `protagonistProfileId`、主角档案实体与配角绑定集合，
+  否则换主角、增删配角时旧请求仍会提交。
+- 历史替换路径（`ChatRepositoryImpl.kt:2077-2087`）走同一套检查。
+
+**不引入独立的状态修订号。** 理由：现有守卫已经是整实体比对，
+再加一套版本列是第二套并发机制，两套并存更容易出错；
+单用户单设备场景下，实体比对足够。若将来出现比对成本问题再改。
+
+手动编辑本身的要求：
+
+- 在**一个事务内重读当前面板、只改目标项**，不能拿 UI 上的整面板草稿覆盖回去，
+  否则会连带盖掉同期模型写入的其它数值。
+- 必须定义「修正」与历史检查点的关系。本计划取：
+  **手动修正同步写入当前最近一条 assistant 消息的 metadata 快照**，
+  否则用户改完值、一回滚就悄悄丢了修改。这条需要单测覆盖。
+- 再次强调：这是**并发保护**，不是 R9 所否定的「锁定」，也不需要 `updatedBy`。
+
+## 6. Prompt 与预算
+
+### 6.1 Prompt 变更
 
 - `buildRpInstructions` 在「角色卡」段之后新增「配角」段，逐个列出
-  `name` + `description` + 文本词条。配角全部常驻（R2 场景下一个会话 3～4 个，可接受）。
+  `name` + `description` + 文本词条。配角全部常驻。
 - 主角段从现有三个字符串改为读主角实体，并列出其数值词条。
 - `buildCurrentMetricLines` 改为同时输出角色卡与主角的数值，带前缀。
 - `buildStateBlockExample` / `metricsJson` 同步带前缀。
@@ -202,138 +378,239 @@ description、progressRule）快照一份存进会话，之后：
   配角不参与内心独白（用户 2026-09-22 确认）。
 - 配角只影响正文叙事，不进 `<muxue_state>`，不进元数据。
 
-## 5. UI 变更
+### 6.2 配角数量与预算（R12，v2 收紧）
 
-### 5.1 配角数量的处理（R12）
+**不设硬性上限**，但 v1 的说法需要修正：不设上限**不等于承诺一定发得出去**。
 
-**不设硬性上限。** 理由：真正的约束是上下文预算，而预算由
-`domain/context/ChatContextPlanner.kt` 按模型真实窗口算出，一个写死的数字必然是武断的。
-但放任多选而不给反馈，正是「世界书写不了那么多」这个痛点的来源。
+- RP 文本属于**不可裁剪的固定成本**（`ChatContextPlanner.kt:290-322`）；
+  固定成本加最近一轮超预算时会产生 `overflowError`（`ChatContextPlanner.kt:445-457`），
+  请求层直接本地失败（`ChatRepositoryImpl.kt:1755-1758`）。
+- 因此一个超长配角就可能让会话发不出去，六个短配角却毫无影响。
+  **主警告必须依据草稿对应的实际规划结果**，数量阈值（建议 6）只作辅助提示。
+- 「预计占用」要估算**实际拼装出来的文本**（含标题、标签、词条），不能只加 description 长度。
+- 文案必须标注「预计」，并明确说明「超出模型预算时仍会发送失败」（AGENT.md 的统一预算要求）。
+- 主角、配角、关联顺序与档案编辑都要触发重新规划，
+  否则面板上的数字与下一次请求对不上（当前响应式估算只额外观察世界观与文风，
+  `ChatRepositoryImpl.kt:1272-1278`）。
 
-做法：
+## 7. UI 变更
 
-- RP 设置 Sheet 的配角多选区显示「已选 N 个 · 预计占用 ~X tokens」，
-  估算走现有 `HeuristicTokenEstimator`，文案必须标注「预计」（AGENT.md 既有要求）。
-- 超过阈值（建议 6 个）显示警告文案，说明会挤占对话历史，**但不阻止选择**。
-- 警告不能只靠颜色表达，要有文字（AGENT.md §9）。
+### 7.1 结构
 
-### 5.2 其余 UI
-
-- 状态面板（`RpStatusPanelCard`）：
-  - 分「角色」与「主角」两组展示，各自带进度条；
-  - 每个数值可点击，**弹出文字输入框**修改（R8），校验范围后落库；
-  - 进度条只做展示，不可拖动。
-- 配角管理：与角色卡、世界观同级的列表页，支持增删改。
-- 主角管理：同上。原「主角档案」那几个输入框从 RP 设置 Sheet 中移除，
-  改为选择一个主角实体。
+- 状态面板（`RpStatusPanelCard`）分「角色」与「主角」两组展示，各自带进度条。
+- 配角管理：与角色卡、世界观同级的列表页，支持增删改。主角管理同上。
+- 原「主角档案」那几个输入框从 RP 设置 Sheet 中移除，改为选择一个主角实体。
 - RP 设置 Sheet：角色卡、主角、世界观各选一个；配角多选。
 - 编辑器沿用 `EditorSheet` + `rememberGuardedDismiss`（未保存草稿要确认）。
-- 词条编辑：文本词条是 name + value 两个输入框；数值词条沿用现有
-  `metricDefinitions` 的编辑形态。
+- 词条编辑：文本词条是 name + value 两个输入框；数值词条沿用现有形态。
 
-## 6. 数据迁移（Room v10）
+### 7.2 数值手动编辑（R8，v2 补齐 AGENT.md 的无障碍要求）
 
-### 6.1 主角三字段 → 主角实体（R3）
+- 点击整行弹出**文字输入框**；进度条只做展示，不可拖动。
+- **输入框保留字符串草稿**，提交时才解析。当前 `NumberField`
+  （`RoleCardEditorSheet.kt:363-369`）直接 `text.toIntOrNull()?.let(...)`，
+  空串和单独一个负号都无法成为中间状态，等于清不掉、输不了负数——这次一并修。
+- **用户手输越界要明确报错，不要静默收敛**；静默收敛只适用于模型输出（见 3.6）。
+  v1 正文写「校验范围」而测试却要求「越界静默收敛」，两处矛盾，v2 以本条为准。
+- 整行使用统一触控尺寸与 `Dimens`，不再硬编码（当前
+  `RpStatusPanelCard.kt:61-74,193-198` 有大量硬编码尺寸）。
+- 提供可访问操作名称，例如「编辑主角体力，当前 80，范围 0 到 100」。
+- 生成或补写期间若禁用编辑，**必须写明禁用原因**，不能只靠置灰。
+- 弹层保留草稿退出确认。
+- 界面上明示：**「仅修正当前值，后续剧情仍可改变。」**
 
-现有每个会话的 `protagonistName` / `protagonistDescription` /
-`protagonistInitialState` 需要转成 `protagonist_profiles` 记录：
+## 8. 数据迁移（Room v10）
 
-- 三个字段**全为空**的会话：不生成记录，`protagonistProfileId` 留 null。
-- 有内容的会话：生成一条记录，`name` 取 `protagonistName`（为空时用
-  「主角」+ 序号），`description` 取 `protagonistDescription`，
-  `protagonistInitialState` 转成一条名为「初始状态」的**文本词条**。
-- **去重**：三个字段内容完全相同的会话合并到同一条记录（用内容哈希判定），
-  避免产生大量重复档案。
-- 迁移后保留原三列一个版本周期，确认无误再删，避免迁移出错无法回滚。
+### 8.1 主角三字段 → 主角实体（R3）
 
-### 6.2 角色卡数值 → 词条
+- 三个字段全为空的会话：不生成记录，`protagonistProfileId` 留 null。
+- 有内容的会话：**每个会话生成一条独立档案**。`name` 取 `protagonistName`
+  （为空时用「主角」+ 序号），`description` 取 `protagonistDescription`，
+  `protagonistInitialState` 转成一条名为「初始状态」的文本词条。
+- **不做内容哈希去重（v2 推翻 v1）**。理由：旧三字段是**会话私有**数据
+  （`ChatEntities.kt:267-275`；`RpRepositoryImpl.kt:227-260` 改一个会话只影响它自己），
+  按内容合并会把它们变成共享对象——此后编辑一处会影响多个会话，
+  而 R6 的快照只冻结数值，管不住姓名与简介。**这是语义变更，不是去重优化。**
+  合并留给用户显式执行。
+- 迁移**不得因新档案的长度限制静默截断**原有姓名与正文。
+- 若将来要做合并功能，必须提供「修改共享档案 / 复制一份仅用于本会话」的入口，
+  并提示受影响的会话数量。
+
+### 8.2 角色卡数值 → 词条
 
 `role_cards.metricDefinitionsJson` 转成 `entriesJson`，每个 `RpMetricDefinition`
-变成一个 `RpEntry.Numeric`，`id` 保留。
+变成一个 `RpEntry.Numeric`，**`id` 必须保留**（它是 R14 的身份依据）。
 
-### 6.3 状态面板前缀补齐
+### 8.3 状态名迁移（两张表，R16）
 
-`rp_status_panels.metricsJson` 中无前缀的 name 一律补「角色.」前缀。
+- **`rp_status_panels.metricsJson` 与 `message_rp_metadata.metricsJson` 都要迁移。**
+  v1 只写了前者，这是最容易造成线上事故的一处遗漏。
+- v9 的每个名字一律映射到角色侧：建立「遗留 name → entryId」，wireName 改写为
+  `角色::<原名>`，**包括原名本身就含 `::` 的情况**。
+- 需要明确 `rawJson` 的定位：它是**原始响应留档**还是规范化后的状态。
+  两种用法不能混，迁移前先确定并写进本节。
 
-### 6.4 迁移要求
+### 8.4 已有绑定回填快照
 
-- 必须导出 `10.json`，并用 `MigrationTestHelper` 做 `9.json → 10.json` 的真实升级测试。
-- 迁移中的 JSON 解析必须容错：解析失败的记录按空处理，不得让整次迁移失败。
+对所有 `isRpEnabled` 且绑定了角色卡的会话，用**升级当刻**的角色卡定义回填 3.4 的快照列。
+文档与提交信息都要如实说明这是「冻结升级时的定义」，不是还原绑定时的定义。
 
-## 7. 分期
+### 8.5 迁移要求
 
-### [ ] RP-1：数据层
+- 必须导出 `10.json`，并用 `MigrationTestHelper` 做 `9.json → 10.json` 的真实升级测试，
+  可沿用 `ChatDatabaseMigrationTest.kt` 现有的真实升级模式。
+- **坏 JSON 保留原文**，不要覆盖成空串——当前解码失败只是返回空列表
+  （`ChatEntities.kt:112-114,322-324`），原始字符串还在库里，是最后的恢复机会，
+  迁移把它写成空就永久丢了。
+- 尽可能**逐条转换**：一条坏 entry 不能清掉整张卡。报告受影响条数，不输出正文内容。
+- 表重建沿用 `ChatDatabase.kt` 已有的复制模式；
+  重建 `role_cards` 时注意不要意外触发已有的 `SET_NULL` 外键造成解绑。
+- 保留的旧三列必须体现在过渡期的 Entity 与导出 schema 中。
 
-新增三张表与关联表；`RpEntry` 模型；`RoleCard` 改造；`ConversationRpSettings` 扩展；
-DAO；Repository；Room v10 迁移与 schema 导出；快照机制。
+### 8.6 关于「保留旧三列」的定位（v2 修正）
 
-验收：迁移测试通过；旧会话的主角数据正确转成档案且去重；
-角色卡数值正确转成词条；无前缀的历史状态块被正确补前缀。
+v1 把「保留旧三列并行一个版本」当成回滚手段。**它不是。**
+数据库只注册了升版本迁移，没有降级路径（`ChatDatabase.kt:23,34-48`），
+旧 APK 装回去打不开新库。旧列的真实价值是**取证与修复材料**。
+
+- 如果确实需要「能装回旧版」，那要的是升级前的一致性备份与恢复流程，
+  或者单独设计降级迁移——本计划不做，只把限制写清楚。
+- 双轨期必须写明：唯一读源是谁、写入时两边怎么处理、旧字段何时停用。
+  不写清就会出现新旧字段互相覆盖。
+
+## 9. 分期（v2 重排，按可验证闭环拆）
+
+**RP-1 改了存储里的名字、RP-2 还没适配——这个中间状态不可发布。**
+因此分期边界按「每期结束时功能自洽」来切，而不是按代码分层。
+
+### [ ] RP-0：状态链路加固（不含任何新功能）
+
+在引入新实体之前，先把现有链路修到能承载它们：
+
+- 统一的「按快照解析 → 匹配 → 合并」入口，替换三条各自为政的解析路径。
+- 匹配失败保留当前值（R15），不再静默回落初始值。
+- `commitRpEnrichment` 纳入面板比对（第 5 节）。
+- 换绑不再按名字继承数值；暂停 RP 不再删面板（第 4 节中与当前实体相关的部分）。
+
+验收：现有 RP 功能行为不变或变得更正确；
+`RpDerivedDataIntegrityTest` 全绿并新增并发用例；**无 schema 变更**。
+
+这一期独立可发布，且即使后面的 RP-1～3 推迟，它修的也都是真实缺陷。
+
+### [ ] RP-1：数据层与迁移
+
+三张新表；`RpEntry` 模型；`RoleCard` 改造；`ConversationRpSettings` 扩展与快照列；
+DAO；Repository；Room v10 迁移（含 8.3 两张表、8.4 回填）与 schema 导出。
+
+验收：真实升级测试通过；旧会话主角数据各自生成独立档案；
+角色卡数值转词条且 `id` 保留；两张表的历史状态名都被正确映射；
+**升级后立即编辑历史或重生成，仍能恢复正确旧值**（这是本期最关键的一条）。
 
 ### [ ] RP-2：Prompt 与状态块
 
 `RpEntry` 进 prompt；前缀加解；`buildCurrentMetricLines` 输出两组；
-状态块示例与解析器；向后兼容；分隔符校验。
+状态块示例与解析器；分隔符与重名校验；配角进正文 prompt。
 
-验收：单测覆盖带前缀/无前缀两种输入；角色卡与主角的数值互不串位；
-配角正确进入正文 prompt 且不进状态块与元数据。
+验收：角色卡与主角的数值互不串位；配角正确进入正文且不进状态块与元数据；
+部分成功的状态块（只对上一半）行为符合 3.6；
+**真机验收模型对带前缀数值名的复现稳定度**（Grok 与 DeepSeek 各一轮）。
 
 ### [ ] RP-3：UI
 
-状态面板分组与文字输入编辑；配角与主角的管理页；RP 设置 Sheet 改造；词条编辑器。
+状态面板分组与文字输入编辑；配角与主角管理页；RP 设置 Sheet 改造；词条编辑器；
+配角预算提示。
 
-验收：手动改值后下一轮请求带的是改后的值（可用日志或上下文面板确认）；
-配角多选上限与展示；空列表与删除后解绑的表现。
+验收：手动改值后下一轮请求带的是改后的值；改值不被同轮迟到补写覆盖；
+配角数量与预计占用提示正确、超阈值只警告不阻止、超预算时报错文案正确；
+空列表与删除后解绑的表现；7.2 的全部无障碍要求。
 
-## 8. 测试计划
+## 10. 测试计划（v2 按评审重写）
 
-JVM 单元测试：
+仓库已有可复用的基础：`RpDerivedDataIntegrityTest`（历史回滚、并发换角色、
+异步补写完整性）、`ChatDatabaseMigrationTest`（真实 schema 迁移）。
 
-- `RpEntry` 的序列化与反序列化，含未知类型的容错。
-- 前缀加解：往返一致；用户词条名含分隔符时被拒绝；无前缀输入按「角色」归属补齐。
-- `buildCurrentMetricLines` 同时输出两组且不串位。
-- 快照：改档案后进行中的会话取值不变；新会话取新定义。
-- 主角迁移：空会话不生成记录；相同内容去重；`protagonistInitialState`
-  转成文本词条。
-- 配角进 prompt 的拼装；配角不出现在状态块与元数据中。
-- 手动编辑：越界值被收敛到 min/max。
+**优先顺序：先补历史迁移、快照生命周期、提交守卫，再谈抽象层与分隔符。**
 
-API 36 设备 instrumentation：
+### 10.1 迁移保真
 
-- `MIGRATION_9_10` 真实升级测试。
-- 关联表的外键级联：删除配角时会话绑定被清理。
+当前面板与历史 metadata 一起迁移；已有绑定回填快照；
+主角字段为空 / 部分空 / 超长；坏 JSON 与单条坏 entry；
+旧名字包含 `::`、以 `主角::` 开头、同组重名。
 
-## 9. 风险与未决事项
+### 10.2 Room 完整性
 
-1. **主角实体化牵动 52 处引用**，是本计划最大的一处改动面。建议 RP-1 中先保留
-   旧三列并行一个版本，降低回滚成本。
-2. **配角常驻 prompt 的成本**：按 R2 每会话 3～4 个可接受，R12 给出数量与预计占用提示。
-   若用户后续习惯性勾很多，需要回头做关键词触发（即 ROADMAP 中「关键词触发世界书」，
-   本计划不做）。
-3. **模型对带前缀数值的遵从度**：`::` 让 name 变长且形状略不常见，Grok 与 DeepSeek
-   是否都能稳定输出正确前缀**需真机验收**。若不稳定，退路依次是：
-   prompt 中给更明确的示例 → 换回 `.` 并加强命名校验 → 最后才考虑改 JSON 结构。
-6. **手动编辑会被模型覆盖**（R9 的预期行为）。若实际使用中感觉困扰，
-   再考虑加回「锁定」语义，届时 `RpEntry.Numeric` 增加一个字段即可。
-7. **与 MM-1a 的 Room 版本冲突**：本计划占 v10，多模态改占 v11，
+9→10 真实升级；从更旧版本连续升级；外键与索引；关联表去重与排序；
+迁移失败整体回滚；重开数据库；确认表重建没有意外解绑。
+
+### 10.3 协议容错
+
+正文 / metadata / 兜底三条路结果一致；未知键、重复键、缺前缀、缺项、
+错范围、整数边界；**失败保留当前值而非初始值**。
+
+### 10.4 快照生命周期
+
+同 id 保存不重拍；改档案不影响旧会话定义；A→B→A 不串值；
+只重拍一组；暂停后恢复；解绑与删除；清空历史。
+
+### 10.5 并发
+
+手改后旧正文或补写迟到；连续两次手改；换主角或配角时旧请求提交；
+旧历史的补写不得覆盖当前面板。
+
+### 10.6 回滚语义
+
+升级后立即重生成；手改后编辑历史；换绑后回滚；失败或取消不留半更新状态。
+
+### 10.7 集成与 UI
+
+仅主角有数值（无角色卡）；设定生成工具绑定；默认主角在两种新建会话入口下的行为；
+预算超限；配角改动后估算刷新；负数与空串输入；草稿退出确认；TalkBack；小屏键盘。
+
+**日志验收的限制**：v1 写「可用日志确认」，但 AGENT.md 禁止输出完整 prompt
+与角色敏感内容，现有上下文面板也只显示统计（`ContextWindowSheet.kt:85-95`），
+核对不了具体数值。**改为用测试捕获请求做断言。**
+
+## 11. 还没解决的范围缺口
+
+评审指出「十二个文件」只是旧字段的替换范围，**不是本次功能的范围**。以下必须补：
+
+1. **无角色卡路径**：明确支持「角色卡无数值、主角有数值」，移除 2.3 第 5 条的两处判断。
+2. **设定生成工具**：`SettingsToolArgumentParser.kt:55-62` 仍构造旧 `metricDefinitions`，
+   另有生成后绑定入口（`RpRepositoryImpl.kt:154-214`）。
+   工具协议可以不变，但必须加「旧 metric DTO → `RpEntry.Numeric`」的适配，
+   并覆盖草稿展示与绑定两条路径。
+3. **R7 的默认主角**：需要补上默认主角 id 的存储位置、档案删除后如何失效、
+   如何显式取消选择；并覆盖两种新建会话路径
+   （显式创建与发送时隐式创建，`ChatRepositoryImpl.kt:161-190`）。
+   **默认主角不得顺带开启 RP，也不得追溯覆盖已有会话的选择。**
+
+## 12. 风险
+
+1. **主角实体化牵动 12 个文件 124 行 155 处**，是本计划最大的改动面。
+   `RpSettingsSheet.kt` 30 行、`ChatScreen.kt` 21 行、`PromptComposer.kt` 17 行最密集。
+   降风险手段是 RP-0 先行 + 分期边界自洽，**不是「保留旧列可回滚」**（见 8.6）。
+2. **配角常驻 prompt 的成本**：按 R2 每会话 3～4 个可接受；
+   真正的约束是 6.2 的预算硬失败。若用户习惯性勾很多，需回头做关键词触发
+   （ROADMAP 中「关键词触发世界书」，本计划不做）。
+3. **模型对带前缀数值名的遵从度未经实测**。退路依次是：
+   prompt 给更明确的示例 → 换 3.3 中的稳定短键方案 → 最后才考虑改 JSON 结构。
+   有了 R15 的失败保值，即使复现不稳也不会丢数据，只会丢一轮更新。
+4. **手动编辑会被模型下一轮覆盖**（R9 的预期行为）。
+   注意这与第 5 节要修的「同轮迟到覆盖」是两回事。
+   是否需要「锁定」，先修完第 5 节再观察；**锁定属于会话运行状态，
+   不是给 `RpEntry.Numeric` 加个字段就能做的**，它要覆盖全部提交、回滚与换绑路径。
+5. **与 MM-1a 的 Room 版本冲突**：本计划占 v10，多模态改占 v11，
    需同步修订 `docs/MULTIMODAL_PLAN.md`。
 
-## 10. 给审查者的重点问题
+## 13. 留给下一轮评审的问题
 
-R1～R13 均已确认，本计划希望被重点攻击的地方：
-
-1. **三类角色不合并是否正确？** 共享 `RpEntry` 而非共享基类，是否会导致
-   角色卡、主角、配角三条几乎相同的 CRUD/编辑器代码重复？重复到什么程度才值得抽？
-2. **主角实体化的 52 处引用**是本计划最大的改动面。「保留旧三列并行一个版本」
-   这个降风险手段是否足够？还是应该进一步拆期？
-3. **前缀方案（R11）是否成立？** 模型每轮都要精确复现 `角色::好感度` 这种 name。
-   有没有比前缀更稳的办法，且不破坏 `<muxue_state>` 的 JSON 结构？
-4. **快照（R6/R10）的边界**：绑定时快照，那么用户在会话进行中**更换**角色卡或主角时，
-   已有的数值怎么办？本计划没有写明，这是一个缺口。
-5. **迁移去重（6.1）**：用内容哈希合并相同的主角档案，会不会把用户主观上不同、
-   但恰好文字相同的档案错误合并？
-6. **状态块向后兼容（3.3）**：旧数据补「角色::」前缀，但如果用户历史数值名里
-   本来就含 `::` 会怎样？
-7. **R9 的取舍**：手动编辑可被模型覆盖。这在实际 RP 体验中是否会成为主要抱怨来源，
-   以致于一开始就该做「锁定」？
-8. 第 8 节测试计划是否有遗漏，尤其是迁移与前缀这两块。
+1. 第 4 节的状态生命周期表，「换主角时角色组不动」是否符合直觉？
+   有没有哪一格的选择会让用户意外丢数据？
+2. 第 5 节用「扩展整实体比对」代替修订号，在
+   「同一会话连续两次手动编辑 + 一次迟到补写」下是否真的安全？
+3. 8.1 不去重意味着一个重度用户可能一次迁移出几十条主角档案。
+   这个代价是否可接受？还是应该迁移后提供一键合并？
+4. RP-0 能否真的独立发布？它改了匹配失败的语义（初始值 → 当前值），
+   这会不会让某些现有行为看起来「变了」而被当成回归？
+5. 3.3 保留可读 wireName、把身份交给 `entryId`，
+   与直接上稳定短键相比，是不是只是把复杂度挪了位置而没有减少？

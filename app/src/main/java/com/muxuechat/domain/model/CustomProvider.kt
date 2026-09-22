@@ -4,6 +4,24 @@ import com.muxuechat.domain.context.ModelContextCatalog
 import java.net.URI
 
 /**
+ * 供应商的认证方式。
+ *
+ * [XAI_OAUTH] 是 AGENT.md §2 批准的唯一 OAuth 例外：凭据来自 xAI 订阅登录，
+ * 不使用、也不读取任何 API Key；服务地址由 App 钉死为 [CustomProvider.XAI_SUBSCRIPTION_BASE_URL]。
+ */
+enum class ProviderAuthKind(val storageValue: String) {
+    API_KEY("api_key"),
+    XAI_OAUTH("xai_oauth"),
+    ;
+
+    companion object {
+        /** 旧 JSON 缺字段或出现未知值时，一律按 API Key 型处理，保持升级前的行为。 */
+        fun fromStorage(value: String?): ProviderAuthKind =
+            entries.firstOrNull { it.storageValue == value } ?: API_KEY
+    }
+}
+
+/**
  * 用户自定义的 OpenAI 兼容供应商。
  *
  * 这里只描述"往哪发、发什么模型"，**不包含 API Key**：
@@ -55,7 +73,12 @@ data class CustomProvider(
      * 不开启时流式用量为尽力读取——上游若不主动返回 usage，界面会如实标注「本次上游未返回用量」。
      */
     val streamUsageEnabled: Boolean = false,
+    /** 旧数据缺省为 [ProviderAuthKind.API_KEY]。 */
+    val authKind: ProviderAuthKind = ProviderAuthKind.API_KEY,
 ) {
+    val usesXaiOAuth: Boolean
+        get() = authKind == ProviderAuthKind.XAI_OAUTH
+
     /** 名称、地址、模型三者齐备才可发起请求。 */
     val isConfigured: Boolean
         get() = baseUrl.isNotBlank() && selectedModel.isNotBlank()
@@ -74,7 +97,8 @@ data class CustomProvider(
         val normalizedSelected = selectedModel.trim()
         return copy(
             name = name.trim().take(MAX_NAME_LENGTH),
-            baseUrl = normalizeBaseUrl(baseUrl),
+            // OAuth token 绝不能跟随用户填写的地址走，xAI 供应商的地址每次归一化都重新钉死。
+            baseUrl = if (usesXaiOAuth) XAI_SUBSCRIPTION_BASE_URL else normalizeBaseUrl(baseUrl),
             models = normalizedModels,
             // 选中的模型未必在列表里（用户手填、或服务端未列出），这是允许的。
             selectedModel = normalizedSelected.ifBlank { normalizedModels.firstOrNull().orEmpty() },
@@ -88,6 +112,11 @@ data class CustomProvider(
     companion object {
         const val MAX_NAME_LENGTH = 40
         const val MAX_REASONING_EFFORT_LENGTH = 20
+
+        /** xAI 订阅链路的固定地址（AGENT.md §2），不接受用户编辑，也不适用明文 HTTP 放行策略。 */
+        const val XAI_SUBSCRIPTION_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+
+        const val XAI_DEFAULT_NAME = "xAI 订阅"
 
         /** UI 快捷填充用，不是取值白名单。 */
         val REASONING_EFFORT_PRESETS = listOf("low", "medium", "high")

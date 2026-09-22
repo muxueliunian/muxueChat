@@ -236,6 +236,8 @@ class SettingsRepositoryImpl(
         settingsMutationMutex.withLock {
             val provider = settings.first().customProviders.firstOrNull { it.id == providerId }
                 ?: error("供应商不存在，请重新添加")
+            // xAI 订阅链路的模型目录是 models-v2，属于 XAI-2；这里绝不能拿 API Key 去请求它。
+            check(!provider.usesXaiOAuth) { "xAI 模型列表将在后续版本接入，请先手动填写模型名" }
             require(provider.baseUrl.isNotBlank()) { "请先填写该供应商的 Base URL" }
             val apiKey = withContext(Dispatchers.IO) {
                 providerKeyStore.getApiKey(providerId)?.takeIf { it.isNotBlank() }

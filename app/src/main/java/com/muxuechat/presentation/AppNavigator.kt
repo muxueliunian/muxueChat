@@ -123,6 +123,7 @@ fun MuxueChatApp(viewModel: ChatViewModel, xaiAuthViewModel: XaiAuthViewModel) {
                         providersWithSavedKey = state.providersWithSavedKey,
                         refreshingModelsProviderId = state.refreshingModelsProviderId,
                         onAddProvider = viewModel::addCustomProvider,
+                        onAddXaiProvider = viewModel::addXaiProvider,
                         onUpdateProvider = viewModel::updateCustomProvider,
                         onDeleteProvider = viewModel::deleteCustomProvider,
                         onSaveProviderKey = viewModel::saveProviderKey,

@@ -18,6 +18,7 @@ import com.muxuechat.domain.context.ModelContextCatalog
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.CustomProvider
+import com.muxuechat.domain.model.ProviderAuthKind
 import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
@@ -59,6 +60,11 @@ private data class CustomProviderDto(
     val modelContextWindows: Map<String, Long> = emptyMap(),
     /** 旧 JSON 缺字段时保持 false，不能让升级后的旧反代突然收到 stream_options。 */
     val streamUsageEnabled: Boolean = false,
+    /**
+     * 认证方式。旧 JSON 缺字段时按 API Key 处理；默认值不写入 JSON（encodeDefaults=false），
+     * 因此已有 API Key 供应商的存储内容与改动前逐字节一致。
+     */
+    val authKind: String = "api_key",
 )
 
 /**
@@ -273,6 +279,7 @@ class SettingsDataStore internal constructor(
                     reasoningEffort = dto.reasoningEffort,
                     modelContextWindows = dto.modelContextWindows,
                     streamUsageEnabled = dto.streamUsageEnabled,
+                    authKind = ProviderAuthKind.fromStorage(dto.authKind),
                 )
             }
         }.onFailure { error ->
@@ -391,6 +398,7 @@ class SettingsDataStore internal constructor(
                         reasoningEffort = provider.reasoningEffort,
                         modelContextWindows = provider.modelContextWindows,
                         streamUsageEnabled = provider.streamUsageEnabled,
+                        authKind = provider.authKind.storageValue,
                     )
                 },
             )

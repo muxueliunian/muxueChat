@@ -104,6 +104,7 @@ fun ProviderSection(
     settings: ChatSettings,
     onChange: (SettingsMutation) -> Unit,
     onAddProvider: (name: String, baseUrl: String) -> Unit,
+    onAddXaiProvider: () -> Unit,
     onDeleteProvider: (String) -> Unit,
 ) {
     var addDialogVisible by remember { mutableStateOf(false) }
@@ -131,7 +132,11 @@ fun ProviderSection(
                 settings.activeCustomProvider?.id == provider.id
             ProviderRow(
                 title = provider.displayName,
-                subtitle = provider.baseUrl.ifBlank { "未填写 Base URL" },
+                subtitle = if (provider.usesXaiOAuth) {
+                    "xAI 订阅登录 · ${provider.baseUrl}"
+                } else {
+                    provider.baseUrl.ifBlank { "未填写 Base URL" }
+                },
                 trailingLabel = if (selected) {
                     provider.selectedModel.ifBlank { "未选择模型" }
                 } else {
@@ -155,6 +160,20 @@ fun ProviderSection(
                 modifier = Modifier.fillMaxWidth().heightIn(min = MinTouchTarget),
             ) {
                 Text("添加 OpenAI 兼容供应商")
+            }
+        }
+        val hasXaiProvider = settings.customProviders.any { it.usesXaiOAuth }
+        Column(modifier = Modifier.padding(bottom = Spacing.Small)) {
+            OutlinedButton(
+                onClick = onAddXaiProvider,
+                enabled = !hasXaiProvider,
+                modifier = Modifier.fillMaxWidth().heightIn(min = MinTouchTarget),
+            ) {
+                Text("添加 xAI 订阅供应商")
+            }
+            if (hasXaiProvider) {
+                // 禁用必须说明原因：所有 xAI 供应商共用同一个登录，多建一个没有意义。
+                MetaLine("已添加 xAI 订阅供应商；所有 xAI 请求共用同一个登录，只能添加一个。")
             }
         }
     }
@@ -192,9 +211,14 @@ internal fun DeleteProviderDialog(
         title = { Text("删除「${provider.displayName}」？") },
         text = {
             Text(
-                "会同时删除：地址、模型列表、逐模型上下文窗口，" +
-                    "以及保存在这台设备上的该供应商 API Key。此操作无法撤销。\n\n" +
-                    "已有的聊天记录不受影响。",
+                if (provider.usesXaiOAuth) {
+                    "会同时删除：模型列表与逐模型上下文窗口。此操作无法撤销。\n\n" +
+                        "不会退出 xAI 登录；如需退出，请到「xAI 订阅登录」分组操作。已有的聊天记录不受影响。"
+                } else {
+                    "会同时删除：地址、模型列表、逐模型上下文窗口，" +
+                        "以及保存在这台设备上的该供应商 API Key。此操作无法撤销。\n\n" +
+                        "已有的聊天记录不受影响。"
+                },
             )
         },
         confirmButton = {
@@ -500,6 +524,8 @@ fun CustomProviderSection(
     onSaveKey: (String) -> Unit,
     onClearKey: () -> Unit,
     onRefreshModels: () -> Unit,
+    /** xAI 订阅供应商用它替代 API Key 输入区，复用设置页已有的 [XaiAuthSection]。 */
+    xaiAuthContent: @Composable () -> Unit = {},
 ) {
     val flushCoordinator = LocalSettingsFlushCoordinator.current
     val nameField = rememberSyncedTextFieldValue(external = provider.name)
@@ -511,17 +537,23 @@ fun CustomProviderSection(
         canCommit = { it.isNotBlank() },
         onCommit = { value -> onUpdate { it.copy(name = value) } },
     )
-    DebouncedTextSetting(
-        fieldValue = baseUrlField,
-        persistedValue = provider.baseUrl,
-        canCommit = { !validateBaseUrl(it).isError },
-        onCommit = { value -> onUpdate { it.copy(baseUrl = value) } },
-    )
+    if (!provider.usesXaiOAuth) {
+        DebouncedTextSetting(
+            fieldValue = baseUrlField,
+            persistedValue = provider.baseUrl,
+            canCommit = { !validateBaseUrl(it).isError },
+            onCommit = { value -> onUpdate { it.copy(baseUrl = value) } },
+        )
+    }
     val validation = validateBaseUrl(baseUrlField.value.text)
 
     SettingsSection(
         title = "供应商设置",
-        description = "局域网自建服务请填写手机可访问的 IP 或域名，不要填 localhost 或 127.0.0.1。",
+        description = if (provider.usesXaiOAuth) {
+            "xAI 订阅供应商的地址由 App 固定，不可编辑，也不适用明文 HTTP。"
+        } else {
+            "局域网自建服务请填写手机可访问的 IP 或域名，不要填 localhost 或 127.0.0.1。"
+        },
     ) {
         Column(
             verticalArrangement = Arrangement.spacedBy(Spacing.Small),
@@ -548,30 +580,40 @@ fun CustomProviderSection(
                 shape = Corner.Control,
                 colors = quietTextFieldColors(),
             )
-            OutlinedTextField(
-                value = baseUrlField.value,
-                onValueChange = { new -> baseUrlField.value = new },
-                singleLine = true,
-                isError = validation.isError,
-                label = { Text("Base URL") },
-                placeholder = { Text("https://example.com/v1") },
-                supportingText = { Text(validation.message()) },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
-                shape = Corner.Control,
-                colors = quietTextFieldColors(),
-            )
+            if (provider.usesXaiOAuth) {
+                MetaLine("地址（固定）：${provider.baseUrl}")
+            } else {
+                OutlinedTextField(
+                    value = baseUrlField.value,
+                    onValueChange = { new -> baseUrlField.value = new },
+                    singleLine = true,
+                    isError = validation.isError,
+                    label = { Text("Base URL") },
+                    placeholder = { Text("https://example.com/v1") },
+                    supportingText = { Text(validation.message()) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
+                    shape = Corner.Control,
+                    colors = quietTextFieldColors(),
+                )
+            }
         }
     }
 
-    SecureKeySection(
-        title = "${provider.displayName} 的 API Key",
-        description = "只填写该服务签发的 API Key，不要填写 OAuth Token 或 Cookie。",
-        placeholder = "输入 API Key",
-        hasSavedKey = hasSavedKey,
-        onSave = onSaveKey,
-        onClear = onClearKey,
-    )
+    if (provider.usesXaiOAuth) {
+        SettingsSection(title = "xAI 登录") {
+            xaiAuthContent()
+        }
+    } else {
+        SecureKeySection(
+            title = "${provider.displayName} 的 API Key",
+            description = "只填写该服务签发的 API Key，不要填写 OAuth Token 或 Cookie。",
+            placeholder = "输入 API Key",
+            hasSavedKey = hasSavedKey,
+            onSave = onSaveKey,
+            onClear = onClearKey,
+        )
+    }
 
     ProviderModelsSection(
         provider = provider,

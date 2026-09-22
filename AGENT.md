@@ -29,8 +29,10 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 
 规则：
 
-- 请求层永远只有「DeepSeek 专属协议」与「OpenAI 兼容协议」两条分支，不按供应商名称分叉出第三条链路，也不为某个具体厂商写特判。
-- 上游是谁（Grok、OpenAI、任意中转）与 App 无关：App 的边界只到 OpenAI 兼容协议本身，不直接适配任何厂商的私有协议、私有字段或 SDK。
+- **上层永远只有「DeepSeek 专属协议」与「OpenAI 兼容协议」两条分支**，不按供应商名称分叉出第三条链路，也不为某个具体厂商写特判。仓库、Prompt 拼装、RP、上下文规划、错误映射都只认这两条。
+- 传输层允许存在多个**实现**，但必须藏在 OpenAI 兼容协议的同一个接口之后，对上层不可见。**唯一例外是 xAI 订阅链路**（用户 2026-09-22 批准）：它在钉死地址上说 Responses 协议，因此以适配器形态实现该接口，负责把 OpenAI 兼容请求翻译过去、再把响应翻译回来。判定依据只能是供应商的认证类型（`ProviderAuthKind.XAI_OAUTH`），不得按名称或地址字符串匹配。
+- 该例外不得扩大：除 xAI 订阅链路外，不允许为任何厂商新增传输实现；用户填写地址的自定义供应商一律只走标准 OpenAI 兼容传输。
+- 上游是谁（OpenAI、任意中转）与 App 无关：除上述 xAI 例外外，App 的边界只到 OpenAI 兼容协议本身，不直接适配任何厂商的私有协议、私有字段或 SDK。
 - 自定义供应商下不发送 DeepSeek 的 `thinking` 对象或 RP Marker；只有全局“设定生成工具”开关和当前供应商的“启用标准工具调用”开关都开启时，才在非 RP 正文请求中发送标准 OpenAI `tools` / `tool_choice` 并处理 `tool_calls`。不得按具体厂商写特判。
 - 自定义供应商的思考等级走 OpenAI 系的顶层 `reasoning_effort` 字段，取值由用户自行填写，App 不做枚举校验（各家档位不统一）。留空时**必须完全不发送该字段**——不支持思考的模型收到未知字段可能直接 400。
 - `reasoning_effort` 只随正文对话发送；RP 元数据、状态兜底、上下文摘要一律不发。
@@ -157,7 +159,10 @@ com.muxuechat
 
 规则：
 
-- 协议实现严格限于两条：DeepSeek 专属协议与 OpenAI 兼容协议。自定义供应商共用后者的同一套 DTO、Client 和 RequestFactory，不允许按供应商名称新增代码分支；两条协议均可承载标准 function tools，但 DeepSeek 私有 thinking/RP Marker 绝不进入 OpenAI 兼容请求。
+- 上层协议严格限于两条：DeepSeek 专属协议与 OpenAI 兼容协议。自定义供应商共用后者的同一套 DTO 与 RequestFactory，不允许按供应商名称新增代码分支；两条协议均可承载标准 function tools，但 DeepSeek 私有 thinking/RP Marker 绝不进入 OpenAI 兼容请求。
+- OpenAI 兼容协议的**传输**由一个接口承载，默认实现是 `OpenAiCompatibleClient`（标准 `POST {base}/chat/completions`）。按 §2 的 xAI 例外，允许存在第二个实现：xAI 订阅链路的 Responses 适配器，入口同样是这个接口，翻译全部封在实现内部。**调用方不得知道自己拿到的是哪个实现**，也不得因此改变请求 DTO 的构造方式。
+- 适配器只做协议翻译，不得引入新的上层概念：它接收同一个 OpenAI 兼容请求 DTO，产出同一套流式事件与用量快照（`input_tokens`/`output_tokens` 必须归一化为 `prompt_tokens`/`completion_tokens`）。
+- 线上格式**只能依据 `docs/XAI_WIRE_FORMAT.md` 的实测记录实现**。该文档 §5.4 列出的未采集场景（截断、错误事件、流中取消、429、无终止事件断流）**不得凭 OpenAI Responses 的经验猜测**：未采集的事件一律走保守兜底（未知事件忽略、缺终止事件按失败处理并给可读文案），不得臆造字段语义。
 - `OpenAiCompatibleClient` 请求用户配置的 `http(s)://` 端点；除 §2 的 xAI 例外外，不允许 App 内 OAuth。地址仍不得包含 user-info、query 或 fragment。
 - 对自定义 OpenAI 兼容供应商，上游服务的 OAuth、令牌刷新、部署和运维均由该服务自身负责，App 不参与。
 - `GET {base}/models` 只用于填充模型选择列表；服务不支持时必须优雅降级到手填，不能阻断聊天。

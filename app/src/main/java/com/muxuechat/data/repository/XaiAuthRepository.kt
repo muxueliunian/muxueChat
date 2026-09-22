@@ -45,7 +45,7 @@ class XaiAuthRepository internal constructor(
     private val ioDispatcher: CoroutineDispatcher,
     private val clock: () -> Long,
     private val logger: RemoteClientLogger,
-) {
+) : XaiAccessTokenSource {
     private val _state = MutableStateFlow<XaiAuthState>(XaiAuthState.Loading)
     val state: StateFlow<XaiAuthState> = _state.asStateFlow()
 
@@ -134,7 +134,7 @@ class XaiAuthRepository internal constructor(
      *
      * 失败时抛出 [XaiAuthException]：只有 [XaiAuthException.AuthorizationRevoked] 会清除凭据。
      */
-    suspend fun getValidAccessToken(rejectedAccessToken: String? = null): String = refreshMutex.withLock {
+    override suspend fun getValidAccessToken(rejectedAccessToken: String?): String = refreshMutex.withLock {
         val (credential, refreshGeneration) = storeMutex.withLock { io { store.load() } to generation }
         if (credential == null) {
             syncSignedOutState()

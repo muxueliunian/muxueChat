@@ -22,6 +22,7 @@ import com.muxuechat.data.remote.DeepSeekStreamEvent
 import com.muxuechat.data.remote.DeepSeekToolCallAccumulator
 import com.muxuechat.data.remote.DeepSeekToolCallDto
 import com.muxuechat.data.remote.SettingsToolCatalog
+import com.muxuechat.data.remote.XaiAuthException
 import com.muxuechat.domain.tool.SettingsTool
 import com.muxuechat.domain.tool.SettingsToolArgumentParser
 import com.muxuechat.domain.tool.SettingsToolDraft
@@ -81,7 +82,6 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
-import java.net.URI
 import java.util.UUID
 
 class ChatRepositoryImpl(
@@ -90,6 +90,8 @@ class ChatRepositoryImpl(
     private val apiClient: DeepSeekApiClient,
     /** 所有自定义供应商共用的 OpenAI 兼容聊天请求客户端。 */
     private val openAiCompatibleClient: OpenAiCompatibleClient,
+    /** xAI 订阅登录的 token 来源；生产环境必须是 [XaiAuthRepository.getInstance]，刷新锁依赖该单例。 */
+    xaiAccessTokens: XaiAccessTokenSource,
     private val promptComposer: PromptComposer = PromptComposer(),
     private val chatContextPlanner: ChatContextPlanner = ChatContextPlanner(promptComposer),
     private val settingsToolDraftStore: SettingsToolDraftStore = SettingsToolDraftStore(),
@@ -100,25 +102,9 @@ class ChatRepositoryImpl(
     private val rpMessageMetadataParser: RpMessageMetadataParser = RpMessageMetadataParser(),
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) : ChatRepository {
+    private val providerRequestFreezer = ProviderRequestFreezer(settingsRepository, xaiAccessTokens)
     private val generationSessions = GenerationSessionRegistry()
     private val enrichmentTasks = RpEnrichmentTaskRegistry()
-
-    /**
-     * 单轮请求的不可变路由快照。API Key 只在内存中短暂保留，绝不进入日志、消息或持久化层。
-     * 后台 RP 补写复用同一快照，避免用户切换设置后把同一轮请求拆到两个 Provider。
-     */
-    // 普通类不会像 data class 一样在误调用 toString() 时展开 API Key、Base URL 与模型名。
-    private class ProviderRequestSnapshot(
-        val provider: ChatProviderId,
-        val settings: ChatSettings,
-        val apiKey: String,
-        val baseUrl: String,
-        val model: String,
-        /** 自定义供应商的 `reasoning_effort`；DeepSeek 走自己的 thinking 协议，这里恒为 null。 */
-        val reasoningEffort: String? = null,
-        /** 该供应商是否已由用户确认支持 `stream_options`；DeepSeek 不需要：其官方流式默认就在最后一个 chunk 返回 usage，恒为 false。 */
-        val includeStreamUsage: Boolean = false,
-    )
 
     /**
      * 正式历史保持不变时生成新分支所需的不可变快照。
@@ -589,57 +575,10 @@ class ChatRepositoryImpl(
 
     private suspend fun freezeProviderRequest(
         onProviderSelected: (ChatProviderId) -> Unit = {},
-    ): ProviderRequestSnapshot = settingsRepository.withCurrentProviderCredentials { settings, apiKey ->
-        val normalized = settings.normalized()
-        onProviderSelected(normalized.provider)
-        val snapshot = when (normalized.provider) {
-            ChatProviderId.DEEPSEEK -> ProviderRequestSnapshot(
-                provider = ChatProviderId.DEEPSEEK,
-                settings = normalized,
-                apiKey = apiKey?.takeIf { it.isNotBlank() }
-                    ?: error("请先在设置中保存 DeepSeek API Key"),
-                baseUrl = normalized.activeBaseUrl,
-                model = normalized.activeModel,
-            )
-
-            ChatProviderId.CUSTOM_OPENAI -> {
-                val activeProvider = normalized.activeCustomProvider
-                    ?: error("请先在设置中添加一个供应商")
-                if (!normalized.isCustomProviderConfigured) {
-                    error("请先在设置中配置「${activeProvider.displayName}」的地址和模型")
-                }
-                ProviderRequestSnapshot(
-                    provider = ChatProviderId.CUSTOM_OPENAI,
-                    settings = normalized,
-                    apiKey = apiKey?.takeIf { it.isNotBlank() }
-                        ?: error("请先在设置中保存「${activeProvider.displayName}」的 API Key"),
-                    baseUrl = normalized.activeBaseUrl,
-                    model = normalized.activeModel,
-                    reasoningEffort = activeProvider.reasoningEffort.takeIf { it.isNotBlank() },
-                    includeStreamUsage = activeProvider.streamUsageEnabled,
-                )
-            }
-        }
-        validateProviderRequest(snapshot.baseUrl, snapshot.model)
-        snapshot
-    }
-
-    /** 只做本地结构校验；http/https 均保留，不能借预检改变用户确认过的明文 HTTP 策略。 */
-    private fun validateProviderRequest(baseUrl: String, model: String) {
-        require(model.isNotBlank()) { "请先配置要使用的模型" }
-        val uri = runCatching { URI(baseUrl.trim()) }.getOrNull()
-            ?: error("Provider Base URL 格式无效")
-        val supportedScheme = uri.scheme.equals("https", ignoreCase = true) ||
-            uri.scheme.equals("http", ignoreCase = true)
-        val validPort = uri.port == -1 || uri.port in 1..65_535
-        require(
-            supportedScheme &&
-                !uri.host.isNullOrBlank() &&
-                uri.rawUserInfo == null &&
-                uri.rawQuery == null &&
-                uri.rawFragment == null &&
-                validPort,
-        ) { "Provider Base URL 必须是有效的 http(s) 地址，且不能包含账号信息、查询参数或片段" }
+    ): ProviderRequestSnapshot = providerRequestFreezer.freeze(onProviderSelected).also { snapshot ->
+        // XAI-2 接上 Responses 传输适配器前，OAuth 快照在预检阶段就停下：
+        // 用户消息已写入、尚未创建 assistant 行，失败会走与其它预检错误相同的落库路径。
+        if (snapshot.credential is ProviderCredential.OAuthBearer) throw XaiTransportUnavailableException()
     }
 
     /**
@@ -2463,6 +2402,9 @@ class ChatRepositoryImpl(
 
     /** 本地预检失败只落固定安全文案，不把异常原文、地址或凭据相关内容写进消息。 */
     private fun Throwable.toSendPreflightUserFacingMessage(provider: ChatProviderId): String {
+        // 这些文案完全由 App 生成、保证不含 token，原样展示才能让用户知道到底缺什么；
+        // 按 Provider 收敛的兜底句会提到 Base URL 与 API Key，而 xAI 供应商没有这两项。
+        if (this is XaiAuthException || this is SafeUserFacingError) return message.orEmpty()
         val mentionsApiKey = message.orEmpty().contains("API Key", ignoreCase = true)
         return when (provider) {
             ChatProviderId.DEEPSEEK -> if (mentionsApiKey) {
