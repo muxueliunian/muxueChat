@@ -45,7 +45,8 @@
 | XAI-2 适配器 | **已通过真机验收**（2026-09-23，用户确认） | — |
 | XAI-5 工具调用 | **已通过真机验收**（2026-09-23，commit d1a5c10，方案 A 被上游接受） | — |
 | XAI-4 额度显示 | 未开始 | XAI-2 |
-| XAI-4 附带：`/v1/models-v2` 拉模型与 500K 窗口 | 未开始。`refreshProviderModels` 的 CAS 校验依赖 `expectedApiKey`，OAuth 没有 Key，需要先改那套并发保护 | XAI-2 |
+| XAI-4a `/v1/models-v2` 拉模型 | **代码完成**（2026-09-23，未提交），已装到真机，**待真机验收**；只取模型 ID，见「XAI-4a」 | — |
+| XAI-4b `models-v2` 的上下文窗口与思考强度 | **下次做**（用户 2026-09-23 定）。窗口需先定「供应商目录给出的窗口」在 AGENT.md 窗口解析顺序里的位置（属规则改动，要用户确认）；思考强度按模型给出取值，不能写死成全局枚举 | XAI-4a 真机验收 |
 
 XAI-1 只依赖 OAuth 规范，不依赖 wire 格式，因此不被 XAI-0 阻塞。
 
@@ -458,6 +459,29 @@ refresh token 原子轮换、登出竞态处理、凭据加密存储与备份排
 
 另需一件实现工作：RP Marker 是 DeepSeek 专属，xAI 下不可用，需在
 `presentation/chat/RpMarkerAvailability.kt` 的文案中如实说明。
+
+### [ ] XAI-4a：`models-v2` 拉取模型列表（2026-09-23）
+
+- `XaiResponsesTransport.listModels`：`GET /v1/models-v2`，地址同样钉死；请求头按抓包只带
+  `Authorization`、`Accept: application/json`、`X-XAI-Token-Auth`、`x-authenticateresponse`、
+  `x-grok-client-identifier/version/mode`，**不带**会话 id、`req-id` 与 `model-override`（它们只在 `/responses` 上出现过）。
+  响应复用 `ModelCatalogParser`（`data[].id`、上限、去重、排序）；只记状态码与条数，不记响应体。
+  不登记为在途请求，「停止生成」不会取消它。
+- `XaiModelCatalog`：token 在设置锁外获取；401 时带着被拒的 token 强制刷新一次再重试（与聊天请求一致），只重试一次。
+- `SettingsRepositoryImpl.refreshProviderModels`：xAI 供应商改走目录来源。原先「地址与 API Key 未变」的
+  并发校验对它不适用（无 Key、地址钉死），改为写回时校验「供应商仍存在且仍是 xAI 订阅」。
+  写回规则与普通供应商相同：原选择仍在目录里就保留，否则退回首项。
+- 文案：去掉「模型名需手动填写」；刷新失败提示改为「网络与凭据（API Key 或登录）」。
+- 测试：传输层 4 项（实测请求头 / 401 类型 / 空目录与坏 JSON / 非钉死主机不发送）、
+  `XaiModelCatalogTest` 2 项、`SettingsRepositoryModelRefreshTest` 4 项。
+
+没做（留给 XAI-4b，用户 2026-09-23 定为下次做）：`context_window`（抓包里四个模型都是 500K）与
+`reasoning_efforts`（逐模型不同，`grok-4.5` 没有 `xhigh`）不消费。当前 xAI 模型的窗口仍按
+「用户逐模型覆盖 → 内置常量 → 32K 回退」解析；需要准确占用时，用户可在「上下文管理」里手填 500000。
+已知限制：刷新期间切换 xAI 账号，写回的是旧账号的目录（订阅档位不同时可能不一致），概率很低，未处理。
+
+真机验收：登录后在「xAI 订阅」供应商设置点「从服务获取模型列表」，应列出订阅可用的模型；未登录时给出登录提示；
+聊天页模型选择器里的刷新同样可用。
 
 ### [x] XAI-5：工具调用（2026-09-23 新增）
 

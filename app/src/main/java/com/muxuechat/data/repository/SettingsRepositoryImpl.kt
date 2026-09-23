@@ -27,6 +27,8 @@ class SettingsRepositoryImpl(
     private val deepSeekApiClient: DeepSeekApiClient,
     /** 仅用于一次性迁移旧的 CLIProxyAPI 代理 Key。 */
     private val legacyCliProxyApiKeyStore: LegacyCliProxyCredentialStore,
+    /** 只用于拉取 xAI 订阅供应商的模型列表（`models-v2`）；为 null 时该功能不可用。 */
+    private val xaiModelCatalog: XaiModelCatalogSource? = null,
 ) : SettingsRepository {
     private val settingsMutationMutex = Mutex()
     private val deepSeekKeyMutex = Mutex()
@@ -200,6 +202,7 @@ class SettingsRepositoryImpl(
     }
 
     override suspend fun refreshProviderModels(providerId: String): List<String> {
+        if (isXaiProvider(providerId)) return refreshXaiProviderModels(providerId)
         val request = freezeProviderModelsRequest(providerId)
 
         val models = openAiCompatibleClient.listModels(
@@ -213,6 +216,28 @@ class SettingsRepositoryImpl(
             models = models,
             updatedAtMillis = System.currentTimeMillis(),
         )
+        return models
+    }
+
+    private suspend fun isXaiProvider(providerId: String): Boolean = settingsMutationMutex.withLock {
+        val provider = settings.first().customProviders.firstOrNull { it.id == providerId }
+            ?: error("供应商不存在，请重新添加")
+        provider.usesXaiOAuth
+    }
+
+    /**
+     * xAI 订阅供应商没有 API Key、地址钉死，普通供应商那套「地址与 Key 未变」的校验对它不适用。
+     * 取而代之的守卫是：写回时该供应商仍然存在、仍是 xAI 订阅。token 由目录来源在设置锁外获取。
+     */
+    private suspend fun refreshXaiProviderModels(providerId: String): List<String> {
+        val catalog = xaiModelCatalog ?: error("当前版本无法获取 xAI 模型列表，请手动填写模型名")
+        val models = catalog.listModels()
+        settingsMutationMutex.withLock {
+            val latest = settings.first().customProviders.firstOrNull { it.id == providerId }
+                ?: error("供应商已被删除，已忽略本次模型列表")
+            require(latest.usesXaiOAuth) { "供应商类型已变化，请重新获取模型列表" }
+            writeProviderModels(providerId, models, System.currentTimeMillis())
+        }
         return models
     }
 
@@ -236,8 +261,8 @@ class SettingsRepositoryImpl(
         settingsMutationMutex.withLock {
             val provider = settings.first().customProviders.firstOrNull { it.id == providerId }
                 ?: error("供应商不存在，请重新添加")
-            // xAI 订阅链路的模型目录是 models-v2，属于 XAI-2；这里绝不能拿 API Key 去请求它。
-            check(!provider.usesXaiOAuth) { "xAI 模型列表将在后续版本接入，请先手动填写模型名" }
+            // xAI 订阅走 refreshXaiProviderModels；这里是 API Key 通道，绝不能拿 Key 去请求 models-v2。
+            check(!provider.usesXaiOAuth) { "xAI 模型列表不走 API Key 通道" }
             require(provider.baseUrl.isNotBlank()) { "请先填写该供应商的 Base URL" }
             val apiKey = withContext(Dispatchers.IO) {
                 providerKeyStore.getApiKey(providerId)?.takeIf { it.isNotBlank() }
@@ -264,24 +289,29 @@ class SettingsRepositoryImpl(
             require(latestProvider.baseUrl == expectedBaseUrl && latestApiKey == expectedApiKey) {
                 "供应商地址或 API Key 已变化，请重新获取模型列表"
             }
-            settingsDataStore.updateSettings { current ->
-                current.copy(
-                    customProviders = current.customProviders.map { provider ->
-                        if (provider.id != providerId) {
-                            provider
-                        } else {
-                            provider.copy(
-                                models = models,
-                                // 原选中模型仍在新列表里就保留，否则退回列表首项，避免指向一个已下线的模型。
-                                selectedModel = provider.selectedModel
-                                    .takeIf { it.isNotBlank() && models.contains(it) }
-                                    ?: models.firstOrNull().orEmpty(),
-                                modelsUpdatedAtMillis = updatedAtMillis,
-                            )
-                        }
-                    },
-                )
-            }
+            writeProviderModels(providerId, models, updatedAtMillis)
+        }
+    }
+
+    /** 调用方必须持有 [settingsMutationMutex] 并已完成各自的一致性校验。 */
+    private suspend fun writeProviderModels(providerId: String, models: List<String>, updatedAtMillis: Long) {
+        settingsDataStore.updateSettings { current ->
+            current.copy(
+                customProviders = current.customProviders.map { provider ->
+                    if (provider.id != providerId) {
+                        provider
+                    } else {
+                        provider.copy(
+                            models = models,
+                            // 原选中模型仍在新列表里就保留，否则退回列表首项，避免指向一个已下线的模型。
+                            selectedModel = provider.selectedModel
+                                .takeIf { it.isNotBlank() && models.contains(it) }
+                                ?: models.firstOrNull().orEmpty(),
+                            modelsUpdatedAtMillis = updatedAtMillis,
+                        )
+                    }
+                },
+            )
         }
     }
 

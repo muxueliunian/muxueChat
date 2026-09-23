@@ -181,7 +181,7 @@ class ProviderRequestFreezerTest {
 
         // 不能复用 API Key 型那句「地址和模型」：xAI 的地址钉死且不可编辑，
         // 而按 Provider 收敛的兜底句还会提到 Base URL 与 API Key，界面上都没有。
-        assertEquals("请先为「xAI 订阅」填写模型名（当前版本需手动填写）。", error?.message)
+        assertEquals("请先为「xAI 订阅」选择模型：在该供应商设置里获取模型列表，或手动添加模型名。", error?.message)
         assertTrue(error is SafeUserFacingError)
         assertEquals(0, tokens.calls)
     }

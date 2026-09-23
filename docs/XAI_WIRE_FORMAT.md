@@ -327,6 +327,20 @@ App 只需要 `email` 用于账号展示——而这一项 `id_token` 里已经�
 }, … ] }
 ```
 
+请求头（2026-09-23 从原始抓包补记，只提取了头名与非敏感值）：
+
+```text
+GET https://cli-chat-proxy.grok.com/v1/models-v2
+Accept: application/json
+Authorization: Bearer <token>
+X-XAI-Token-Auth: xai-grok-cli
+x-authenticateresponse: authenticate-response
+x-grok-client-identifier / x-grok-client-version / x-grok-client-mode（同 §1.1）
+```
+
+**没有** `x-grok-conv-id`、`x-grok-session-id`、`x-grok-req-id`、`x-grok-model-override`。
+三次采集的响应都是 200，`etag` 相同。
+
 本次返回四个模型：`grok-4.7`、`grok-4.7-build-fast`（"Fast variant. 2x the price."）、
 `grok-4.6`、`grok-4.5`。**全部 `context_window: 500000`**。
 

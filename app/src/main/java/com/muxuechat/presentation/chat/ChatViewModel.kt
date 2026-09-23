@@ -25,6 +25,7 @@ import com.muxuechat.data.repository.SettingsRepository
 import com.muxuechat.data.repository.SettingsRepositoryImpl
 import com.muxuechat.data.remote.XaiResponsesTransport
 import com.muxuechat.data.repository.XaiAuthRepository
+import com.muxuechat.data.repository.XaiModelCatalog
 import com.muxuechat.domain.model.ChatMessage
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatRole
@@ -662,7 +663,7 @@ class ChatViewModel(
                 settingsRepository.upsertCustomProvider(provider)
             }.onSuccess {
                 transient.update {
-                    it.copy(errorMessage = "已添加并切换到「${CustomProvider.XAI_DEFAULT_NAME}」，请登录 xAI 并填写模型名")
+                    it.copy(errorMessage = "已添加并切换到「${CustomProvider.XAI_DEFAULT_NAME}」，请登录 xAI 后获取模型列表")
                 }
             }.onFailure { error ->
                 Log.w(TAG, "Adding xAI provider failed: ${error.javaClass.simpleName}")
@@ -741,7 +742,7 @@ class ChatViewModel(
                 transient.update {
                     it.copy(
                         errorMessage = error.message ?: "模型列表获取失败，请手动填写模型名",
-                        modelRefreshErrors = it.modelRefreshErrors + (providerId to "刷新失败，仍保留旧目录与当前选择。请检查连接与 Key 后重试。"),
+                        modelRefreshErrors = it.modelRefreshErrors + (providerId to "刷新失败，仍保留旧目录与当前选择。请检查网络与凭据（API Key 或登录）后重试。"),
                     )
                 }
             }
@@ -1228,6 +1229,7 @@ class ChatViewModel(
                     application.packageManager.getPackageInfo(application.packageName, 0).versionName
                 }.getOrNull().orEmpty()
                 val xaiResponsesTransport = XaiResponsesTransport(clientVersion = appVersion)
+                val xaiAccessTokens = XaiAuthRepository.getInstance(application)
                 val settingsRepository = SettingsRepositoryImpl(
                     settingsDataStore = SettingsDataStore(application),
                     apiKeyStore = EncryptedApiKeyStore(application),
@@ -1235,6 +1237,7 @@ class ChatViewModel(
                     openAiCompatibleClient = openAiCompatibleClient,
                     deepSeekApiClient = deepSeekApiClient,
                     legacyCliProxyApiKeyStore = EncryptedCliProxyApiKeyStore(application),
+                    xaiModelCatalog = XaiModelCatalog(xaiResponsesTransport, xaiAccessTokens),
                 )
                 val chatRepository = ChatRepositoryImpl(
                     chatDao = database.chatDao(),
@@ -1243,7 +1246,7 @@ class ChatViewModel(
                     openAiCompatibleClient = openAiCompatibleClient,
                     xaiResponsesTransport = xaiResponsesTransport,
                     // 必须与设置页的 XaiAuthViewModel 共用同一个单例：刷新的串行化依赖同一把锁。
-                    xaiAccessTokens = XaiAuthRepository.getInstance(application),
+                    xaiAccessTokens = xaiAccessTokens,
                 )
                 val rpRepository = RpRepositoryImpl(database = database)
 

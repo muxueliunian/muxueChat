@@ -36,7 +36,7 @@ interface XaiAccessTokenSource {
  * 那两项在 xAI 供应商的界面上根本不存在，用户会被指向找不到的输入框。
  */
 internal class XaiProviderNotConfiguredException(providerName: String) :
-    IllegalStateException("请先为「$providerName」填写模型名（当前版本需手动填写）。"),
+    IllegalStateException("请先为「$providerName」选择模型：在该供应商设置里获取模型列表，或手动添加模型名。"),
     SafeUserFacingError
 
 /**

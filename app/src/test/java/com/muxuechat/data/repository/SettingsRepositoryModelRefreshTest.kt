@@ -12,6 +12,7 @@ import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.CustomProvider
 import com.muxuechat.domain.model.DeepSeekModels
+import com.muxuechat.domain.model.ProviderAuthKind
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -27,6 +28,7 @@ import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -151,6 +153,89 @@ class SettingsRepositoryModelRefreshTest {
         assertEquals("new-a", updated.selectedModel)
     }
 
+    // ---------- xAI 订阅（models-v2） ----------
+
+    /** xAI 供应商走目录来源而不是 API Key 通道；原选择不在新目录里时退回首项。 */
+    @Test
+    fun xaiRefresh_usesCatalogWithoutAnyApiKey() = runBlocking {
+        seedXai(selectedModel = "grok-old")
+        val repository = repository(xaiCatalog = FakeXaiCatalog { listOf("grok-4.5", "grok-4.7") })
+
+        val models = repository.refreshProviderModels(XAI_ID)
+        val updated = settingsDataStore.settings.first().customProviders.single()
+
+        assertEquals(listOf("grok-4.5", "grok-4.7"), models)
+        assertEquals(listOf("grok-4.5", "grok-4.7"), updated.models)
+        assertEquals("grok-4.5", updated.selectedModel)
+        assertTrue(updated.modelsUpdatedAtMillis > 0L)
+        assertFalse(providerKeys.hasApiKey(XAI_ID))
+    }
+
+    @Test
+    fun xaiRefresh_keepsSelectionThatIsStillListed() = runBlocking {
+        seedXai(selectedModel = "grok-4.7")
+        val repository = repository(xaiCatalog = FakeXaiCatalog { listOf("grok-4.5", "grok-4.7") })
+
+        repository.refreshProviderModels(XAI_ID)
+
+        assertEquals("grok-4.7", settingsDataStore.settings.first().customProviders.single().selectedModel)
+    }
+
+    /** 请求期间供应商被删：结果丢弃，不能把目录写回一个已不存在的供应商。 */
+    @Test
+    fun xaiRefresh_providerDeletedDuringRequest_discardsResult() = runBlocking {
+        seedXai(selectedModel = "")
+        lateinit var repository: SettingsRepositoryImpl
+        repository = repository(
+            xaiCatalog = FakeXaiCatalog {
+                repository.deleteCustomProvider(XAI_ID)
+                listOf("grok-4.7")
+            },
+        )
+
+        val error = runCatching { repository.refreshProviderModels(XAI_ID) }.exceptionOrNull()
+
+        assertTrue(error?.message.orEmpty().contains("已被删除"))
+        assertTrue(settingsDataStore.settings.first().customProviders.isEmpty())
+    }
+
+    /** 目录拉取失败：旧目录与当前选择原样保留。 */
+    @Test
+    fun xaiRefresh_failureKeepsOldCatalog() = runBlocking {
+        seedXai(selectedModel = "grok-4.7", models = listOf("grok-4.7"))
+        val repository = repository(xaiCatalog = FakeXaiCatalog { error("请先登录 xAI") })
+
+        val error = runCatching { repository.refreshProviderModels(XAI_ID) }.exceptionOrNull()
+
+        assertEquals("请先登录 xAI", error?.message)
+        val provider = settingsDataStore.settings.first().customProviders.single()
+        assertEquals(listOf("grok-4.7"), provider.models)
+        assertEquals("grok-4.7", provider.selectedModel)
+    }
+
+    private suspend fun seedXai(selectedModel: String, models: List<String> = emptyList()) {
+        settingsDataStore.updateSettings {
+            ChatSettings(
+                provider = ChatProviderId.CUSTOM_OPENAI,
+                customProviders = listOf(
+                    CustomProvider(
+                        id = XAI_ID,
+                        name = CustomProvider.XAI_DEFAULT_NAME,
+                        baseUrl = CustomProvider.XAI_SUBSCRIPTION_BASE_URL,
+                        models = models,
+                        selectedModel = selectedModel,
+                        authKind = ProviderAuthKind.XAI_OAUTH,
+                    ),
+                ),
+                activeCustomProviderId = XAI_ID,
+            )
+        }
+    }
+
+    private class FakeXaiCatalog(private val block: suspend () -> List<String>) : XaiModelCatalogSource {
+        override suspend fun listModels(): List<String> = block()
+    }
+
     private suspend fun seedDeepSeek(
         model: String,
         cached: List<String> = emptyList(),
@@ -168,6 +253,7 @@ class SettingsRepositoryModelRefreshTest {
     private fun repository(
         deepSeekClient: DeepSeekApiClient = DeepSeekApiClient(clientReturning(SUCCESS_BODY), NO_OP_LOGGER),
         openAiClient: OpenAiCompatibleClient = OpenAiCompatibleClient(clientReturning(SUCCESS_BODY), NO_OP_LOGGER),
+        xaiCatalog: XaiModelCatalogSource? = null,
     ) = SettingsRepositoryImpl(
         settingsDataStore = settingsDataStore,
         apiKeyStore = deepSeekKeys,
@@ -175,6 +261,7 @@ class SettingsRepositoryModelRefreshTest {
         openAiCompatibleClient = openAiClient,
         deepSeekApiClient = deepSeekClient,
         legacyCliProxyApiKeyStore = UnusedLegacyKeys(),
+        xaiModelCatalog = xaiCatalog,
     )
 
     private fun deepSeekClient(body: String, statusCode: Int = 200) =
@@ -241,6 +328,7 @@ class SettingsRepositoryModelRefreshTest {
     }
 
     private companion object {
+        const val XAI_ID = "xai"
         const val SUCCESS_BODY =
             """{"data":[{"id":"deepseek-v4-flash"},{"id":"deepseek-v4-pro"}]}"""
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()

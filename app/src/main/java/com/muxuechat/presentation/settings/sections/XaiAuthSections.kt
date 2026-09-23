@@ -68,7 +68,7 @@ fun XaiAuthSection(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error,
         )
-        MetaLine("登录后可在「xAI 订阅」供应商下聊天。模型名需手动填写；工具调用默认关闭，可在该供应商设置中开启。")
+        MetaLine("登录后可在「xAI 订阅」供应商下聊天。模型列表可在该供应商设置中获取；工具调用默认关闭，同样在那里开启。")
 
         when (val auth = state.auth) {
             XaiAuthState.Loading -> MetaLine("状态：正在读取…")

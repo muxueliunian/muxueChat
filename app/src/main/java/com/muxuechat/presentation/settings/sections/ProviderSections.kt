@@ -770,7 +770,11 @@ private fun ProviderModelsSection(
 
     SettingsSection(
         title = "可用模型",
-        description = "服务不支持 /models 时可手动添加。窗口覆盖统一在「上下文管理」中配置。",
+        description = if (provider.usesXaiOAuth) {
+            "模型列表来自 xAI 订阅服务，需先登录。窗口覆盖统一在「上下文管理」中配置。"
+        } else {
+            "服务不支持 /models 时可手动添加。窗口覆盖统一在「上下文管理」中配置。"
+        },
     ) {
         Column(
             verticalArrangement = Arrangement.spacedBy(Spacing.Small),

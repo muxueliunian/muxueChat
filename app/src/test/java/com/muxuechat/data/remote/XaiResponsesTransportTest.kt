@@ -548,6 +548,69 @@ class XaiResponsesTransportTest {
     }
 
 
+    // ------------------------------------------------------------------ models-v2（线上格式 §5.3）
+
+    /** 实测响应的结构（字段取自抓包，值是合成的）。 */
+    private val modelsV2Body = """
+        {"object":"list","data":[
+          {"id":"grok-4.7","object":"model","owned_by":"xAI","model":"grok-4.7","context_window":500000,
+           "api_backend":"responses","reasoning_efforts":[{"id":"high","value":"high","label":"High","default":true}]},
+          {"id":"grok-4.5","object":"model","owned_by":"xAI","context_window":500000,"api_backend":"responses"}
+        ]}
+    """.trimIndent()
+
+    @Test
+    fun listModels_sendsMeasuredHeadersOnlyAndParsesIds() {
+        val models = runBlocking { transportReturning(modelsV2Body).listModels(TOKEN, "$BASE_URL/") }
+
+        assertEquals(listOf("grok-4.5", "grok-4.7"), models)
+        val request = recorded.get()!!
+        assertEquals("GET", request.method)
+        assertEquals("$BASE_URL/models-v2", request.url.toString())
+        assertEquals("Bearer $TOKEN", request.header("Authorization"))
+        assertEquals("application/json", request.header("Accept"))
+        assertEquals("xai-grok-cli", request.header("X-XAI-Token-Auth"))
+        assertEquals("authenticate-response", request.header("x-authenticateresponse"))
+        assertEquals(XaiResponsesTransport.CLIENT_IDENTIFIER, request.header("x-grok-client-identifier"))
+        assertEquals("9.9.9", request.header("x-grok-client-version"))
+        assertEquals("interactive", request.header("x-grok-client-mode"))
+        // 这几项只在 /responses 上出现过。
+        listOf("x-grok-conv-id", "x-grok-session-id", "x-grok-req-id", "x-grok-model-override").forEach {
+            assertNull(it, request.header(it))
+        }
+    }
+
+    @Test
+    fun listModels_unauthorizedIsTypedForRefreshRetry() {
+        val error = runCatching {
+            runBlocking { transportReturning("{}", code = 401).listModels(TOKEN, BASE_URL) }
+        }.exceptionOrNull()
+
+        assertTrue(error is XaiResponsesTransport.XaiUnauthorizedException)
+    }
+
+    @Test
+    fun listModels_emptyOrMalformedCatalogFailsWithReadableCopy() {
+        listOf("""{"object":"list","data":[]}""", "不是 JSON").forEach { body ->
+            val error = runCatching {
+                runBlocking { transportReturning(body).listModels(TOKEN, BASE_URL) }
+            }.exceptionOrNull()
+            assertTrue("body=$body", error is XaiResponsesTransport.XaiResponsesException)
+            assertTrue(error!!.message!!.contains("手动填写模型名"))
+        }
+    }
+
+    /** 与聊天请求同一道关口：token 绝不发往钉死地址以外的主机。 */
+    @Test
+    fun listModels_rejectsNonPinnedHostWithoutSending() {
+        val error = runCatching {
+            runBlocking { transportReturning(modelsV2Body).listModels(TOKEN, "https://api.x.ai/v1") }
+        }.exceptionOrNull()
+
+        assertTrue(error is XaiResponsesTransport.XaiResponsesException)
+        assertNull(recorded.get())
+    }
+
     private companion object {
         const val TOKEN = "synthetic-xai-access-token"
         const val BASE_URL = "https://cli-chat-proxy.grok.com/v1"

@@ -9,6 +9,7 @@ import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -187,6 +188,102 @@ class XaiResponsesTransport private constructor(
         activeCalls.clear()
     }
 
+    /**
+     * 订阅可用的模型目录：`GET /v1/models-v2`（线上格式 §5.3）。
+     *
+     * 请求头按实测只带认证与客户端身份，**不带** `x-grok-conv-id` / `session-id` / `req-id` /
+     * `model-override`——它们只在 `/responses` 上出现过。响应与 OpenAI `/models` 同为 `data[].id`，
+     * 复用 [ModelCatalogParser] 的上限与去重；`context_window`、`reasoning_efforts` 等字段暂不消费。
+     *
+     * 不登记进 [activeCalls]：「停止生成」只该取消聊天请求，不该误伤设置页的模型拉取。
+     */
+    suspend fun listModels(accessToken: String, baseUrl: String): List<String> {
+        val request = identityHeaders(Request.Builder(), accessToken)
+            .url("${requirePinnedBaseUrl(baseUrl)}/models-v2")
+            .header("Accept", "application/json")
+            .get()
+            .build()
+
+        logger.info("Fetching xAI model list")
+        return suspendCancellableCoroutine { continuation ->
+            val call = okHttpClient.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            try {
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        continuation.resumeWith(
+                            Result.failure(
+                                if (call.isCanceled()) CancellationException("模型列表请求已取消") else networkError(e),
+                            ),
+                        )
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        val result = runCatching { response.use(::readModelCatalog) }
+                            .recoverCatching { error ->
+                                throw when {
+                                    call.isCanceled() -> CancellationException("模型列表请求已取消")
+                                    error is XaiResponsesException -> error
+                                    error is IOException -> networkError(error)
+                                    else -> XaiResponsesException(MODELS_PARSE_FAILED)
+                                }
+                            }
+                        continuation.resumeWith(result)
+                    }
+                })
+            } catch (_: RuntimeException) {
+                call.cancel()
+                continuation.resumeWith(Result.failure(XaiResponsesException("xAI 模型列表请求无法启动")))
+            }
+        }
+    }
+
+    private fun readModelCatalog(response: Response): List<String> {
+        if (!response.isSuccessful) {
+            // 与聊天请求同理，只记状态码，不记响应体。
+            logger.warn("xAI model list HTTP ${response.code}")
+            throw httpError(response.code)
+        }
+        val body = response.body ?: throw XaiResponsesException("xAI 返回了空响应")
+        val maxBytes = ModelCatalogParser.MAX_RESPONSE_BYTES
+        if (body.contentLength() > maxBytes || body.source().request(maxBytes + 1L)) {
+            throw XaiResponsesException("xAI 模型列表响应过大，请手动填写模型名")
+        }
+        return when (val parsed = ModelCatalogParser.parse(body.source().readUtf8(), json)) {
+            is ModelCatalogParseResult.Success -> parsed.ids.also {
+                logger.info("xAI model list fetched: count=${it.size}")
+            }
+            is ModelCatalogParseResult.Failure -> throw XaiResponsesException(
+                when (parsed.reason) {
+                    ModelCatalogParseResult.Reason.EMPTY -> "xAI 返回的模型列表为空，请手动填写模型名"
+                    else -> MODELS_PARSE_FAILED
+                },
+            )
+        }
+    }
+
+    /**
+     * 发送凭据的最后一道关口自己校验，不依赖调用方自律：
+     * 冻结器已经钉死地址，但本类是唯一附加 Authorization 的地方（AGENT.md §2）。
+     */
+    private fun requirePinnedBaseUrl(baseUrl: String): String {
+        val normalized = baseUrl.trim().trimEnd('/')
+        if (!normalized.equals(CustomProvider.XAI_SUBSCRIPTION_BASE_URL, ignoreCase = true)) {
+            throw XaiResponsesException("xAI 服务地址不合法，已中止请求")
+        }
+        return normalized
+    }
+
+    /** `/responses` 与 `/models-v2` 共有的认证与身份头（线上格式 §1.1）。 */
+    private fun identityHeaders(builder: Request.Builder, accessToken: String): Request.Builder = builder
+        .header("Authorization", "Bearer $accessToken")
+        // 实测：发送方自报身份即可，不需要冒充 Grok CLI（线上格式 §1.1）。
+        .header("X-XAI-Token-Auth", "xai-grok-cli")
+        .header("x-grok-client-identifier", CLIENT_IDENTIFIER)
+        .header("x-grok-client-version", toSemver(clientVersion))
+        .header("x-grok-client-mode", "interactive")
+        .header("x-authenticateresponse", "authenticate-response")
+
     private fun readStream(
         response: Response,
         call: Call,
@@ -237,29 +334,17 @@ class XaiResponsesTransport private constructor(
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
     ): Request {
-        // 发送凭据的最后一道关口自己校验，不依赖调用方自律：
-        // 冻结器已经钉死地址，但本类是唯一附加 Authorization 的地方（AGENT.md §2）。
-        val normalized = baseUrl.trim().trimEnd('/')
-        if (!normalized.equals(CustomProvider.XAI_SUBSCRIPTION_BASE_URL, ignoreCase = true)) {
-            throw XaiResponsesException("xAI 服务地址不合法，已中止请求")
-        }
+        val normalized = requirePinnedBaseUrl(baseUrl)
         warnUnsupportedSamplingParams(requestDto)
         val payload = json.encodeToString(toResponsesRequest(requestDto))
-        return Request.Builder()
+        return identityHeaders(Request.Builder(), accessToken)
             .url("$normalized/responses")
             .post(payload.toRequestBody(JSON_MEDIA_TYPE))
-            .header("Authorization", "Bearer $accessToken")
             .header("Accept", "text/event-stream")
-            // 实测：发送方自报身份即可，不需要冒充 Grok CLI（线上格式 §1.1）。
-            .header("X-XAI-Token-Auth", "xai-grok-cli")
-            .header("x-grok-client-identifier", CLIENT_IDENTIFIER)
-            .header("x-grok-client-version", toSemver(clientVersion))
-            .header("x-grok-client-mode", "interactive")
             .header("x-grok-conv-id", sessionId)
             .header("x-grok-session-id", sessionId)
             .header("x-grok-req-id", UUID.randomUUID().toString())
             .header("x-grok-model-override", requestDto.model)
-            .header("x-authenticateresponse", "authenticate-response")
             .build()
     }
 
@@ -423,6 +508,7 @@ class XaiResponsesTransport private constructor(
         private const val ITEM_TYPE_FUNCTION_CALL_OUTPUT = "function_call_output"
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private const val MODELS_PARSE_FAILED = "xAI 模型列表格式无法解析，请手动填写模型名"
 
         /**
          * 把版本号补足成三段 semver。
