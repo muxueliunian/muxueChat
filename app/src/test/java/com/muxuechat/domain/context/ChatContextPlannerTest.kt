@@ -4,6 +4,7 @@ import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.prompt.PromptMessage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -142,6 +143,30 @@ class ChatContextPlannerTest {
         val plan = planner.plan(input(messages, rpSettings = rp, roleCard = roleCard))
 
         assertTrue(plan.tokensOf(ContextSectionKind.RP_SETTINGS) > 600L)
+    }
+
+    /** 配角常驻 prompt（§6.2）：它们计入 RP 固定成本，否则一个超长配角能让估算与实际请求脱节。 */
+    @Test
+    fun supportingCharacters_areCountedAsRpSettings() {
+        val messages = history(turns = 1, charsEach = 10)
+        val rp = ConversationRpSettings(conversationId = "c", isRpEnabled = true, updatedAtMillis = 0L)
+        val base = input(messages, rpSettings = rp)
+        val withSupporting = base.copy(
+            supportingCharacters = listOf(
+                SupportingCharacter(
+                    id = "s",
+                    name = "老周",
+                    description = "配".repeat(500),
+                    createdAtMillis = 0L,
+                    updatedAtMillis = 0L,
+                ),
+            ),
+        )
+
+        val delta = planner.plan(withSupporting).tokensOf(ContextSectionKind.RP_SETTINGS) -
+            planner.plan(base).tokensOf(ContextSectionKind.RP_SETTINGS)
+
+        assertTrue(delta > 400L)
     }
 
     /** 工具 schema 也是发出去的字节。 */

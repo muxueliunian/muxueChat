@@ -17,12 +17,18 @@ data class RpMetricDraft(
  *
  * [panel] 为 null 表示**整个状态块都对不上本轮定义**：它不是有效的本地状态，
  * 调用方必须当作「本轮没有状态」处理（例如继续走兜底请求），而不是拿它覆盖面板。
+ *
+ * [textOnlyPanel] 只在 [panel] 为 null 时可能非空：数值一个都没对上，但模型给了关系或场景。
+ * 它的数值保持当前值，只更新关系与场景（用户 2026-09-23 选定，RP_ACTOR_PLAN 建议 5）。
+ * 调用方可以把它写进面板，但**仍须当作数值没更新**、照常发兜底请求。
+ *
  * 计数只用于日志，不携带任何名字或正文。
  */
 data class RpStateMergeResult(
     val panel: RpStatusPanel?,
     val unknownCount: Int,
     val duplicateCount: Int,
+    val textOnlyPanel: RpStatusPanel? = null,
 )
 
 /**
@@ -79,21 +85,22 @@ object RpStateMerger {
             baseMetric.copy(value = value ?: baseMetric.value)
         }
 
+        val merged = RpStatusPanel(
+            conversationId = conversationId,
+            metrics = metrics,
+            relationship = relationship,
+            scene = scene,
+            rawJson = draft.rawJson,
+            updatedAtMillis = now,
+        )
+        val hasNewText = draft.relationship.isNotBlank() || draft.scene.isNotBlank()
+
         return RpStateMergeResult(
-            panel = if (matched == 0) {
-                null
-            } else {
-                RpStatusPanel(
-                    conversationId = conversationId,
-                    metrics = metrics,
-                    relationship = relationship,
-                    scene = scene,
-                    rawJson = draft.rawJson,
-                    updatedAtMillis = now,
-                )
-            },
+            panel = merged.takeIf { matched > 0 },
             unknownCount = byName.keys.count { it !in definedNames },
             duplicateCount = duplicateNames.count { it in definedNames },
+            // matched == 0 时 metrics 全部等于 base，即当前值（没有当前值时为初始值）。
+            textOnlyPanel = merged.takeIf { matched == 0 && hasNewText },
         )
     }
 

@@ -20,6 +20,15 @@ data class ProtagonistProfile(
 
     val textEntries: List<RpEntry.Text>
         get() = entries.filterIsInstance<RpEntry.Text>()
+
+    /** RP 设置里「初始状态」输入框对应的文本词条；同名多条时取第一条。 */
+    val initialStateText: String
+        get() = textEntries.firstOrNull { it.name == INITIAL_STATE_ENTRY_NAME }?.value.orEmpty()
+
+    companion object {
+        /** v9「初始状态」字段转成的文本词条名；迁移、设定生成工具与 RP 设置共用。 */
+        const val INITIAL_STATE_ENTRY_NAME = "初始状态"
+    }
 }
 
 data class ProtagonistProfileDraft(

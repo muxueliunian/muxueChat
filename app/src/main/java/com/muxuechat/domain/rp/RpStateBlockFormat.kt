@@ -23,6 +23,14 @@ object RpStateBlockFormat {
      */
     const val WIRE_NAME_SEPARATOR = "::"
 
+    /**
+     * 三处 prompt（正文、元数据补写、状态兜底）共用的前缀规则，放在状态条定义前。
+     * 只说「原样照抄」，不解释前缀的实现含义——多写只会让模型自作主张地改名。
+     */
+    const val PREFIX_RULE =
+        "状态条的 name 带有归属前缀（「角色::」「主角::」），输出时必须原样照抄完整的 name，" +
+            "包括前缀；不要去掉前缀，也不要给名字另加前缀。"
+
     /** 把显示名加上归属前缀，得到发给模型、也写进 metricsJson 的名字。 */
     fun wireNameOf(owner: RpEntryOwner, displayName: String): String =
         "${owner.wirePrefix}$WIRE_NAME_SEPARATOR$displayName"

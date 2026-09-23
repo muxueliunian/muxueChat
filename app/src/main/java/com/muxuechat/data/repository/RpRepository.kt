@@ -92,6 +92,11 @@ interface RpRepository {
      * [writingStyleId]、[protagonistProfileId] 与 [roleCardId]、[worldSettingId] 一样是**必填**的：
      * null 表示解绑，不是「保持不变」。刻意不给默认值，
      * 逼每个调用点都想清楚要不要动这个绑定，避免默认值静默清空。
+     *
+     * [protagonistName]、[protagonistDescription]、[protagonistInitialState] 是 RP 设置里的
+     * 三个主角输入框（RP-2d 过渡方案）：它们改写 [protagonistProfileId] 指向的**档案本身**，
+     * 没绑档案且有内容时新建一条并绑定，改完什么都不剩时解绑；不再写 v9 的旧三列。
+     * 三个都为 null 表示不动主角档案。
      */
     suspend fun updateConversationRpSettings(
         conversationId: String,

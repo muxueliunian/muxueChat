@@ -37,18 +37,24 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.RpMetric
+import com.muxuechat.domain.model.RpMetricSnapshot
 import com.muxuechat.domain.model.RpStatusPanel
+import com.muxuechat.domain.rp.RpEffectiveDefinitions
 
 /**
  * 聊天页顶部的 RP 状态面板。
  *
  * 只做展示，不解析模型返回内容。数据来自 ChatUiState.activeRpStatusPanel。
  * 默认展开；用户可手动折叠。面板 rawJson 永远不展示给用户。
+ *
+ * 面板里存的是带归属前缀的线上名（「角色::好感度」），显示名从本会话的
+ * [metricSnapshot] 还原，不按前缀形状猜。
  */
 @Composable
 fun RpStatusPanelCard(
     panel: RpStatusPanel,
     roleCardName: String?,
+    metricSnapshot: List<RpMetricSnapshot>,
     modifier: Modifier = Modifier,
 ) {
     var expanded by rememberSaveable { mutableStateOf(true) }
@@ -125,8 +131,12 @@ fun RpStatusPanelCard(
                 }
                 if (panel.metrics.isNotEmpty()) {
                     Spacer(Modifier.height(2.dp))
-                    panel.metrics.forEach { metric ->
-                        MetricRow(metric = metric)
+                    val labels = RpEffectiveDefinitions.displayLabelsOf(
+                        wireNames = panel.metrics.map { it.name },
+                        snapshot = metricSnapshot,
+                    )
+                    panel.metrics.forEachIndexed { index, metric ->
+                        MetricRow(metric = metric, label = labels[index])
                     }
                 }
             }
@@ -158,7 +168,7 @@ private fun LabeledText(label: String, value: String) {
 }
 
 @Composable
-private fun MetricRow(metric: RpMetric) {
+private fun MetricRow(metric: RpMetric, label: String) {
     val safeMin = metric.min
     val safeMax = if (metric.max > safeMin) metric.max else safeMin + 1
     val clampedValue = metric.value.coerceIn(safeMin, safeMax)
@@ -169,7 +179,7 @@ private fun MetricRow(metric: RpMetric) {
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(
-                text = metric.name,
+                text = label,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
                 maxLines = 1,

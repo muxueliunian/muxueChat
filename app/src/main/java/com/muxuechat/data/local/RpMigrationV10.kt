@@ -130,10 +130,6 @@ internal object RpMigrationV10 {
     fun hasProtagonistContent(name: String, description: String, initialState: String): Boolean =
         name.isNotBlank() || description.isNotBlank() || initialState.isNotBlank()
 
-    /** 姓名为空但有其它内容时的兜底名字。 */
-    fun protagonistNameOrFallback(name: String, ordinal: Int): String =
-        name.ifBlank { "主角$ordinal" }
-
     private fun parseArray(raw: String): JsonArray? {
         if (raw.isBlank()) return null
         return runCatching { json.parseToJsonElement(raw) as? JsonArray }.getOrNull()

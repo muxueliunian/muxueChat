@@ -13,6 +13,7 @@ import com.muxuechat.data.local.toEntity
 import com.muxuechat.domain.model.ChatRole
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.ProtagonistDraft
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.ProtagonistProfileDraft
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpEntry
@@ -276,7 +277,10 @@ class RpBindingTransitionTest {
         assertEquals("场景", panel?.scene)
     }
 
-    /** 删除角色卡只清角色组，**不得连带清主角组**（§4）。 */
+    /**
+     * 删除角色卡只清角色组，**不得连带清主角组**（§4）。
+     * 还绑着主角时 RP 保持开启（RP-2f：主角单独也能驱动状态链路）。
+     */
     @Test
     fun deletingRoleCard_keepsProtagonistGroup() = runBlocking {
         seedConversation()
@@ -289,7 +293,7 @@ class RpBindingTransitionTest {
 
         val settings = settings()
         assertNull(settings.roleCardId)
-        assertFalse(settings.isRpEnabled)
+        assertTrue(settings.isRpEnabled)
         assertEquals(profile, settings.protagonistProfileId)
         assertEquals(listOf(PROTAGONIST_WIRE), settings.metricSnapshot.map { it.wireName })
         assertEquals(listOf(RpMetric(PROTAGONIST_WIRE, 20, 0, 100)), panel()?.metrics)
@@ -329,6 +333,29 @@ class RpBindingTransitionTest {
     }
 
     // ---------- 设定生成工具 ----------
+
+    /**
+     * RP-2g（§11.2）：工具草稿里的旧 metric 定义保存为 `RpEntry.Numeric`，id 不变；
+     * 绑定时按它拍快照，wireName 带「角色::」前缀，面板从初始值开始。
+     */
+    @Test
+    fun generatedRoleCardMetrics_areSavedAsNumericEntriesAndSnapshotted() = runBlocking {
+        seedConversation()
+
+        val saved = repository.saveGeneratedSettings(
+            roleCard = cardDraft("生成的角色", initialValue = 30),
+            worldSetting = null,
+            writingStyle = null,
+            bindToConversationId = CONVERSATION_ID,
+        )
+
+        val card = dao.getRoleCard(saved.roleCard!!.id)!!.toDomain()
+        assertEquals(listOf(RpEntry.Numeric(METRIC_ID, METRIC_NAME, 0, 100, 30)), card.entries)
+        val snapshot = settings().metricSnapshot.single()
+        assertEquals(METRIC_ID, snapshot.entryId)
+        assertEquals(ROLE_WIRE, snapshot.wireName)
+        assertEquals(listOf(RpMetric(ROLE_WIRE, 30, 0, 100)), panel()?.metrics)
+    }
 
     /** 工具建的主角成为独立档案并绑定；旧三字段不再写入，角色卡绑定与面板不动。 */
     @Test
@@ -418,6 +445,125 @@ class RpBindingTransitionTest {
         assertEquals("备注::一", saved.textEntries.single().name)
     }
 
+    // ---------- RP 设置里的主角输入框（RP-2d） ----------
+
+    /** 没绑档案时填了内容：新建一条档案并绑定；v9 的旧三列不再写入。 */
+    @Test
+    fun protagonistFields_withoutProfile_createAndBindProfile() = runBlocking {
+        seedConversation()
+
+        editProtagonist(profileId = null, name = "沈昭", description = "", initialState = "刚下火车")
+
+        val settings = settings()
+        val profile = dao.getProtagonistProfile(settings.protagonistProfileId!!)!!.toDomain()
+        assertEquals("沈昭", profile.name)
+        assertEquals("刚下火车", profile.initialStateText)
+        assertEquals("", settings.protagonistName)
+        assertEquals("", settings.protagonistInitialState)
+    }
+
+    /** 全空不建档案。 */
+    @Test
+    fun blankProtagonistFields_withoutProfile_createNothing() = runBlocking {
+        seedConversation()
+
+        editProtagonist(profileId = null, name = " ", description = "", initialState = "")
+
+        assertNull(settings().protagonistProfileId)
+        assertTrue(dao.observeProtagonistProfiles().first().isEmpty())
+    }
+
+    /**
+     * 改的是档案本身：共用档案的另一个会话同步看到新文字；
+     * 没显示在输入框里的词条原样保留，数值快照不动（R6）。
+     */
+    @Test
+    fun protagonistFields_editSharedProfileInPlace() = runBlocking {
+        seedConversation()
+        dao.upsertConversation(ConversationEntity(OTHER_CONVERSATION_ID, "另一个会话", 1, 1))
+        val profileId = repository.saveProtagonistProfile(
+            null,
+            ProtagonistProfileDraft(
+                name = "沈昭",
+                entries = listOf(
+                    RpEntry.Text("state", ProtagonistProfile.INITIAL_STATE_ENTRY_NAME, "刚下火车"),
+                    RpEntry.Text("job", "职业", "记者"),
+                    RpEntry.Numeric("stamina", STAMINA, 0, 100, 80),
+                ),
+            ),
+        ).id
+        bind(roleCardId = null, protagonist = profileId)
+        bindOther(profileId)
+        val snapshotBefore = settings().metricSnapshot
+
+        editProtagonist(profileId, name = "沈昭（化名）", description = null, initialState = "住进旅馆")
+
+        val profile = dao.getProtagonistProfile(profileId)!!.toDomain()
+        assertEquals("沈昭（化名）", profile.name)
+        assertEquals(
+            listOf(
+                RpEntry.Text("state", ProtagonistProfile.INITIAL_STATE_ENTRY_NAME, "住进旅馆"),
+                RpEntry.Text("job", "职业", "记者"),
+                RpEntry.Numeric("stamina", STAMINA, 0, 100, 80),
+            ),
+            profile.entries,
+        )
+        assertEquals(profileId, settings().protagonistProfileId)
+        assertEquals(profileId, dao.getConversationRpSettings(OTHER_CONVERSATION_ID)!!.protagonistProfileId)
+        assertEquals(snapshotBefore, settings().metricSnapshot)
+    }
+
+    /** 没改（null）或改成与现值相同时不写档案，更新时间不变。 */
+    @Test
+    fun untouchedProtagonistFields_doNotRewriteProfile() = runBlocking {
+        seedConversation()
+        val profile = repository.saveProtagonistProfile(null, ProtagonistProfileDraft(name = "沈昭"))
+        bind(roleCardId = null, protagonist = profile.id)
+
+        editProtagonist(profile.id, name = null, description = null, initialState = null)
+        editProtagonist(profile.id, name = "沈昭", description = "", initialState = "")
+
+        assertEquals(profile.updatedAtMillis, dao.getProtagonistProfile(profile.id)!!.updatedAtMillis)
+        assertEquals(profile.id, settings().protagonistProfileId)
+    }
+
+    /** 清空后档案什么都不剩：本会话解绑，档案保留给可能共用它的会话。 */
+    @Test
+    fun clearingAllProtagonistFields_unbindsButKeepsProfile() = runBlocking {
+        seedConversation()
+        val profile = repository.saveProtagonistProfile(
+            null,
+            ProtagonistProfileDraft(
+                name = "沈昭",
+                entries = listOf(RpEntry.Text("", ProtagonistProfile.INITIAL_STATE_ENTRY_NAME, "刚下火车")),
+            ),
+        )
+        bind(roleCardId = null, protagonist = profile.id)
+
+        editProtagonist(profile.id, name = "", description = "", initialState = "")
+
+        assertNull(settings().protagonistProfileId)
+        assertEquals("沈昭", dao.getProtagonistProfile(profile.id)!!.name)
+    }
+
+    /** 名字允许为空（用户 2026-09-23 选定），但整份档案不能什么都没有。 */
+    @Test
+    fun protagonistProfile_allowsBlankNameButNotEmptyProfile() = runBlocking {
+        val nameless = repository.saveProtagonistProfile(
+            null,
+            ProtagonistProfileDraft(name = " ", description = "外地来的记者"),
+        )
+        assertEquals("", nameless.name)
+
+        val failure = runCatching {
+            repository.saveProtagonistProfile(
+                null,
+                ProtagonistProfileDraft(name = "", entries = listOf(RpEntry.Text("", "备注", " "))),
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is IllegalArgumentException)
+    }
+
     // ---------- 配角 ----------
 
     @Test
@@ -497,6 +643,36 @@ class RpBindingTransitionTest {
         )
     }
 
+    private suspend fun editProtagonist(
+        profileId: String?,
+        name: String?,
+        description: String?,
+        initialState: String?,
+    ) {
+        repository.updateConversationRpSettings(
+            conversationId = CONVERSATION_ID,
+            isRpEnabled = true,
+            roleCardId = null,
+            worldSettingId = null,
+            writingStyleId = null,
+            protagonistProfileId = profileId,
+            protagonistName = name,
+            protagonistDescription = description,
+            protagonistInitialState = initialState,
+        )
+    }
+
+    private suspend fun bindOther(protagonistProfileId: String) {
+        repository.updateConversationRpSettings(
+            conversationId = OTHER_CONVERSATION_ID,
+            isRpEnabled = true,
+            roleCardId = null,
+            worldSettingId = null,
+            writingStyleId = null,
+            protagonistProfileId = protagonistProfileId,
+        )
+    }
+
     private suspend fun settings() = dao.getConversationRpSettings(CONVERSATION_ID)!!.toDomain()
 
     private suspend fun panel() = dao.getRpStatusPanel(CONVERSATION_ID)?.toDomain()
@@ -546,6 +722,7 @@ class RpBindingTransitionTest {
 
     private companion object {
         const val CONVERSATION_ID = "conversation"
+        const val OTHER_CONVERSATION_ID = "other-conversation"
         const val METRIC_ID = "metric-affection"
         const val METRIC_NAME = "好感度"
         const val ROLE_WIRE = "角色::好感度"

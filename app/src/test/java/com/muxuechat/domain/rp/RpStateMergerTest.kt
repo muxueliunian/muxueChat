@@ -103,6 +103,36 @@ class RpStateMergerTest {
         assertEquals(1, result.unknownCount)
     }
 
+    /** 建议 5：数值一个没对上，关系与场景仍然保留，数值维持当前值。 */
+    @Test
+    fun blockMatchingNothing_keepsRelationshipAndSceneWithCurrentValues() {
+        val result = merge(RpMetricDraft("角色::好感度", 70, 0, 100), relationship = "恋人")
+
+        assertNull(result.panel)
+        val textOnly = requireNotNull(result.textOnlyPanel)
+        assertEquals("恋人", textOnly.relationship)
+        assertEquals("吧台", textOnly.scene)
+        assertEquals(listOf(62, 4), textOnly.metrics.map { it.value })
+        assertEquals(99L, textOnly.updatedAtMillis)
+    }
+
+    @Test
+    fun blockMatchingNothing_withoutRelationshipOrScene_hasNoTextOnlyPanel() {
+        val result = merge(RpMetricDraft("角色::好感度", 70, 0, 100))
+
+        assertNull(result.panel)
+        assertNull(result.textOnlyPanel)
+    }
+
+    /** 数值对上了就走正常面板，textOnlyPanel 只是整块对不上时的退路。 */
+    @Test
+    fun matchedBlock_hasNoTextOnlyPanel() {
+        val result = merge(RpMetricDraft("好感度", 70, 0, 100), relationship = "恋人")
+
+        assertNotNull(result.panel)
+        assertNull(result.textOnlyPanel)
+    }
+
     @Test
     fun blankRelationshipAndScene_keepCurrent() {
         val result = merge(RpMetricDraft("好感度", 70, 0, 100), scene = "雨巷")

@@ -79,6 +79,10 @@ fun RpSettingsSheet(
     initialProtagonistName: String,
     initialProtagonistDescription: String,
     initialProtagonistInitialState: String,
+    /** 会话是否绑了主角档案：决定输入框下方的说明（改档案会影响共用它的会话 / 保存时新建档案）。 */
+    isProtagonistProfileBound: Boolean,
+    /** 档案里没在这里显示的词条数，仍会照常发给模型。 */
+    protagonistHiddenEntryCount: Int,
     initialNarrativeMinChars: Int,
     initialNarrativePerspective: RpNarrativePerspective,
     initialPlotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -116,9 +120,10 @@ fun RpSettingsSheet(
         roleCardId: String?,
         worldSettingId: String?,
         writingStyleId: String?,
-        protagonistName: String,
-        protagonistDescription: String,
-        protagonistInitialState: String,
+        // 没改过的主角项传 null，保存时不覆盖档案里的现值。
+        protagonistName: String?,
+        protagonistDescription: String?,
+        protagonistInitialState: String?,
         narrativeMinChars: Int,
         narrativePerspective: RpNarrativePerspective,
         plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -166,9 +171,9 @@ fun RpSettingsSheet(
                         draftRoleCardId,
                         draftWorldSettingId,
                         draftWritingStyleId,
-                        draftProtagonistName,
-                        draftProtagonistDescription,
-                        draftProtagonistInitialState,
+                        draftProtagonistName.takeIf { it != initialProtagonistName },
+                        draftProtagonistDescription.takeIf { it != initialProtagonistDescription },
+                        draftProtagonistInitialState.takeIf { it != initialProtagonistInitialState },
                         draftNarrativeMinCharsText.toNarrativeMinChars(),
                         draftNarrativePerspective,
                         draftPlotSuggestionPerspective,
@@ -208,6 +213,8 @@ fun RpSettingsSheet(
                 name = draftProtagonistName,
                 description = draftProtagonistDescription,
                 initialState = draftProtagonistInitialState,
+                isProfileBound = isProtagonistProfileBound,
+                hiddenEntryCount = protagonistHiddenEntryCount,
                 onNameChange = onDraftProtagonistNameChange,
                 onDescriptionChange = onDraftProtagonistDescriptionChange,
                 onInitialStateChange = onDraftProtagonistInitialStateChange,
@@ -554,6 +561,8 @@ private fun ProtagonistProfileSection(
     name: String,
     description: String,
     initialState: String,
+    isProfileBound: Boolean,
+    hiddenEntryCount: Int,
     onNameChange: (String) -> Unit,
     onDescriptionChange: (String) -> Unit,
     onInitialStateChange: (String) -> Unit,
@@ -562,7 +571,7 @@ private fun ProtagonistProfileSection(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
-            text = "描述玩家控制的主角。主角档案会写入 RP prompt，并作为剧情推进建议的重要参考。留空表示玩家本人。",
+            text = "描述玩家控制的主角。主角档案会写入 RP prompt，并作为剧情推进建议的重要参考。名称留空表示玩家本人。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -591,6 +600,24 @@ private fun ProtagonistProfileSection(
             minLines = 2,
             maxLines = 5,
             modifier = Modifier.fillMaxWidth(),
+        )
+        // 过渡方案（RP-2d）：档案可被多个会话共用，改这里等于改档案本身，必须说清楚影响范围。
+        Text(
+            text = if (isProfileBound) {
+                buildString {
+                    append("这里改的是本会话绑定的主角档案。其他会话若绑定了同一个档案，")
+                    append("它们的主角名称、简介和初始状态也会一起改变；状态数值不受影响。")
+                    if (hiddenEntryCount > 0) {
+                        append("该档案另有 $hiddenEntryCount 条词条未在此显示，仍会照常生效。")
+                    } else {
+                        append("三项全部清空并保存后，本会话不再使用该档案，档案本身保留。")
+                    }
+                }
+            } else {
+                "填写后保存，会为本会话新建一个主角档案。"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }

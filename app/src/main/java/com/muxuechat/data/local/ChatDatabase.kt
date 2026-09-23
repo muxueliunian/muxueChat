@@ -512,12 +512,10 @@ abstract class ChatDatabase : RoomDatabase() {
                 }
             }
 
-            var ordinal = 0
             rows.forEach { row ->
                 if (!RpMigrationV10.hasProtagonistContent(row.name, row.description, row.initialState)) {
                     return@forEach
                 }
-                ordinal++
                 val profileId = UUID.randomUUID().toString()
                 db.execSQL(
                     "INSERT INTO `protagonist_profiles` " +
@@ -525,7 +523,8 @@ abstract class ChatDatabase : RoomDatabase() {
                         "VALUES (?, ?, ?, ?, ?, ?)",
                     arrayOf(
                         profileId,
-                        RpMigrationV10.protagonistNameOrFallback(row.name, ordinal),
+                        // 名字为空就留空（用户 2026-09-23 选定）：占位名会被当成主角的真名发给模型。
+                        row.name,
                         row.description,
                         RpMigrationV10.protagonistEntriesJson(row.initialState),
                         now,

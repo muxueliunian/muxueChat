@@ -4,8 +4,10 @@ import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.ConversationTokenUsage
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RpStatusPanel
+import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.model.WorldSetting
 import com.muxuechat.domain.model.WritingStyleProfile
 import com.muxuechat.domain.prompt.PromptComposer
@@ -64,6 +66,10 @@ data class ChatContextInput(
     val worldSetting: WorldSetting?,
     val writingStyle: WritingStyleProfile?,
     val statusPanel: RpStatusPanel?,
+    /** 会话绑定的主角档案，只在 RP 启用时非空。 */
+    val protagonistProfile: ProtagonistProfile? = null,
+    /** 会话勾选的配角，只在 RP 启用时非空；计入 RP 固定成本（§6.2）。 */
+    val supportingCharacters: List<SupportingCharacter> = emptyList(),
     /** 完整的可用历史，未经裁剪。 */
     val history: List<PromptMessage>,
     val summaryState: ContextSummaryState = ContextSummaryState.EMPTY,
@@ -503,6 +509,8 @@ class ChatContextPlanner(
             writingStyle = input.writingStyle,
             statusPanel = input.statusPanel,
             history = history,
+            protagonistProfile = input.protagonistProfile,
+            supportingCharacters = input.supportingCharacters,
             settingsToolsAvailable = input.toolDefinitions.isNotEmpty(),
         )
 

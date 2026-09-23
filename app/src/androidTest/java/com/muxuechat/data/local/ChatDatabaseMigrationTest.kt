@@ -481,9 +481,9 @@ class ChatDatabaseMigrationTest {
                 queryString(db, "SELECT entriesJson FROM protagonist_profiles WHERE id = '$activeProfile'"),
             ).entries
             assertEquals(listOf(RpEntry.Text(profileEntries.single().id, "初始状态", "刚下火车")), profileEntries)
-            // 姓名为空但有描述：按升级顺序取兜底名。
+            // 姓名为空但有描述：名字留空，不填占位名（占位名会被当成真名发给模型）。
             val namelessProfile = queryString(db, settingsColumn("nameless", "protagonistProfileId"))
-            assertEquals("主角3", queryString(db, "SELECT name FROM protagonist_profiles WHERE id = '$namelessProfile'"))
+            assertEquals("", queryString(db, "SELECT name FROM protagonist_profiles WHERE id = '$namelessProfile'"))
             // 旧三列保留为取证材料。
             assertEquals("沈昭", queryString(db, settingsColumn("active", "protagonistName")))
 
@@ -534,7 +534,7 @@ class ChatDatabaseMigrationTest {
     private fun settingsColumn(conversationId: String, column: String) =
         "SELECT `$column` FROM conversation_rp_settings WHERE conversationId = '$conversationId'"
 
-    /** v9 形状的 RP 数据。时间戳决定主角兜底名的序号：active=1、twin=2、nameless=3。 */
+    /** v9 形状的 RP 数据。 */
     private fun seedV9RpData(db: SupportSQLiteDatabase) {
         listOf("active", "paused", "twin", "nameless").forEachIndexed { index, id ->
             db.execSQL(

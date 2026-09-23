@@ -4,13 +4,17 @@ import com.muxuechat.domain.rp.RpEffectiveDefinitions
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.DeepSeekModels
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.RpEntryOwner
 import com.muxuechat.domain.model.RpMarkerMode
 import com.muxuechat.domain.model.RpMetricDefinition
+import com.muxuechat.domain.model.RpMetricSnapshot
 import com.muxuechat.domain.model.RpNarrativePerspective
 import com.muxuechat.domain.model.RpPlotSuggestionPerspective
 import com.muxuechat.domain.model.RpStatusPanel
+import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.model.ThinkingMode
 import com.muxuechat.domain.model.WorldSetting
 import com.muxuechat.domain.model.WritingStyleProfile
@@ -29,6 +33,16 @@ data class PromptContext(
     val writingStyle: WritingStyleProfile? = null,
     val statusPanel: RpStatusPanel?,
     val history: List<PromptMessage>,
+    /**
+     * 会话绑定的主角档案（RP-2）。只在 RP 启用时由请求层填入。
+     * 姓名、简介、文本词条实时跟随档案；数值定义走 [rpSettings] 的快照，不从这里读。
+     */
+    val protagonistProfile: ProtagonistProfile? = null,
+    /**
+     * 会话勾选的配角，按勾选顺序（RP-2e）。只在 RP 启用时由请求层填入。
+     * 配角只进正文 prompt：不进状态块，不进元数据补写。
+     */
+    val supportingCharacters: List<SupportingCharacter> = emptyList(),
     /** 本次请求是否挂载了设定生成工具。挂载时才注入工具使用规则。 */
     val settingsToolsAvailable: Boolean = false,
 )
@@ -49,7 +63,7 @@ data class ComposedPrompt(
     val userSystemPrompt: String,
     /** 工具可用性说明（不含工具 JSON schema，schema 由请求层持有）。 */
     val toolInstructions: String,
-    /** RP 规则 + 角色卡 + 世界观 + 文风 + 主角档案 + 状态栏契约。 */
+    /** RP 规则 + 主角档案 + 角色卡 + 配角 + 世界观 + 文风 + 状态栏契约。 */
     val rpInstructions: String,
     /** 附加到最后一条 user 消息末尾的本轮易变状态。 */
     val volatileState: String,
@@ -60,6 +74,7 @@ data class ComposedPrompt(
 data class RpMetadataPromptContext(
     val rpSettings: ConversationRpSettings?,
     val roleCard: RoleCard,
+    val protagonistProfile: ProtagonistProfile? = null,
     val definitions: List<RpMetricDefinition>,
     val currentPanel: RpStatusPanel?,
     val lastUser: String,
@@ -330,15 +345,14 @@ class PromptComposer {
             appendLine("用户输入代表本轮临时给出的剧情推进意图，不能被永久绑定为某一方的固定台词。")
             appendLine("角色台词要自然融入正文，不使用“角色台词：”之类硬标签。")
 
-            val hasProtagonistProfile = settings.protagonistName.isNotBlank() ||
-                settings.protagonistDescription.isNotBlank() ||
-                settings.protagonistInitialState.isNotBlank()
-            if (hasProtagonistProfile) {
+            // 主角读档案（RP-2），不再读会话配置里的旧三字段。
+            val protagonist = context.protagonistProfile?.takeIf { it.hasPromptContent() }
+            if (protagonist != null) {
                 appendLine()
                 appendLine("### 主角档案")
-                appendProfileLine("主角名称", settings.protagonistName)
-                appendProfileLine("主角简介", settings.protagonistDescription)
-                appendProfileLine("初始状态", settings.protagonistInitialState)
+                appendProfileLine("主角名称", protagonist.name)
+                appendProfileLine("主角简介", protagonist.description)
+                protagonist.textEntries.forEach { entry -> appendProfileLine(entry.name, entry.value) }
                 appendLine("主角档案代表玩家本人。后续剧情推进建议和对用户输入意图的理解都必须以主角档案为准。")
             }
             if (settings.narrativeMinChars > 0) {
@@ -360,11 +374,13 @@ class PromptComposer {
             appendSection("禁止事项与边界", roleCard.boundaries)
         }
 
-        if (context.rpSettings?.hasProtagonistProfile() == true && context.roleCard?.userIdentity.isNullOrBlank().not()) {
+        if (context.protagonistProfile?.hasPromptContent() == true && context.roleCard?.userIdentity.isNullOrBlank().not()) {
             appendLine()
             appendLine("### 视角规则")
             appendLine("角色卡中的“用户身份”只作为该角色如何称呼或理解玩家的参考；主角档案优先决定玩家本人是谁。")
         }
+
+        appendSupportingCharacters(context.supportingCharacters)
 
         context.worldSetting?.let { world ->
             appendSection("世界观：${world.title}", world.content)
@@ -430,31 +446,23 @@ class PromptComposer {
             ${buildPlotSuggestionContract(suggestionPerspective, roleCard.name)}
             options 只是建议，不锁定用户下一条输入视角；用户可以直接发送、编辑，或改写为任意一方的剧情推进指令。
             state.metrics 必须只包含已定义的状态条；没有状态条时输出空数组。
+            ${RpStateBlockFormat.PREFIX_RULE}
             如果剧情没有足够理由改变状态数值，保持当前值。
         """.trimIndent()
     }
 
     private fun buildRpMetadataUserPrompt(context: RpMetadataPromptContext): String = buildString {
         appendLine("玩家/主角档案：")
-        appendLine("- 名称：${context.rpSettings?.protagonistName.orEmpty().ifBlank { "未设定，视为玩家本人" }}")
+        val protagonist = context.protagonistProfile
+        appendLine("- 名称：${protagonist?.name.orEmpty().trim().ifBlank { "未设定，视为玩家本人" }}")
         appendLine(
-            "- 简介：${
-                context.rpSettings
-                    ?.protagonistDescription
-                    .orEmpty()
-                    .ifBlank { "未设定" }
-                    .take(METADATA_CONTEXT_LIMIT)
-            }",
+            "- 简介：${protagonist?.description.orEmpty().trim().ifBlank { "未设定" }.take(METADATA_CONTEXT_LIMIT)}",
         )
-        appendLine(
-            "- 初始状态：${
-                context.rpSettings
-                    ?.protagonistInitialState
-                    .orEmpty()
-                    .ifBlank { "未设定" }
-                    .take(METADATA_CONTEXT_LIMIT)
-            }",
-        )
+        protagonist?.textEntries.orEmpty()
+            .filter { it.name.isNotBlank() && it.value.isNotBlank() }
+            .forEach { entry ->
+                appendLine("- ${entry.name.trim()}：${entry.value.trim().take(METADATA_CONTEXT_LIMIT)}")
+            }
         appendLine()
         appendLine("角色名称：${context.roleCard.name}")
         appendLine("角色简介：${context.roleCard.description.take(METADATA_CONTEXT_LIMIT)}")
@@ -513,25 +521,63 @@ class PromptComposer {
         return """{"inner_thought":"角色此刻的真实想法","options":["靠近她，低声回应刚才的问题。","先观察周围，再追问她的目的。","短暂停顿，把话题转向窗外的雨声。"],"state":{"metrics":[$metrics],"relationship":"$relationship","scene":"$scene"}}"""
     }
 
+    /**
+     * 配角段（RP-2e，§6.1）：名称 + 简介 + 文本词条，按勾选顺序全部常驻。
+     *
+     * 说明里明确不为配角新增状态条：状态块只认定义过的前缀名，
+     * 模型若给配角编状态条，会被当成未知键丢弃并计数，白白浪费输出。
+     */
+    private fun StringBuilder.appendSupportingCharacters(characters: List<SupportingCharacter>) {
+        val present = characters.filter { it.hasPromptContent() }
+        if (present.isEmpty()) return
+        appendLine()
+        appendLine("### 配角")
+        appendLine("以下配角会在剧情中出现，由你按设定描写他们的言行。他们不是玩家，也不是角色卡的主角色；")
+        appendLine("状态栏只记录下方定义过的状态条，不要为配角新增状态条。")
+        present.forEach { character ->
+            appendLine()
+            appendLine("#### ${character.name.trim()}")
+            val description = character.description.trim()
+            if (description.isNotBlank()) appendLine(description)
+            character.entries.forEach { entry -> appendProfileLine(entry.name, entry.value) }
+        }
+    }
+
+    /**
+     * 状态条定义按归属分组（角色组在前、主角组在后，与快照顺序一致），
+     * 每组标明前缀；名字本身就是带前缀的 wireName，照抄即可对上解析器。
+     */
     private fun StringBuilder.appendMetricDefinitions(context: PromptContext) {
-        val definitions = context.metricDefinitions()
+        val snapshot = context.metricSnapshot()
         appendLine()
         appendLine("### 状态栏定义")
-        if (definitions.isEmpty()) {
-            appendLine("当前角色卡没有定义状态条。metrics 必须输出空数组。")
+        if (snapshot.isEmpty()) {
+            appendLine("当前没有定义状态条。metrics 必须输出空数组。")
             return
         }
 
-        definitions.forEachIndexed { index, definition ->
+        appendLine(RpStateBlockFormat.PREFIX_RULE)
+        snapshot.groupBy { it.ownerType }.forEach { (owner, items) ->
+            val prefix = "${owner.wirePrefix}${RpStateBlockFormat.WIRE_NAME_SEPARATOR}"
+            val roleName = context.roleCard?.name.orEmpty().trim().ifBlank { "角色卡人物" }
+            appendLine()
             appendLine(
-                "${index + 1}. ${definition.name}: " +
-                    "范围 ${definition.minValue}-${definition.maxValue}，初始值 ${definition.initialValue}。",
+                when (owner) {
+                    RpEntryOwner.ROLE_CARD -> "#### ${roleName}的状态条（前缀「$prefix」）"
+                    RpEntryOwner.PROTAGONIST -> "#### 主角（玩家）的状态条（前缀「$prefix」）"
+                },
             )
-            if (definition.description.isNotBlank()) {
-                appendLine("   含义：${definition.description}")
-            }
-            if (definition.progressRule.isNotBlank()) {
-                appendLine("   变化规则：${definition.progressRule}")
+            RpEffectiveDefinitions.of(items).forEachIndexed { index, definition ->
+                appendLine(
+                    "${index + 1}. ${definition.name}: " +
+                        "范围 ${definition.minValue}-${definition.maxValue}，初始值 ${definition.initialValue}。",
+                )
+                if (definition.description.isNotBlank()) {
+                    appendLine("   含义：${definition.description}")
+                }
+                if (definition.progressRule.isNotBlank()) {
+                    appendLine("   变化规则：${definition.progressRule}")
+                }
             }
         }
     }
@@ -558,12 +604,16 @@ class PromptComposer {
         )
 
     /**
-     * 本会话有效的数值定义，名字是带归属前缀的 wireName。
+     * 本会话有效的数值定义快照，名字是带归属前缀的 wireName。
      * 只从会话快照取，不读实时角色卡：改档案不影响已绑定的会话（R6）。
-     * RP 未绑定角色卡时不发状态条，与之前「没有角色卡就没有定义」的行为一致。
+     * 角色卡与主角都没绑时不发状态条；只绑了主角时照常发主角组（RP-2f）。
+     * 判据与请求层 `captureRpTurnSnapshot` 的 stateActive 一致。
      */
+    private fun PromptContext.metricSnapshot(): List<RpMetricSnapshot> =
+        if (roleCard == null && protagonistProfile == null) emptyList() else rpSettings?.metricSnapshot.orEmpty()
+
     private fun PromptContext.metricDefinitions(): List<RpMetricDefinition> =
-        if (roleCard == null) emptyList() else RpEffectiveDefinitions.of(rpSettings)
+        RpEffectiveDefinitions.of(metricSnapshot())
 
     private fun StringBuilder.appendSection(title: String, content: String) {
         val trimmed = content.trim()
@@ -579,10 +629,15 @@ class PromptComposer {
         appendLine("- $label: $trimmed")
     }
 
-    private fun ConversationRpSettings.hasProtagonistProfile(): Boolean =
-        protagonistName.isNotBlank() ||
-            protagonistDescription.isNotBlank() ||
-            protagonistInitialState.isNotBlank()
+    private fun SupportingCharacter.hasPromptContent(): Boolean =
+        name.isNotBlank() ||
+            description.isNotBlank() ||
+            entries.any { it.value.isNotBlank() }
+
+    private fun ProtagonistProfile.hasPromptContent(): Boolean =
+        name.isNotBlank() ||
+            description.isNotBlank() ||
+            textEntries.any { it.value.isNotBlank() }
 
     private fun buildDeepSeekRpMarker(mode: RpMarkerMode): String =
         when (mode) {

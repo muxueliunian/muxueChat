@@ -63,6 +63,23 @@ object RpEffectiveDefinitions {
     fun displayNameOf(wireName: String, snapshot: List<RpMetricSnapshot>): String =
         snapshot.firstOrNull { it.wireName == wireName }?.displayName ?: wireName
 
+    /**
+     * 状态面板上一组名字的显示文本，与 [wireNames] 一一对应。
+     *
+     * 默认用 [displayNameOf]；角色卡和主角可以各有一个同名数值（如都叫「体力」），
+     * 这时只显示名字就分不清谁是谁，于是**仅在撞名时**加上归属，显示为「主角·体力」。
+     * 快照里查不到的名字原样显示，同样不按前缀形状猜。
+     */
+    fun displayLabelsOf(wireNames: List<String>, snapshot: List<RpMetricSnapshot>): List<String> {
+        val entries = wireNames.map { name -> snapshot.firstOrNull { it.wireName == name } }
+        val labels = wireNames.mapIndexed { index, name -> entries[index]?.displayName ?: name }
+        val collided = labels.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+        return labels.mapIndexed { index, label ->
+            val entry = entries[index]
+            if (entry != null && label in collided) "${entry.ownerType.wirePrefix}·$label" else label
+        }
+    }
+
     private fun RpMetricSnapshot.toDefinition() = RpMetricDefinition(
         id = entryId,
         name = wireName,

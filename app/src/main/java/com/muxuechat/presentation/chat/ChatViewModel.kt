@@ -36,6 +36,7 @@ import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
 import com.muxuechat.domain.model.MessageStatus
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.ProviderAuthKind
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
@@ -121,6 +122,14 @@ class ChatViewModel(
         if (conversationId == null) flowOf(null) else rpRepository.observeConversationRpSettings(conversationId)
     }
 
+    /** 当前会话设置连同它绑定的主角档案；档案被改名或删除时同样会推送。 */
+    private val activeRpBinding = combine(
+        activeRpSettings,
+        rpRepository.observeProtagonistProfiles(),
+    ) { settings, profiles ->
+        settings to profiles.firstOrNull { it.id == settings?.protagonistProfileId }
+    }
+
     private val activeRpStatusPanel = activeConversationId.flatMapLatest { conversationId ->
         if (conversationId == null) flowOf(null) else rpRepository.observeRpStatusPanel(conversationId)
     }
@@ -178,14 +187,15 @@ class ChatViewModel(
         rpRepository.observeRoleCards(),
         rpRepository.observeWorldSettings(),
         rpRepository.observeWritingStyleProfiles(),
-        activeRpSettings,
+        activeRpBinding,
         activeRpStatusPanel,
-    ) { roleCards, worldSettings, writingStyles, activeRpSettings, activeRpStatusPanel ->
+    ) { roleCards, worldSettings, writingStyles, (activeRpSettings, activeProtagonist), activeRpStatusPanel ->
         RpUiSlice(
             roleCards = roleCards,
             worldSettings = worldSettings,
             writingStyleProfiles = writingStyles,
             activeRpSettings = activeRpSettings,
+            activeProtagonistProfile = activeProtagonist,
             activeRpStatusPanel = activeRpStatusPanel,
         )
     }
@@ -217,6 +227,7 @@ class ChatViewModel(
             worldSettings = rp.worldSettings,
             activeRpSettings = rp.activeRpSettings,
             activeRoleCard = rp.roleCards.firstOrNull { it.id == rp.activeRpSettings?.roleCardId },
+            activeProtagonistProfile = rp.activeProtagonistProfile,
             activeWorldSetting = rp.worldSettings.firstOrNull { it.id == rp.activeRpSettings?.worldSettingId },
             activeRpStatusPanel = rp.activeRpStatusPanel,
             writingStyleProfiles = rp.writingStyleProfiles,
@@ -756,11 +767,17 @@ class ChatViewModel(
                 val saved = rpRepository.saveRoleCard(id, draft)
                 val conversationId = activeConversationId.value
                 val activeRpSettings = uiState.value.activeRpSettings
+                val editedBoundCard = conversationId != null &&
+                    id != null && activeRpSettings?.roleCardId == saved.id
                 val shouldApplyToCurrentConversation = conversationId != null &&
                     activeRpSettings?.isRpEnabled == true &&
                     (id == null || activeRpSettings.roleCardId == saved.id)
 
-                if (shouldApplyToCurrentConversation) {
+                if (editedBoundCard) {
+                    // 绑定没变，走 updateConversationRpSettings 不会重拍快照（R6）。
+                    // 在当前会话里改自己绑的卡即视为显式同步，只影响这一个会话；其它绑定该卡的会话仍冻结。
+                    rpRepository.syncMetricDefinitionsFromProfiles(conversationId)
+                } else if (shouldApplyToCurrentConversation) {
                     rpRepository.updateConversationRpSettings(
                         conversationId = conversationId,
                         isRpEnabled = true,
@@ -771,7 +788,7 @@ class ChatViewModel(
                         protagonistProfileId = activeRpSettings.protagonistProfileId,
                     )
                 }
-                shouldApplyToCurrentConversation
+                editedBoundCard || shouldApplyToCurrentConversation
             }.onSuccess { applied ->
                 transient.update { state ->
                     state.copy(
@@ -1184,6 +1201,7 @@ class ChatViewModel(
         val worldSettings: List<WorldSetting>,
         val writingStyleProfiles: List<WritingStyleProfile>,
         val activeRpSettings: ConversationRpSettings?,
+        val activeProtagonistProfile: ProtagonistProfile?,
         val activeRpStatusPanel: RpStatusPanel?,
     )
 

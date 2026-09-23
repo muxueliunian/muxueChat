@@ -170,8 +170,6 @@ class RpMigrationV10Test {
     fun protagonistContentDetection() {
         assertFalse(RpMigrationV10.hasProtagonistContent("", " ", ""))
         assertTrue(RpMigrationV10.hasProtagonistContent("", "", "受伤"))
-        assertEquals("主角3", RpMigrationV10.protagonistNameOrFallback(" ", 3))
-        assertEquals("沈昭", RpMigrationV10.protagonistNameOrFallback("沈昭", 3))
     }
 
     private fun parse(raw: String): JsonArray = Json.parseToJsonElement(raw) as JsonArray

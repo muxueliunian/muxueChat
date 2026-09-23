@@ -5,6 +5,7 @@ import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.Conversation
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.DisplaySettings
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RpStatusPanel
@@ -33,6 +34,8 @@ data class ChatUiState(
     val worldSettings: List<WorldSetting> = emptyList(),
     val activeRpSettings: ConversationRpSettings? = null,
     val activeRoleCard: RoleCard? = null,
+    /** 当前会话绑定的主角档案；RP 设置里的主角输入框编辑的就是它。 */
+    val activeProtagonistProfile: ProtagonistProfile? = null,
     val activeWorldSetting: WorldSetting? = null,
     val activeRpStatusPanel: RpStatusPanel? = null,
     val writingStyleProfiles: List<WritingStyleProfile> = emptyList(),

@@ -9,6 +9,8 @@ import com.muxuechat.data.local.ConversationEntity
 import com.muxuechat.data.local.MessageEntity
 import com.muxuechat.data.local.RpMigrationV10
 import com.muxuechat.data.local.MessageRpMetadataEntity
+import com.muxuechat.data.local.ProtagonistProfileEntity
+import com.muxuechat.data.local.SupportingCharacterEntity
 import com.muxuechat.data.local.toEntity
 import com.muxuechat.data.remote.DeepSeekApiClient
 import com.muxuechat.data.remote.OpenAiCompatibleClient
@@ -21,6 +23,7 @@ import com.muxuechat.domain.model.CustomProvider
 import com.muxuechat.domain.model.DisplaySettings
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.RpEntry
 import com.muxuechat.domain.model.RpMetric
 import com.muxuechat.domain.model.RpEntryOwner
 import com.muxuechat.domain.model.RpMetricDefinition
@@ -49,9 +52,12 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -137,6 +143,104 @@ class ChatRepositoryRpStateTest {
         assertEquals(2, calls.get())
         assertEquals(editedPanel, dao.getRpStatusPanel(CONVERSATION_ID))
         assertNull(latestAssistant().errorMessage)
+    }
+
+    /**
+     * RP-2b：正文状态块的数值一个都没对上（缺前缀），但给了关系与场景。
+     * 关系与场景照样落面板，数值保持当前值；数值没更新，所以仍发兜底请求——兜底也失败时，
+     * 关系与场景仍是正文给的新值，并提示「未更新状态栏」。
+     */
+    @Test
+    fun contentStateWithOnlyStoryMatched_keepsNewStoryWhenFallbackFails() = runBlocking {
+        seedRpConversation(withMetrics = true)
+        dao.upsertRpStatusPanel(panel(metrics = listOf(RpMetric("角色::信任", 4, 0, 10)), relationship = "熟识", scene = "吧台"))
+        val calls = AtomicInteger()
+        val repository = repository(
+            Interceptor { chain ->
+                val body = when (calls.getAndIncrement()) {
+                    0 -> """正文<muxue_state>{"metrics":[{"name":"信任","value":9}],"relationship":"亲近","scene":"雨巷"}</muxue_state>"""
+                    1 -> """{"inner_thought":"想法","options":["甲","乙","丙"]}"""
+                    else -> "兜底也给不出状态"
+                }
+                respond(chain, body)
+            },
+        )
+
+        repository.sendMessage(CONVERSATION_ID, "新一句").toList()
+        awaitEnrichment()
+
+        assertEquals(3, calls.get())
+        val panel = dao.getRpStatusPanel(CONVERSATION_ID)!!.toDomain()
+        assertEquals(listOf(RpMetric("角色::信任", 4, 0, 10)), panel.metrics)
+        assertEquals("亲近", panel.relationship)
+        assertEquals("雨巷", panel.scene)
+        assertEquals("本次回复未更新状态栏，已保留上一次状态。", latestAssistant().errorMessage)
+    }
+
+    /** 同上，但兜底成功：数值来自兜底，关系与场景以正文给的新值为基准，兜底留空时不回退。 */
+    @Test
+    fun contentStateWithOnlyStoryMatched_fallbackUpdatesMetricsOnTopOfNewStory() = runBlocking {
+        seedRpConversation(withMetrics = true)
+        dao.upsertRpStatusPanel(panel(metrics = listOf(RpMetric("角色::信任", 4, 0, 10)), relationship = "熟识", scene = "吧台"))
+        val calls = AtomicInteger()
+        val repository = repository(
+            Interceptor { chain ->
+                val body = when (calls.getAndIncrement()) {
+                    0 -> """正文<muxue_state>{"metrics":[{"name":"信任","value":9}],"relationship":"亲近","scene":"雨巷"}</muxue_state>"""
+                    1 -> """{"inner_thought":"想法","options":["甲","乙","丙"]}"""
+                    else -> """{"metrics":[{"name":"角色::信任","value":7}],"relationship":"","scene":""}"""
+                }
+                respond(chain, body)
+            },
+        )
+
+        repository.sendMessage(CONVERSATION_ID, "新一句").toList()
+        awaitEnrichment()
+
+        assertEquals(3, calls.get())
+        val panel = dao.getRpStatusPanel(CONVERSATION_ID)!!.toDomain()
+        assertEquals(listOf(RpMetric("角色::信任", 7, 0, 10)), panel.metrics)
+        assertEquals("亲近", panel.relationship)
+        assertEquals("雨巷", panel.scene)
+        assertNull(latestAssistant().errorMessage)
+    }
+
+    /** RP-2e：会话勾选的配角只进正文请求，元数据补写请求里没有。数据直接用 DAO 插（RP-3 才有 UI）。 */
+    @Test
+    fun supportingCharacters_goIntoMainRequestOnly() = runBlocking {
+        seedRpConversation(withMetrics = true)
+        dao.insertSupportingCharacter(
+            SupportingCharacterEntity(
+                id = "support",
+                name = "配角老周",
+                description = "咖啡店的熟客",
+                entriesJson = "[]",
+                createdAtMillis = 1,
+                updatedAtMillis = 1,
+            ),
+        )
+        dao.replaceConversationSupportingCharacters(CONVERSATION_ID, listOf("support"))
+        val bodies = mutableListOf<String>()
+        val repository = repository(
+            Interceptor { chain ->
+                val body = synchronized(bodies) {
+                    bodies += Buffer().also { chain.request().body!!.writeTo(it) }.readUtf8()
+                    if (bodies.size == 1) {
+                        """正文<muxue_state>{"metrics":[{"name":"角色::信任","value":6}],"relationship":"","scene":""}</muxue_state>"""
+                    } else {
+                        """{"inner_thought":"想法","options":["甲","乙","丙"]}"""
+                    }
+                }
+                respond(chain, body)
+            },
+        )
+
+        repository.sendMessage(CONVERSATION_ID, "新一句").toList()
+        awaitEnrichment()
+
+        assertEquals(2, bodies.size)
+        assertTrue(bodies[0].contains("配角老周"))
+        assertFalse(bodies[1].contains("配角老周"))
     }
 
     /** 角色卡没有状态条时，重新生成也要回滚关系与场景，不能留着被作废那条回复写下的值。 */
@@ -251,6 +355,89 @@ class ChatRepositoryRpStateTest {
         assertEquals(listOf(RpMetric("角色::信任", 5, 0, 10)), panel.metrics)
         assertEquals("熟识", panel.relationship)
         assertEquals("吧台", panel.scene)
+    }
+
+    /**
+     * RP-2f 无角色卡路径：只绑了有数值的主角。正文状态块照常更新面板；
+     * 元数据补写需要角色卡，因此不发；数值已更新，兜底也不发——整轮只有一次请求。
+     */
+    @Test
+    fun protagonistOnly_contentStateUpdatesPanelWithSingleRequest() = runBlocking {
+        seedProtagonistOnlyConversation()
+        dao.upsertRpStatusPanel(panel(metrics = listOf(RpMetric(STAMINA_WIRE, 50, 0, 100))))
+        val bodies = mutableListOf<String>()
+        val repository = repository(
+            Interceptor { chain ->
+                synchronized(bodies) { bodies += Buffer().also { chain.request().body!!.writeTo(it) }.readUtf8() }
+                respond(
+                    chain,
+                    """正文<muxue_state>{"metrics":[{"name":"$STAMINA_WIRE","value":40}],"relationship":"","scene":"山路"}</muxue_state>""",
+                )
+            },
+        )
+
+        repository.sendMessage(CONVERSATION_ID, "继续赶路").toList()
+        delay(300)
+
+        assertEquals(1, bodies.size)
+        assertTrue(bodies.single().contains(STAMINA_WIRE))
+        val panel = dao.getRpStatusPanel(CONVERSATION_ID)!!.toDomain()
+        assertEquals(listOf(RpMetric(STAMINA_WIRE, 40, 0, 100)), panel.metrics)
+        assertEquals("山路", panel.scene)
+        assertNull(latestAssistant().errorMessage)
+    }
+
+    /** 同上，但正文没给状态块：后台只跑兜底状态请求，不跑元数据补写。 */
+    @Test
+    fun protagonistOnly_missingStateRunsFallbackOnly() = runBlocking {
+        seedProtagonistOnlyConversation()
+        dao.upsertRpStatusPanel(panel(metrics = listOf(RpMetric(STAMINA_WIRE, 50, 0, 100))))
+        val calls = AtomicInteger()
+        val repository = repository(
+            Interceptor { chain ->
+                val body = if (calls.getAndIncrement() == 0) {
+                    "正文没有状态块"
+                } else {
+                    """{"metrics":[{"name":"$STAMINA_WIRE","value":45}],"relationship":"","scene":""}"""
+                }
+                respond(chain, body)
+            },
+        )
+
+        repository.sendMessage(CONVERSATION_ID, "继续赶路").toList()
+        withTimeout(10_000) {
+            while (dao.getRpStatusPanel(CONVERSATION_ID)?.toDomain()?.metrics?.singleOrNull()?.value != 45) {
+                delay(20)
+            }
+        }
+
+        assertEquals(2, calls.get())
+        assertNull(latestAssistant().errorMessage)
+    }
+
+    private suspend fun seedProtagonistOnlyConversation() {
+        dao.upsertConversation(ConversationEntity(CONVERSATION_ID, "会话", 1, 1))
+        val entries = listOf(RpEntry.Numeric("stamina", "体力", 0, 100, 80))
+        dao.insertProtagonistProfile(
+            ProtagonistProfileEntity(
+                id = PROTAGONIST_ID,
+                name = "沈昭",
+                description = "",
+                entriesJson = RpEntryCodec.encodeEntries(entries),
+                createdAtMillis = 1,
+                updatedAtMillis = 1,
+            ),
+        )
+        dao.upsertConversationRpSettings(
+            ConversationRpSettings(
+                conversationId = CONVERSATION_ID,
+                isRpEnabled = true,
+                roleCardId = null,
+                protagonistProfileId = PROTAGONIST_ID,
+                metricSnapshot = RpEffectiveDefinitions.snapshotOf(RpEntryOwner.PROTAGONIST, entries),
+                updatedAtMillis = 1,
+            ).toEntity(),
+        )
     }
 
     private suspend fun awaitEnrichment() = withTimeout(10_000) {
@@ -399,5 +586,7 @@ class ChatRepositoryRpStateTest {
     private companion object {
         const val CONVERSATION_ID = "conversation"
         const val ROLE_CARD_ID = "role-card"
+        const val PROTAGONIST_ID = "protagonist"
+        const val STAMINA_WIRE = "主角::体力"
     }
 }

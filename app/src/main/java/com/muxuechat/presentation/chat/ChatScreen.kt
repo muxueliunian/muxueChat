@@ -46,8 +46,10 @@ import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
+import com.muxuechat.domain.model.RpEntry
 import com.muxuechat.domain.model.RpMarkerMode
 import com.muxuechat.domain.model.RpNarrativePerspective
 import com.muxuechat.domain.model.RpPlotSuggestionPerspective
@@ -91,9 +93,10 @@ fun ChatScreen(
         roleCardId: String?,
         worldSettingId: String?,
         writingStyleId: String?,
-        protagonistName: String,
-        protagonistDescription: String,
-        protagonistInitialState: String,
+        // 主角三项为 null 表示用户没改，不动档案（RP-2d）。
+        protagonistName: String?,
+        protagonistDescription: String?,
+        protagonistInitialState: String?,
         narrativeMinChars: Int,
         narrativePerspective: RpNarrativePerspective,
         plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -310,6 +313,7 @@ fun ChatScreen(
                     RpStatusPanelCard(
                         panel = state.activeRpStatusPanel!!,
                         roleCardName = state.activeRoleCard?.name,
+                        metricSnapshot = state.activeRpSettings?.metricSnapshot.orEmpty(),
                     )
                 }
                 // 草稿被收起后仍然存在，这条提示是把它重新打开的唯一入口。
@@ -415,9 +419,11 @@ fun ChatScreen(
             initialRoleCardId = state.activeRpSettings?.roleCardId,
             initialWorldSettingId = state.activeRpSettings?.worldSettingId,
             initialWritingStyleId = state.activeRpSettings?.writingStyleId,
-            initialProtagonistName = state.activeRpSettings?.protagonistName.orEmpty(),
-            initialProtagonistDescription = state.activeRpSettings?.protagonistDescription.orEmpty(),
-            initialProtagonistInitialState = state.activeRpSettings?.protagonistInitialState.orEmpty(),
+            initialProtagonistName = state.activeProtagonistProfile?.name.orEmpty(),
+            initialProtagonistDescription = state.activeProtagonistProfile?.description.orEmpty(),
+            initialProtagonistInitialState = state.activeProtagonistProfile?.initialStateText.orEmpty(),
+            isProtagonistProfileBound = state.activeProtagonistProfile != null,
+            protagonistHiddenEntryCount = state.activeProtagonistProfile?.hiddenEntryCountInRpSettings() ?: 0,
             initialNarrativeMinChars = state.activeRpSettings?.narrativeMinChars ?: 0,
             initialNarrativePerspective = state.activeRpSettings
                 ?.narrativePerspective
@@ -714,6 +720,14 @@ private data class MessageEditTarget(
     val initialContent: String,
 )
 
+/** 档案里除第一条「初始状态」外的词条数：RP 设置只编辑三项，其余照常发给模型但这里看不到。 */
+private fun ProtagonistProfile.hiddenEntryCountInRpSettings(): Int {
+    val shownInitialState = entries.indexOfFirst {
+        it is RpEntry.Text && it.name == ProtagonistProfile.INITIAL_STATE_ENTRY_NAME
+    }
+    return entries.size - if (shownInitialState >= 0) 1 else 0
+}
+
 private data class RpSettingsDraft(
     val isRpEnabled: Boolean,
     val roleCardId: String?,
@@ -733,9 +747,10 @@ private data class RpSettingsDraft(
             roleCardId = state.activeRpSettings?.roleCardId,
             worldSettingId = state.activeRpSettings?.worldSettingId,
             writingStyleId = state.activeRpSettings?.writingStyleId,
-            protagonistName = state.activeRpSettings?.protagonistName.orEmpty(),
-            protagonistDescription = state.activeRpSettings?.protagonistDescription.orEmpty(),
-            protagonistInitialState = state.activeRpSettings?.protagonistInitialState.orEmpty(),
+            // RP-2d：主角输入框编辑的是绑定的档案，不再读 v9 的旧三列。
+            protagonistName = state.activeProtagonistProfile?.name.orEmpty(),
+            protagonistDescription = state.activeProtagonistProfile?.description.orEmpty(),
+            protagonistInitialState = state.activeProtagonistProfile?.initialStateText.orEmpty(),
             narrativeMinCharsText = state.activeRpSettings
                 ?.narrativeMinChars
                 ?.takeIf { it > 0 }

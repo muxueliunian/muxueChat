@@ -103,7 +103,8 @@ class RpRepositoryImpl(
      * 删除角色卡等价于在所有绑定它的会话里解绑：走 [applyBindingTransition] 同一条规则，
      * 只清角色组数值、关系与场景，**不连带清主角组**（§4）。
      *
-     * RP 目前仍要求绑定角色卡，因此同时关闭 RP；历史消息与其元数据行保留。
+     * 会话还绑着主角时 RP 保持原开关（RP-2f 起主角单独也能驱动状态链路）；
+     * 角色卡与主角都没了才关闭 RP。历史消息与其元数据行保留。
      */
     override suspend fun deleteRoleCard(roleCardId: String) {
         database.withTransaction {
@@ -111,7 +112,7 @@ class RpRepositoryImpl(
             chatDao.getConversationRpSettingsByRoleCard(roleCardId).forEach { previous ->
                 val next = previous.copy(
                     roleCardId = null,
-                    isRpEnabled = false,
+                    isRpEnabled = previous.isRpEnabled && previous.protagonistProfileId != null,
                     metricSnapshotJson = RpEntryCodec.encodeSnapshot(
                         nextMetricSnapshot(previous, roleCardId = null, protagonistProfileId = previous.protagonistProfileId),
                     ),
@@ -162,9 +163,14 @@ class RpRepositoryImpl(
         id: String?,
         draft: ProtagonistProfileDraft,
     ): ProtagonistProfile {
+        // 名字允许为空（用户 2026-09-23 选定）：空名表示「玩家本人」，prompt 不发名称行。
+        // 但整份档案不能什么都没有，否则它进不了 prompt，只是一条看不见的空记录。
         val name = draft.name.trim().replace(NEWLINE_REGEX, " ")
-        require(name.isNotBlank()) { "主角名字不能为空" }
+        val description = draft.description.trim()
         val entries = normalizeEntries(draft.entries)
+        require(name.isNotBlank() || description.isNotBlank() || entries.any { it.hasContent() }) {
+            "主角档案不能为空：名称、简介和词条至少填一项"
+        }
 
         return database.withTransaction {
             val now = clock()
@@ -173,7 +179,7 @@ class RpRepositoryImpl(
             val entity = ProtagonistProfileEntity(
                 id = existing?.id ?: UUID.randomUUID().toString(),
                 name = name.take(MAX_NAME_LENGTH),
-                description = draft.description.trim(),
+                description = description,
                 entriesJson = RpEntryCodec.encodeEntries(entries),
                 createdAtMillis = existing?.createdAtMillis ?: now,
                 updatedAtMillis = now,
@@ -389,7 +395,14 @@ class RpRepositoryImpl(
         val validRoleCardId = roleCardId?.takeIf { chatDao.getRoleCard(it) != null }
         val validWorldSettingId = worldSettingId?.takeIf { chatDao.getWorldSetting(it) != null }
         val validWritingStyleId = writingStyleId?.takeIf { chatDao.getWritingStyleProfile(it) != null }
-        val validProtagonistProfileId = protagonistProfileId?.takeIf { chatDao.getProtagonistProfile(it) != null }
+        val requestedProfileId = protagonistProfileId?.takeIf { chatDao.getProtagonistProfile(it) != null }
+        val editsProtagonist = protagonistName != null || protagonistDescription != null ||
+            protagonistInitialState != null
+        val validProtagonistProfileId = if (editsProtagonist) {
+            applyProtagonistTextEdit(requestedProfileId, protagonistName, protagonistDescription, protagonistInitialState)
+        } else {
+            requestedProfileId
+        }
         val nextEntity = ConversationRpSettingsEntity(
             conversationId = conversationId,
             isRpEnabled = isRpEnabled,
@@ -400,12 +413,10 @@ class RpRepositoryImpl(
             metricSnapshotJson = RpEntryCodec.encodeSnapshot(
                 nextMetricSnapshot(previousEntity, validRoleCardId, validProtagonistProfileId),
             ),
-            protagonistName = protagonistName?.trim()?.take(MAX_PROFILE_LENGTH)
-                ?: previousSettings?.protagonistName.orEmpty(),
-            protagonistDescription = protagonistDescription?.trim()?.take(MAX_PROFILE_LENGTH)
-                ?: previousSettings?.protagonistDescription.orEmpty(),
-            protagonistInitialState = protagonistInitialState?.trim()?.take(MAX_PROFILE_LENGTH)
-                ?: previousSettings?.protagonistInitialState.orEmpty(),
+            // v9 的主角三列已停用（RP-2d 起输入框改写档案），原样保留为取证材料。
+            protagonistName = previousSettings?.protagonistName.orEmpty(),
+            protagonistDescription = previousSettings?.protagonistDescription.orEmpty(),
+            protagonistInitialState = previousSettings?.protagonistInitialState.orEmpty(),
             narrativeMinChars = narrativeMinChars?.coerceIn(0, MAX_NARRATIVE_MIN_CHARS)
                 ?: previousSettings?.narrativeMinChars.orZero(),
             narrativePerspective = (
@@ -428,6 +439,56 @@ class RpRepositoryImpl(
         chatDao.upsertConversationRpSettings(nextEntity)
         applyBindingTransition(conversationId, previousEntity, nextEntity, now)
         chatDao.touchConversation(conversationId, now)
+    }
+
+    /**
+     * RP 设置里的主角三个输入框（RP-2d 过渡方案，RP-3 换成档案选择器）。
+     *
+     * 编辑的是**档案本身**：绑定同一档案的其他会话，文字部分会一起变；
+     * 数值定义有会话快照保护，不受影响（R6）。参数为 null 表示该项不改。
+     *
+     * - 已绑定：改名称、简介与「初始状态」词条，其它词条原样保留；内容没变时不写库。
+     *   改完后档案什么都不剩时，本会话解绑，档案本身保留（别的会话可能还在用）。
+     * - 未绑定：有内容就新建一条档案，由调用方在同一事务里绑定；全空则保持不绑。
+     *
+     * @return 本会话应绑定的档案 id，null 表示不绑。
+     */
+    private suspend fun applyProtagonistTextEdit(
+        profileId: String?,
+        name: String?,
+        description: String?,
+        initialState: String?,
+    ): String? {
+        val existing = profileId?.let { chatDao.getProtagonistProfile(it)?.toDomain() }
+        val nextName = name?.trim() ?: existing?.name.orEmpty()
+        val nextDescription = description?.trim() ?: existing?.description.orEmpty()
+        val nextEntries = withInitialState(existing?.entries.orEmpty(), initialState?.trim())
+        if (nextName.isBlank() && nextDescription.isBlank() && nextEntries.none { it.hasContent() }) {
+            return null
+        }
+        val draft = ProtagonistProfileDraft(name = nextName, description = nextDescription, entries = nextEntries)
+        if (existing == null) return saveProtagonistProfile(id = null, draft = draft).id
+        val unchanged = nextName == existing.name &&
+            nextDescription == existing.description &&
+            nextEntries == existing.entries
+        if (!unchanged) saveProtagonistProfile(id = existing.id, draft = draft)
+        return existing.id
+    }
+
+    /** 改写第一条「初始状态」文本词条：空值删掉它，没有就追加；null 表示不改。 */
+    private fun withInitialState(entries: List<RpEntry>, value: String?): List<RpEntry> {
+        if (value == null) return entries
+        val index = entries.indexOfFirst {
+            it is RpEntry.Text && it.name == ProtagonistProfile.INITIAL_STATE_ENTRY_NAME
+        }
+        return when {
+            index < 0 && value.isBlank() -> entries
+            index < 0 -> entries + RpEntry.Text(id = "", name = ProtagonistProfile.INITIAL_STATE_ENTRY_NAME, value = value)
+            value.isBlank() -> entries.filterIndexed { i, _ -> i != index }
+            else -> entries.mapIndexed { i, entry ->
+                if (i == index) (entry as RpEntry.Text).copy(value = value) else entry
+            }
+        }
     }
 
     override suspend fun syncMetricDefinitionsFromProfiles(conversationId: String): Boolean =
@@ -697,19 +758,21 @@ class RpRepositoryImpl(
         entries = if (initialState.isBlank()) {
             emptyList()
         } else {
-            listOf(RpEntry.Text(id = "", name = PROTAGONIST_INITIAL_STATE_ENTRY, value = initialState))
+            listOf(RpEntry.Text(id = "", name = ProtagonistProfile.INITIAL_STATE_ENTRY_NAME, value = initialState))
         },
     )
+
+    private fun RpEntry.hasContent(): Boolean = when (this) {
+        is RpEntry.Text -> value.isNotBlank()
+        is RpEntry.Numeric -> true
+    }
 
     private fun Int?.orZero(): Int = this ?: 0
 
     private companion object {
         const val MAX_NAME_LENGTH = 80
-        const val MAX_PROFILE_LENGTH = 2000
         const val MAX_NARRATIVE_MIN_CHARS = 5000
         const val MAX_METRIC_DEFINITIONS = 12
-        /** 与迁移生成的词条同名，工具建的主角与升级来的主角在界面上表现一致。 */
-        const val PROTAGONIST_INITIAL_STATE_ENTRY = "初始状态"
         val NEWLINE_REGEX = Regex("[\\r\\n]+")
         val repositoryJson = Json { ignoreUnknownKeys = true }
     }

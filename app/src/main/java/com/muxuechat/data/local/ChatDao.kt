@@ -21,6 +21,10 @@ data class RpTurnConfigurationSnapshot(
      */
     val persistedStatusPanel: RpStatusPanelEntity?,
     val statusBeforeMetadata: MessageRpMetadataEntity?,
+    /** 只在 RP 开启且绑了主角档案时非空；与配置同一事务读出，避免混入换绑中途的状态。 */
+    val protagonistProfile: ProtagonistProfileEntity? = null,
+    /** 只在 RP 开启时读取，按勾选顺序；同样与配置同一事务读出。 */
+    val supportingCharacters: List<SupportingCharacterEntity> = emptyList(),
 )
 
 /** 带 RP 派生数据的提交结果。三种情况下正文本身都已提交。 */
@@ -136,13 +140,24 @@ interface ChatDao {
             ?.roleCardId
             ?.let { getRoleCard(it) }
         val persistedStatusPanel = getRpStatusPanel(conversationId)
+        val protagonistProfile = settings
+            ?.takeIf { it.isRpEnabled }
+            ?.protagonistProfileId
+            ?.let { getProtagonistProfile(it) }
         return RpTurnConfigurationSnapshot(
             settings = settings,
             roleCard = roleCard,
-            statusPanel = roleCard?.let { persistedStatusPanel },
+            // 状态链路在「绑了角色卡或主角」时生效（RP-2f）：只有主角有数值的会话同样要有面板。
+            statusPanel = persistedStatusPanel?.takeIf { roleCard != null || protagonistProfile != null },
             persistedStatusPanel = persistedStatusPanel,
             statusBeforeMetadata = statusBeforeMessageId?.let {
                 getLatestMessageRpMetadataBeforeMessage(conversationId, it)
+            },
+            protagonistProfile = protagonistProfile,
+            supportingCharacters = if (settings?.isRpEnabled == true) {
+                getConversationSupportingCharacters(conversationId)
+            } else {
+                emptyList()
             },
         )
     }

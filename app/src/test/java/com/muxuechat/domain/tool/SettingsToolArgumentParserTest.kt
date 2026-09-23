@@ -1,5 +1,6 @@
 package com.muxuechat.domain.tool
 
+import com.muxuechat.domain.model.RpEntry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -206,6 +207,57 @@ class SettingsToolArgumentParserTest {
         )
 
         assertEquals(1, draft.roleCard!!.metricDefinitions.size)
+        assertTrue(draft.warnings.any { it.contains("重复") })
+    }
+
+    /**
+     * RP-2g（§11.2）：工具协议不变，旧 metric DTO 在保存时经 `RoleCardDraft.toEntries()`
+     * 转成 `RpEntry.Numeric`，id、范围、说明原样带过去——id 是数值身份（R14），不能在这一步重发。
+     */
+    @Test
+    fun toolMetricDefinitions_becomeNumericEntriesWithSameIdentity() {
+        val card = success(
+            SettingsTool.CREATE_ROLE_CARD,
+            """
+            {"name":"林澈","metric_definitions":[
+              {"name":"信任度","min_value":-10,"max_value":10,"initial_value":2,
+               "description":"是否愿意透露秘密","progress_rule":"守约时上升"}
+            ]}
+            """.trimIndent(),
+        ).roleCard!!
+
+        val metric = card.metricDefinitions.single()
+        assertEquals(
+            listOf(
+                RpEntry.Numeric(
+                    id = metric.id,
+                    name = "信任度",
+                    minValue = -10,
+                    maxValue = 10,
+                    initialValue = 2,
+                    description = "是否愿意透露秘密",
+                    progressRule = "守约时上升",
+                ),
+            ),
+            card.toEntries(),
+        )
+    }
+
+    /** 状态条名含归属分隔符时仓库会拒绝保存，而草稿页改不了状态条：解析时就替换并提示。 */
+    @Test
+    fun replacesWireSeparatorInMetricNamesAndWarns() {
+        val draft = success(
+            SettingsTool.CREATE_ROLE_CARD,
+            """
+            {"name":"甲","metric_definitions":[
+              {"name":"主角::体力","min_value":0,"max_value":10},
+              {"name":"主角·体力","min_value":0,"max_value":10}
+            ]}
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("主角·体力"), draft.roleCard!!.metricDefinitions.map { it.name })
+        assertTrue(draft.warnings.any { it.contains("保留符号") })
         assertTrue(draft.warnings.any { it.contains("重复") })
     }
 

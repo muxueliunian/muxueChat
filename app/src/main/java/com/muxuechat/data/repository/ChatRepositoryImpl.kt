@@ -37,7 +37,9 @@ import com.muxuechat.domain.model.ConversationTokenUsage
 import com.muxuechat.domain.model.TokenUsageNormalizer
 import com.muxuechat.domain.model.TokenUsageSnapshot
 import com.muxuechat.domain.model.MessageStatus
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.data.local.RpStateCommitResult
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.RpMessageMetadata
@@ -62,6 +64,7 @@ import com.muxuechat.domain.rp.RpMessageMetadataParser
 import com.muxuechat.domain.rp.RpStatusPanelDraft
 import com.muxuechat.domain.rp.RpStateBlockFormat
 import com.muxuechat.domain.rp.RpStateBlockParser
+import com.muxuechat.domain.rp.RpStateMergeResult
 import com.muxuechat.domain.rp.RpStateMerger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -144,6 +147,10 @@ class ChatRepositoryImpl(
         /** 提交时库里面板必须仍是它；否则说明请求期间面板被改过，不得用本轮结果覆盖。 */
         val expectedStatusPanel: RpStatusPanelEntity?,
         val lastUser: String,
+        /** 本轮冻结的主角档案；正文与元数据补写都用它，不再现查。 */
+        val protagonistProfile: ProtagonistProfile? = null,
+        /** 本轮冻结的配角，只供正文 prompt；元数据补写与兜底不用。 */
+        val supportingCharacters: List<SupportingCharacter> = emptyList(),
     )
 
     private data class RpEnrichmentInput(
@@ -1274,13 +1281,16 @@ class ChatRepositoryImpl(
             )
         }
 
-        // 世界观与文风的**正文**修改不会改动 conversation_rp_settings，
+        // 世界观、文风、主角档案与配角的**正文**修改不会改动 conversation_rp_settings，
         // 因此必须单独观察它们，否则改完设定后面板上的 token 数不动。
+        // 配角的关联表查询同时覆盖勾选变化与配角内容修改（Room 按涉及的表失效）。
         val settingSignals = combine(
             settingsRepository.settings,
             chatDao.observeWorldSettings(),
             chatDao.observeWritingStyleProfiles(),
-        ) { settings, _, _ -> settings }
+            chatDao.observeProtagonistProfiles(),
+            chatDao.observeConversationSupportingCharacters(conversationId),
+        ) { settings, _, _, _, _ -> settings }
 
         return combine(conversationSignals, settingSignals) { signals, settings -> signals to settings }
             .debounce(CONTEXT_WINDOW_DEBOUNCE_MILLIS)
@@ -1306,6 +1316,7 @@ class ChatRepositoryImpl(
         val rpSettings = signals.rpSettings?.toDomain()
         val rpEnabled = rpSettings?.isRpEnabled == true
         val roleCard = rpSettings?.takeIf { rpEnabled }?.roleCardId?.let { chatDao.getRoleCard(it)?.toDomain() }
+        val protagonistProfile = loadProtagonistProfile(rpSettings, rpEnabled)
 
         return chatContextPlanner.plan(
             buildContextInput(
@@ -1314,8 +1325,11 @@ class ChatRepositoryImpl(
                 roleCard = roleCard,
                 worldSetting = loadWorldSetting(rpSettings, rpEnabled),
                 writingStyle = loadWritingStyle(rpSettings, rpEnabled),
-                // 状态栏只有在真的绑了角色卡时才会进 prompt，估算必须跟请求保持一致。
-                statusPanel = signals.statusPanel?.toDomain()?.takeIf { roleCard != null },
+                protagonistProfile = protagonistProfile,
+                supportingCharacters = loadSupportingCharacters(conversationId, rpEnabled),
+                // 状态栏只有在绑了角色卡或主角时才会进 prompt，估算必须跟请求保持一致。
+                statusPanel = signals.statusPanel?.toDomain()
+                    ?.takeIf { roleCard != null || protagonistProfile != null },
                 history = signals.messages.toPromptHistory(),
                 summaryState = signals.summaryState,
                 settingsToolsAvailable = normalized.settingsToolsEnabledForActiveProvider && !rpEnabled,
@@ -1648,10 +1662,17 @@ class ChatRepositoryImpl(
         } else {
             rpSettings?.takeIf { rpEnabled }?.roleCardId?.let { chatDao.getRoleCard(it)?.toDomain() }
         }
+        val protagonistProfile = if (rpTurnSnapshot != null) {
+            rpTurnSnapshot.protagonistProfile
+        } else {
+            loadProtagonistProfile(rpSettings, rpEnabled)
+        }
         val statusPanel = if (rpTurnSnapshot != null) {
             rpTurnSnapshot.currentPanel
+        } else if (roleCard != null || protagonistProfile != null) {
+            chatDao.getRpStatusPanel(conversationId)?.toDomain()
         } else {
-            roleCard?.let { chatDao.getRpStatusPanel(conversationId)?.toDomain() }
+            null
         }
 
         return buildContextInput(
@@ -1660,6 +1681,9 @@ class ChatRepositoryImpl(
             roleCard = roleCard,
             worldSetting = loadWorldSetting(rpSettings, rpEnabled),
             writingStyle = loadWritingStyle(rpSettings, rpEnabled),
+            protagonistProfile = protagonistProfile,
+            supportingCharacters = rpTurnSnapshot?.supportingCharacters
+                ?: loadSupportingCharacters(conversationId, rpEnabled),
             statusPanel = statusPanel,
             history = history,
             summaryState = summaryState,
@@ -1678,6 +1702,8 @@ class ChatRepositoryImpl(
         roleCard: RoleCard?,
         worldSetting: com.muxuechat.domain.model.WorldSetting?,
         writingStyle: com.muxuechat.domain.model.WritingStyleProfile?,
+        protagonistProfile: ProtagonistProfile?,
+        supportingCharacters: List<SupportingCharacter>,
         statusPanel: RpStatusPanel?,
         history: List<PromptMessage>,
         summaryState: ContextSummaryState,
@@ -1691,6 +1717,8 @@ class ChatRepositoryImpl(
         roleCard = roleCard,
         worldSetting = worldSetting,
         writingStyle = writingStyle,
+        protagonistProfile = protagonistProfile,
+        supportingCharacters = supportingCharacters,
         statusPanel = statusPanel,
         history = history,
         summaryState = summaryState,
@@ -1708,6 +1736,17 @@ class ChatRepositoryImpl(
         ?.takeIf { rpEnabled }
         ?.worldSettingId
         ?.let { chatDao.getWorldSetting(it)?.toDomain() }
+
+    private suspend fun loadProtagonistProfile(
+        rpSettings: com.muxuechat.domain.model.ConversationRpSettings?,
+        rpEnabled: Boolean,
+    ) = rpSettings
+        ?.takeIf { rpEnabled }
+        ?.protagonistProfileId
+        ?.let { chatDao.getProtagonistProfile(it)?.toDomain() }
+
+    private suspend fun loadSupportingCharacters(conversationId: String, rpEnabled: Boolean) =
+        if (rpEnabled) chatDao.getConversationSupportingCharacters(conversationId).map { it.toDomain() } else emptyList()
 
     private suspend fun loadWritingStyle(
         rpSettings: com.muxuechat.domain.model.ConversationRpSettings?,
@@ -1889,17 +1928,22 @@ class ChatRepositoryImpl(
         val contentExtraction = rpStateBlockParser.extract(message.content)
         val reasoningExtraction = message.reasoningContent?.let { rpStateBlockParser.extract(it) }
         val expectedRpState = turn.definitions.isNotEmpty()
-        val needsEnrichment = turn.roleCard != null
 
         // 只做本地解析。剧情建议、内心独白、兜底状态都需要额外的网络往返，
         // 放在这里会让用户看完正文后还要干等一整次请求，因此移到后台补写。
         val draft = contentExtraction.panel ?: reasoningExtraction?.panel
         val now = maxOf(message.updatedAtMillis, clock())
         // 整块都对不上定义的状态块不算「有本地状态」：否则会跳过兜底请求，这一轮的状态就白丢了。
-        val localStatusPanel = draft?.takeIf { expectedRpState }?.let {
+        // 但它带来的关系与场景照样落面板（建议 5），数值保持当前值，等兜底请求再更新。
+        val contentMerge = draft?.takeIf { expectedRpState }?.let {
             mergeRpState(conversationId, turn, it, now, source = "content")
         }
-        val missingExpectedState = localStatusPanel == null && expectedRpState
+        val metricsUpdated = contentMerge?.panel != null
+        val localStatusPanel = contentMerge?.panel ?: contentMerge?.textOnlyPanel
+        val missingExpectedState = !metricsUpdated && expectedRpState
+        // 元数据补写（内心独白、剧情建议）需要角色卡；没有角色卡时（RP-2f，只有主角），
+        // 后台只在数值没更新时跑一次兜底状态请求。
+        val needsEnrichment = turn.roleCard != null || missingExpectedState
         val completed = message.copy(
             content = contentExtraction.cleanContent,
             reasoningContent = reasoningExtraction?.cleanContent ?: message.reasoningContent,
@@ -1915,7 +1959,8 @@ class ChatRepositoryImpl(
         return PreparedAssistant(
             message = completed,
             localStatusPanel = localStatusPanel,
-            hasLocalPanel = localStatusPanel != null,
+            // 只有关系与场景的面板不算：数值还没更新，后台仍要发兜底请求。
+            hasLocalPanel = metricsUpdated,
             expectedRpState = expectedRpState,
             needsEnrichment = needsEnrichment,
         )
@@ -1974,19 +2019,24 @@ class ChatRepositoryImpl(
         }
         val conversationId = input.expectedMessage.conversationId
         // 元数据里的状态整块对不上时，同样当作没给状态，继续走兜底请求。
-        val metadataPanel = metadata?.statusPanel?.let {
+        val metadataMerge = metadata?.statusPanel?.let {
             mergeRpState(conversationId, input.turn, it, clock(), source = "metadata")
         }
-        val fallbackPanel = if (!input.hasLocalPanel && metadataPanel == null && input.expectedRpState) {
+        val metadataPanel = metadataMerge?.panel
+        val fallbackMerge = if (!input.hasLocalPanel && metadataPanel == null && input.expectedRpState) {
             requestFallbackRpStatusPanel(input)?.let {
                 mergeRpState(conversationId, input.turn, it, clock(), source = "fallback")
             }
         } else {
             null
         }
+        val fallbackPanel = fallbackMerge?.panel
+        // 数值都没对上时，退而保留模型给的关系与场景（建议 5）；兜底的比元数据的新，优先用它。
+        val textOnlyPanel = fallbackMerge?.textOnlyPanel ?: metadataMerge?.textOnlyPanel
 
         val now = clock()
-        val candidatePanel = (metadataPanel ?: fallbackPanel)?.copy(updatedAtMillis = now)
+        val metricsPanel = metadataPanel ?: fallbackPanel
+        val candidatePanel = (metricsPanel ?: textOnlyPanel)?.copy(updatedAtMillis = now)
         val hasMetadataContent = metadata?.let { it.innerThought.isNotBlank() || it.options.isNotEmpty() } == true
         val savedMetadata = if (hasMetadataContent || candidatePanel != null) {
             createRpMessageMetadata(
@@ -1999,7 +2049,7 @@ class ChatRepositoryImpl(
             null
         }
         val missingStateMessage = if (
-            !input.hasLocalPanel && candidatePanel == null && input.expectedRpState
+            !input.hasLocalPanel && metricsPanel == null && input.expectedRpState
         ) {
             "本次回复未更新状态栏，已保留上一次状态。"
         } else {
@@ -2041,12 +2091,16 @@ class ChatRepositoryImpl(
         val rpSettings = rpSettingsEntity?.toDomain()
         val activeRoleCardEntity = configuration.roleCard
         val roleCard = activeRoleCardEntity?.toDomain()
+        val protagonistProfile = configuration.protagonistProfile?.toDomain()
+        // 状态链路生效：RP 开启且绑了角色卡或主角（RP-2f 放开了「必须有角色卡」）。
+        // 两者都没绑的 RP 仍然不记状态，与之前一致。配置里的两者只在 RP 开启时读出。
+        val stateActive = roleCard != null || protagonistProfile != null
         // 唯一的「本会话有效定义」来源：会话快照，不读实时角色卡（R6）。
-        val definitions = if (roleCard != null) RpEffectiveDefinitions.of(rpSettings) else emptyList()
+        val definitions = if (stateActive) RpEffectiveDefinitions.of(rpSettings) else emptyList()
         val statusPanel = if (resolveStatusBeforeTarget) {
             resolveRpStatusFromSnapshot(
                 conversationId = conversationId,
-                isRpActive = roleCard != null,
+                isRpActive = stateActive,
                 definitions = definitions,
                 previousMetadata = configuration.statusBeforeMetadata,
                 now = clock(),
@@ -2062,6 +2116,8 @@ class ChatRepositoryImpl(
             definitions = definitions,
             currentPanel = statusPanel,
             expectedStatusPanel = configuration.persistedStatusPanel,
+            protagonistProfile = protagonistProfile,
+            supportingCharacters = configuration.supportingCharacters.map { it.toDomain() },
             lastUser = lastUserOverride ?: if (targetMessageId != null) {
                 RpHistoryMutation.lastCompletedUserContentBefore(
                     messages = messages,
@@ -2145,6 +2201,7 @@ class ChatRepositoryImpl(
             RpMetadataPromptContext(
                 rpSettings = input.turn.rpSettings,
                 roleCard = roleCard,
+                protagonistProfile = input.turn.protagonistProfile,
                 definitions = input.turn.definitions,
                 currentPanel = input.turn.currentPanel,
                 lastUser = input.turn.lastUser,
@@ -2274,6 +2331,7 @@ class ChatRepositoryImpl(
             你是 muxueChat 的 RP 状态更新器，只负责根据最近一轮对话更新状态面板。
             必须只输出一个 <muxue_state> JSON 状态块，不要输出正文、解释、Markdown、代码围栏或额外字符。
             metrics 必须只包含用户定义过的状态条，不要新增、改名或遗漏。
+            ${RpStateBlockFormat.PREFIX_RULE}
             value 必须是整数，并且必须在对应 min/max 范围内。
             如果最近一轮没有足够理由改变某个数值，保持当前值。
         """.trimIndent()
@@ -2340,7 +2398,8 @@ class ChatRepositoryImpl(
 
     /**
      * 正文、元数据、兜底三条路共用的合并入口，基准是本轮冻结的当前面板。
-     * 返回 null 表示整块对不上定义，调用方必须当作「本轮没有状态」。
+     * `panel` 为 null 表示数值整块对不上定义，调用方必须当作「数值没更新」；
+     * 此时 `textOnlyPanel` 可能携带新的关系与场景，见 [RpStateMergeResult]。
      */
     private fun mergeRpState(
         conversationId: String,
@@ -2348,7 +2407,7 @@ class ChatRepositoryImpl(
         draft: RpStatusPanelDraft,
         now: Long,
         source: String,
-    ): RpStatusPanel? {
+    ): RpStateMergeResult {
         val result = RpStateMerger.merge(
             conversationId = conversationId,
             definitions = turn.definitions,
@@ -2364,7 +2423,7 @@ class ChatRepositoryImpl(
                     "unknown=${result.unknownCount} duplicate=${result.duplicateCount}",
             )
         }
-        return result.panel
+        return result
     }
 
     private suspend fun getActiveRoleCard(conversationId: String): RoleCard? {

@@ -5,6 +5,7 @@ import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.WorldSettingDraft
 import com.muxuechat.domain.model.WritingStyleProfileDraft
+import com.muxuechat.domain.rp.RpStateBlockFormat
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -109,7 +110,7 @@ class SettingsToolArgumentParser(
                     return SettingsToolParseResult.Failure("模型没有给出主角名字，无法创建主角设定。")
                 }
                 if (conversationId == null) {
-                    // 主角没有独立实体，只能落到某个会话的 RP 设置上；没有会话就没有落点。
+                    // 工具协议规定主角是「为这个故事建的」：保存为档案并绑定到会话，没有会话就没有落点。
                     return SettingsToolParseResult.Failure("当前没有会话，主角设定无处保存。")
                 }
                 SettingsToolDraft(
@@ -118,7 +119,7 @@ class SettingsToolArgumentParser(
                     conversationId = conversationId,
                     protagonist = ProtagonistDraft(
                         name = name,
-                        // 上限与 RpRepositoryImpl 写入会话设置时的截断一致，避免保存时二次静默截断。
+                        // 上限沿用 v9 会话设置三列的截断长度，草稿里就截好并提示，保存时不再二次截断。
                         description = root.string("description")
                             .limit(MAX_PROFILE_LENGTH, warnings, "主角描述"),
                         initialState = root.string("initial_state")
@@ -163,8 +164,14 @@ class SettingsToolArgumentParser(
         val usedNames = mutableSetOf<String>()
         return array.take(MAX_METRIC_DEFINITIONS).mapNotNull { item ->
             val obj = item as? JsonObject ?: return@mapNotNull null
-            val name = obj.string("name").trim().take(MAX_NAME_LENGTH)
+            val rawName = obj.string("name").trim().take(MAX_NAME_LENGTH)
+            // 数值词条名不得含归属分隔符（§3.3），仓库保存时会整笔拒绝；草稿页的状态条只读，
+            // 用户没法自己改。名字是模型起的，这里换成「·」并提示，而不是让整份草稿存不进去。
+            val name = rawName.replace(RpStateBlockFormat.WIRE_NAME_SEPARATOR, SEPARATOR_REPLACEMENT)
             if (name.isBlank()) return@mapNotNull null
+            if (name != rawName) {
+                warnings += "状态条「$rawName」含保留符号「${RpStateBlockFormat.WIRE_NAME_SEPARATOR}」，已改为「$name」。"
+            }
             if (!usedNames.add(name)) {
                 warnings += "状态条「$name」重复，已忽略重复项。"
                 return@mapNotNull null
@@ -234,8 +241,10 @@ class SettingsToolArgumentParser(
         val NEWLINE_REGEX = Regex("[\\r\\n]+")
         const val MAX_NAME_LENGTH = 80
 
-        /** 与 `RpRepositoryImpl.MAX_PROFILE_LENGTH` 同值：主角三段文本存在会话设置里。 */
+        /** 工具生成的主角简介与初始状态的长度上限（沿用 v9 会话设置三列的上限）。 */
         const val MAX_PROFILE_LENGTH = 2_000
+        /** 状态条名里的归属分隔符替换成它（与面板撞名时的「主角·体力」同形）。 */
+        const val SEPARATOR_REPLACEMENT = "·"
         const val MAX_TEXT_LENGTH = 4_000
         const val MAX_LONG_TEXT_LENGTH = 20_000
         const val MAX_METRIC_DEFINITIONS = 12
