@@ -34,8 +34,11 @@ data class ChatUiState(
     val worldSettings: List<WorldSetting> = emptyList(),
     val activeRpSettings: ConversationRpSettings? = null,
     val activeRoleCard: RoleCard? = null,
-    /** 当前会话绑定的主角档案；RP 设置里的主角输入框编辑的就是它。 */
+    /** 当前会话绑定的主角档案。 */
     val activeProtagonistProfile: ProtagonistProfile? = null,
+    val protagonistProfiles: List<ProtagonistProfile> = emptyList(),
+    /** 档案 id → 绑定它的会话数；没有会话绑定的档案不在表里。 */
+    val protagonistProfileUsage: Map<String, Int> = emptyMap(),
     val activeWorldSetting: WorldSetting? = null,
     val activeRpStatusPanel: RpStatusPanel? = null,
     val writingStyleProfiles: List<WritingStyleProfile> = emptyList(),

@@ -3,42 +3,26 @@ package com.muxuechat.presentation.chat.components
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Add
-import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberModalBottomSheetState
 import com.muxuechat.presentation.common.components.EditorSheet
 import com.muxuechat.presentation.common.components.rememberGuardedDismiss
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.RoleCardDraft
-import com.muxuechat.domain.model.RpMetricDefinition
 import java.util.UUID
 
 /**
@@ -63,15 +47,31 @@ fun RoleCardEditorSheet(
     var userIdentity by remember(initialDraft) { mutableStateOf(initialDraft.userIdentity) }
     var openingMessage by remember(initialDraft) { mutableStateOf(initialDraft.openingMessage) }
     var boundaries by remember(initialDraft) { mutableStateOf(initialDraft.boundaries) }
-    var metricDefinitions by remember(initialDraft) { mutableStateOf(initialDraft.metricDefinitions) }
+    val initialTextEntries = remember(initialDraft) { initialDraft.textEntries.map(RpEntryDrafts::textFrom) }
+    val initialNumericEntries = remember(initialDraft) {
+        initialDraft.metricDefinitions.map(RpEntryDrafts::numericFrom)
+    }
+    var textEntries by remember(initialDraft) { mutableStateOf(initialTextEntries) }
+    var numericEntries by remember(initialDraft) { mutableStateOf(initialNumericEntries) }
 
-    val canSave = name.trim().isNotEmpty()
-
-    fun updateMetric(index: Int, metric: RpMetricDefinition) {
-        metricDefinitions = metricDefinitions.toMutableList().also { it[index] = metric }
+    val issueCount = RpEntryDrafts.issueCount(textEntries, numericEntries)
+    val canSave = name.trim().isNotEmpty() && issueCount == 0
+    val saveBlockedReason = when {
+        name.trim().isEmpty() -> "请填写角色名称"
+        issueCount > 0 -> "还有 $issueCount 处需要修正"
+        else -> null
     }
 
-    val guardedDismiss = rememberGuardedDismiss(name != initialDraft.name || description != initialDraft.description || persona != initialDraft.persona || speakingStyle != initialDraft.speakingStyle || userIdentity != initialDraft.userIdentity || openingMessage != initialDraft.openingMessage || boundaries != initialDraft.boundaries || metricDefinitions != initialDraft.metricDefinitions, onDismiss)
+    val isDirty = name != initialDraft.name ||
+        description != initialDraft.description ||
+        persona != initialDraft.persona ||
+        speakingStyle != initialDraft.speakingStyle ||
+        userIdentity != initialDraft.userIdentity ||
+        openingMessage != initialDraft.openingMessage ||
+        boundaries != initialDraft.boundaries ||
+        textEntries != initialTextEntries ||
+        numericEntries != initialNumericEntries
+    val guardedDismiss = rememberGuardedDismiss(isDirty, onDismiss)
     EditorSheet(
         onDismiss = guardedDismiss,
         actions = {
@@ -80,6 +80,14 @@ fun RoleCardEditorSheet(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
             ) {
+                saveBlockedReason?.let { reason ->
+                    Text(
+                        text = reason,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
                 TextButton(onClick = guardedDismiss) {
                     Text("取消")
                 }
@@ -94,7 +102,8 @@ fun RoleCardEditorSheet(
                                 userIdentity = userIdentity.trim(),
                                 openingMessage = openingMessage.trim(),
                                 boundaries = boundaries.trim(),
-                                metricDefinitions = metricDefinitions,
+                                metricDefinitions = RpEntryDrafts.toMetricDefinitions(numericEntries),
+                                textEntries = RpEntryDrafts.toTextEntries(textEntries),
                             ),
                         )
                     },
@@ -175,203 +184,26 @@ fun RoleCardEditorSheet(
                 placeholder = "角色拒绝谈论的内容或行为边界",
             )
 
-            MetricDefinitionsSection(
-                metrics = metricDefinitions,
-                onAdd = {
-                    metricDefinitions = metricDefinitions + RpMetricDefinition(
+            TextEntriesEditor(
+                entries = textEntries,
+                onChange = { textEntries = it },
+                description = "补充静态设定，例如年龄、身份、口头禅、与主角的关系。只写进 prompt，不进状态栏。",
+            )
+
+            NumericEntriesEditor(
+                entries = numericEntries,
+                onChange = { numericEntries = it },
+                newEntry = {
+                    NumericEntryDraft(
                         id = UUID.randomUUID().toString(),
                         name = "好感度",
-                        minValue = 0,
-                        maxValue = 100,
-                        initialValue = 0,
                         description = "角色对用户的亲近、信赖和情感投入程度。",
                         progressRule = "0 表示陌生或排斥，50 表示熟悉，100 表示强烈依恋。",
                     )
                 },
-                onUpdate = ::updateMetric,
-                onDelete = { index ->
-                    metricDefinitions = metricDefinitions.toMutableList().also { it.removeAt(index) }
-                },
+                description = "定义这个角色需要维护的状态条；当前数值会按会话独立保存。" +
+                    "修改后，已绑定这张卡的其它会话仍沿用绑定时的定义。",
             )
-
-
-    }
-}
-
-@Composable
-private fun MetricDefinitionsSection(
-    metrics: List<RpMetricDefinition>,
-    onAdd: () -> Unit,
-    onUpdate: (Int, RpMetricDefinition) -> Unit,
-    onDelete: (Int) -> Unit,
-) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Text(
-            text = "状态栏定义",
-            style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onSurface,
-        )
-        Text(
-            text = "定义这个角色需要维护的状态条；当前数值会按会话独立保存。",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        metrics.forEachIndexed { index, metric ->
-            MetricDefinitionEditor(
-                index = index,
-                metric = metric,
-                onChange = { onUpdate(index, it) },
-                onDelete = { onDelete(index) },
-            )
-        }
-
-        OutlinedButton(
-            onClick = onAdd,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Icon(
-                imageVector = Icons.Outlined.Add,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-            )
-            Text(
-                text = "添加状态条",
-                modifier = Modifier.padding(start = 8.dp),
-            )
-        }
-    }
-}
-
-@Composable
-private fun MetricDefinitionEditor(
-    index: Int,
-    metric: RpMetricDefinition,
-    onChange: (RpMetricDefinition) -> Unit,
-    onDelete: () -> Unit,
-) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(
-                text = "状态条 ${index + 1}",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.weight(1f),
-            )
-            IconButton(onClick = onDelete) {
-                Icon(
-                    imageVector = Icons.Outlined.DeleteOutline,
-                    contentDescription = "删除状态条",
-                    tint = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
-
-        FormField(
-            label = "状态名称",
-            value = metric.name,
-            onValueChange = { onChange(metric.copy(name = it)) },
-            singleLine = true,
-            placeholder = "例如：好感度、信任度、警戒心",
-        )
-
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            NumberField(
-                label = "最小值",
-                value = metric.minValue,
-                onValueChange = { value ->
-                    val safeMax = if (metric.maxValue > value) metric.maxValue else value + 1
-                    onChange(
-                        metric.copy(
-                            minValue = value,
-                            maxValue = safeMax,
-                            initialValue = metric.initialValue.coerceIn(value, safeMax),
-                        ),
-                    )
-                },
-                modifier = Modifier.weight(1f),
-            )
-            NumberField(
-                label = "最大值",
-                value = metric.maxValue,
-                onValueChange = { value ->
-                    val safeMax = if (value > metric.minValue) value else metric.minValue + 1
-                    onChange(
-                        metric.copy(
-                            maxValue = safeMax,
-                            initialValue = metric.initialValue.coerceIn(metric.minValue, safeMax),
-                        ),
-                    )
-                },
-                modifier = Modifier.weight(1f),
-            )
-            NumberField(
-                label = "初始值",
-                value = metric.initialValue,
-                onValueChange = { value ->
-                    onChange(metric.copy(initialValue = value.coerceIn(metric.minValue, metric.maxValue)))
-                },
-                modifier = Modifier.weight(1f),
-            )
-        }
-
-        FormField(
-            label = "状态含义",
-            value = metric.description,
-            onValueChange = { onChange(metric.copy(description = it)) },
-            minLines = 2,
-            maxLines = 5,
-            placeholder = "这个数值代表什么心理、关系或世界状态",
-        )
-
-        FormField(
-            label = "变化规则",
-            value = metric.progressRule,
-            onValueChange = { onChange(metric.copy(progressRule = it)) },
-            minLines = 2,
-            maxLines = 5,
-            placeholder = "例如：0 表示陌生，50 表示信任，100 表示强烈依恋；只有在明确互动后才变化",
-        )
-    }
-}
-
-@Composable
-private fun NumberField(
-    label: String,
-    value: Int,
-    onValueChange: (Int) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Column(modifier = modifier) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.onSurface,
-        )
-        OutlinedTextField(
-            value = value.toString(),
-            onValueChange = { text ->
-                text.toIntOrNull()?.let(onValueChange)
-            },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 6.dp)
-                .heightIn(min = 56.dp),
-        )
     }
 }
 

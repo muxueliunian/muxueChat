@@ -47,6 +47,10 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.ProtagonistProfile
+import java.util.UUID
+import com.muxuechat.presentation.chat.components.displayName
+import com.muxuechat.presentation.chat.components.ProtagonistEditorSheet
+import com.muxuechat.domain.model.ProtagonistProfileDraft
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpEntry
@@ -93,10 +97,7 @@ fun ChatScreen(
         roleCardId: String?,
         worldSettingId: String?,
         writingStyleId: String?,
-        // 主角三项为 null 表示用户没改，不动档案（RP-2d）。
-        protagonistName: String?,
-        protagonistDescription: String?,
-        protagonistInitialState: String?,
+        protagonistProfileId: String?,
         narrativeMinChars: Int,
         narrativePerspective: RpNarrativePerspective,
         plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -104,6 +105,9 @@ fun ChatScreen(
     ) -> Unit,
     onSaveRoleCard: (id: String?, draft: RoleCardDraft) -> Unit,
     onDeleteRoleCard: (roleCardId: String) -> Unit,
+    onSaveProtagonist: (id: String?, draft: ProtagonistProfileDraft) -> Unit,
+    onForkProtagonist: (sourceProfileId: String, draft: ProtagonistProfileDraft) -> Unit,
+    onDeleteProtagonist: (profileId: String) -> Unit,
     onSaveWorldSetting: (id: String?, draft: WorldSettingDraft) -> Unit,
     onDeleteWorldSetting: (worldSettingId: String) -> Unit,
     onSaveWritingStyle: (id: String?, draft: WritingStyleProfileDraft) -> Unit,
@@ -137,6 +141,9 @@ fun ChatScreen(
     var roleCardEditor by remember { mutableStateOf<RoleCardEditorTarget?>(null) }
     var worldSettingEditor by remember { mutableStateOf<WorldSettingEditorTarget?>(null) }
     var pendingDeleteRoleCard by remember { mutableStateOf<RoleCard?>(null) }
+    var protagonistEditor by remember { mutableStateOf<ProtagonistEditorTarget?>(null) }
+    var pendingDeleteProtagonist by remember { mutableStateOf<ProtagonistProfile?>(null) }
+    var pendingCreatedProtagonistIds by remember { mutableStateOf<Set<String>?>(null) }
     var pendingDeleteWorldSetting by remember { mutableStateOf<WorldSetting?>(null) }
     var writingStyleEditor by remember { mutableStateOf<WritingStyleEditorTarget?>(null) }
     var pendingDeleteWritingStyle by remember { mutableStateOf<WritingStyleProfile?>(null) }
@@ -206,6 +213,20 @@ fun ChatScreen(
             roleCardId = created.id,
         )
         pendingCreatedRoleCardIds = null
+    }
+
+    // 新建或另存的主角档案出现后，RP 设置草稿预选它；另存时本会话已改绑，这里只是让草稿跟上，
+    // 否则草稿仍指向原档案，一点保存就会改绑回去。
+    LaunchedEffect(state.protagonistProfiles, pendingCreatedProtagonistIds) {
+        val beforeIds = pendingCreatedProtagonistIds ?: return@LaunchedEffect
+        val created = state.protagonistProfiles
+            .filterNot { it.id in beforeIds }
+            .maxByOrNull { it.createdAtMillis }
+            ?: return@LaunchedEffect
+        rpSettingsDraft = (rpSettingsDraft ?: RpSettingsDraft.from(state)).copy(
+            protagonistProfileId = created.id,
+        )
+        pendingCreatedProtagonistIds = null
     }
 
     LaunchedEffect(state.worldSettings, pendingCreatedWorldSettingIds) {
@@ -419,11 +440,7 @@ fun ChatScreen(
             initialRoleCardId = state.activeRpSettings?.roleCardId,
             initialWorldSettingId = state.activeRpSettings?.worldSettingId,
             initialWritingStyleId = state.activeRpSettings?.writingStyleId,
-            initialProtagonistName = state.activeProtagonistProfile?.name.orEmpty(),
-            initialProtagonistDescription = state.activeProtagonistProfile?.description.orEmpty(),
-            initialProtagonistInitialState = state.activeProtagonistProfile?.initialStateText.orEmpty(),
-            isProtagonistProfileBound = state.activeProtagonistProfile != null,
-            protagonistHiddenEntryCount = state.activeProtagonistProfile?.hiddenEntryCountInRpSettings() ?: 0,
+            initialProtagonistProfileId = state.activeRpSettings?.protagonistProfileId,
             initialNarrativeMinChars = state.activeRpSettings?.narrativeMinChars ?: 0,
             initialNarrativePerspective = state.activeRpSettings
                 ?.narrativePerspective
@@ -436,9 +453,7 @@ fun ChatScreen(
             draftRoleCardId = draft.roleCardId,
             draftWorldSettingId = draft.worldSettingId,
             draftWritingStyleId = draft.writingStyleId,
-            draftProtagonistName = draft.protagonistName,
-            draftProtagonistDescription = draft.protagonistDescription,
-            draftProtagonistInitialState = draft.protagonistInitialState,
+            draftProtagonistProfileId = draft.protagonistProfileId,
             draftNarrativeMinCharsText = draft.narrativeMinCharsText,
             draftNarrativePerspective = draft.narrativePerspective,
             draftPlotSuggestionPerspective = draft.plotSuggestionPerspective,
@@ -449,6 +464,8 @@ fun ChatScreen(
             roleCards = state.roleCards,
             worldSettings = state.worldSettings,
             writingStyles = state.writingStyleProfiles,
+            protagonistProfiles = state.protagonistProfiles,
+            protagonistProfileUsage = state.protagonistProfileUsage,
             onDraftRpEnabledChange = {
                 rpSettingsDraft = draft.copy(isRpEnabled = it)
             },
@@ -461,14 +478,8 @@ fun ChatScreen(
             onDraftWritingStyleIdChange = {
                 rpSettingsDraft = draft.copy(writingStyleId = it)
             },
-            onDraftProtagonistNameChange = {
-                rpSettingsDraft = draft.copy(protagonistName = it)
-            },
-            onDraftProtagonistDescriptionChange = {
-                rpSettingsDraft = draft.copy(protagonistDescription = it)
-            },
-            onDraftProtagonistInitialStateChange = {
-                rpSettingsDraft = draft.copy(protagonistInitialState = it)
+            onDraftProtagonistProfileIdChange = {
+                rpSettingsDraft = draft.copy(protagonistProfileId = it)
             },
             onDraftNarrativeMinCharsTextChange = {
                 rpSettingsDraft = draft.copy(narrativeMinCharsText = it)
@@ -486,9 +497,7 @@ fun ChatScreen(
                     roleCardId,
                     worldSettingId,
                     writingStyleId,
-                    name,
-                    description,
-                    initialState,
+                    protagonistProfileId,
                     narrativeMinChars,
                     narrativePerspective,
                     plotSuggestionPerspective,
@@ -498,9 +507,7 @@ fun ChatScreen(
                     roleCardId,
                     worldSettingId,
                     writingStyleId,
-                    name,
-                    description,
-                    initialState,
+                    protagonistProfileId,
                     narrativeMinChars,
                     narrativePerspective,
                     plotSuggestionPerspective,
@@ -520,6 +527,18 @@ fun ChatScreen(
             },
             onDeleteRoleCard = { card ->
                 pendingDeleteRoleCard = card
+            },
+            onCreateProtagonist = {
+                pendingCreatedProtagonistIds = state.protagonistProfiles.map { it.id }.toSet()
+                rpSheetVisible = false
+                protagonistEditor = ProtagonistEditorTarget.newProfile()
+            },
+            onEditProtagonist = { profile ->
+                rpSheetVisible = false
+                protagonistEditor = ProtagonistEditorTarget.fromExisting(profile)
+            },
+            onDeleteProtagonist = { profile ->
+                pendingDeleteProtagonist = profile
             },
             onCreateWorldSetting = {
                 pendingCreatedWorldSettingIds = state.worldSettings.map { it.id }.toSet()
@@ -549,6 +568,7 @@ fun ChatScreen(
                 rpSheetVisible = false
                 rpSettingsDraft = null
                 pendingCreatedRoleCardIds = null
+                pendingCreatedProtagonistIds = null
                 pendingCreatedWorldSettingIds = null
                 pendingCreatedWritingStyleIds = null
             },
@@ -566,6 +586,35 @@ fun ChatScreen(
             },
             onDismiss = {
                 dismissRoleCardEditor()
+            },
+        )
+    }
+
+    protagonistEditor?.let { target ->
+        ProtagonistEditorSheet(
+            isEditing = target.id != null,
+            initialDraft = target.draft,
+            sharedConversationCount = target.id?.let { state.protagonistProfileUsage[it] } ?: 0,
+            isBoundToCurrentConversation = target.id != null &&
+                target.id == state.activeRpSettings?.protagonistProfileId,
+            onSave = { draft ->
+                onSaveProtagonist(target.id, draft)
+                protagonistEditor = null
+                rpSheetVisible = true
+            },
+            onFork = { draft ->
+                val sourceId = checkNotNull(target.id)
+                pendingCreatedProtagonistIds = state.protagonistProfiles.map { it.id }.toSet()
+                onForkProtagonist(sourceId, draft)
+                protagonistEditor = null
+                rpSheetVisible = true
+            },
+            onDismiss = {
+                if (target.id == null) {
+                    pendingCreatedProtagonistIds = null
+                }
+                protagonistEditor = null
+                rpSheetVisible = true
             },
         )
     }
@@ -630,6 +679,44 @@ fun ChatScreen(
             },
             dismissButton = {
                 TextButton(onClick = { pendingDeleteWritingStyle = null }) {
+                    Text("取消")
+                }
+            },
+        )
+    }
+
+    pendingDeleteProtagonist?.let { profile ->
+        val count = state.protagonistProfileUsage[profile.id] ?: 0
+        AlertDialog(
+            onDismissRequest = { pendingDeleteProtagonist = null },
+            title = { Text("删除主角档案") },
+            text = {
+                Text(
+                    text = "确定删除「${profile.displayName()}」吗？" +
+                        if (count > 0) {
+                            "有 $count 个会话在用它，这些会话会解绑主角并清掉主角的状态数值；" +
+                                "角色卡的数值与历史消息保留。"
+                        } else {
+                            "目前没有会话在用它。"
+                        },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteProtagonist(profile.id)
+                        // 草稿若正选着它，保存时会被当成无效 id 静默解绑，界面上却哪一项都没选中。
+                        rpSettingsDraft = rpSettingsDraft?.let { draft ->
+                            if (draft.protagonistProfileId == profile.id) draft.copy(protagonistProfileId = null) else draft
+                        }
+                        pendingDeleteProtagonist = null
+                    },
+                ) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteProtagonist = null }) {
                     Text("取消")
                 }
             },
@@ -720,22 +807,12 @@ private data class MessageEditTarget(
     val initialContent: String,
 )
 
-/** 档案里除第一条「初始状态」外的词条数：RP 设置只编辑三项，其余照常发给模型但这里看不到。 */
-private fun ProtagonistProfile.hiddenEntryCountInRpSettings(): Int {
-    val shownInitialState = entries.indexOfFirst {
-        it is RpEntry.Text && it.name == ProtagonistProfile.INITIAL_STATE_ENTRY_NAME
-    }
-    return entries.size - if (shownInitialState >= 0) 1 else 0
-}
-
 private data class RpSettingsDraft(
     val isRpEnabled: Boolean,
     val roleCardId: String?,
     val worldSettingId: String?,
     val writingStyleId: String?,
-    val protagonistName: String,
-    val protagonistDescription: String,
-    val protagonistInitialState: String,
+    val protagonistProfileId: String?,
     val narrativeMinCharsText: String,
     val narrativePerspective: RpNarrativePerspective,
     val plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -747,10 +824,7 @@ private data class RpSettingsDraft(
             roleCardId = state.activeRpSettings?.roleCardId,
             worldSettingId = state.activeRpSettings?.worldSettingId,
             writingStyleId = state.activeRpSettings?.writingStyleId,
-            // RP-2d：主角输入框编辑的是绑定的档案，不再读 v9 的旧三列。
-            protagonistName = state.activeProtagonistProfile?.name.orEmpty(),
-            protagonistDescription = state.activeProtagonistProfile?.description.orEmpty(),
-            protagonistInitialState = state.activeProtagonistProfile?.initialStateText.orEmpty(),
+            protagonistProfileId = state.activeRpSettings?.protagonistProfileId,
             narrativeMinCharsText = state.activeRpSettings
                 ?.narrativeMinChars
                 ?.takeIf { it > 0 }
@@ -900,6 +974,38 @@ private data class RoleCardEditorTarget(
                 openingMessage = card.openingMessage,
                 boundaries = card.boundaries,
                 metricDefinitions = card.metricDefinitions,
+                // 不带上文本词条，保存时它们会被当成删掉（RP-3a 之前的缺陷）。
+                textEntries = card.textEntries,
+            ),
+        )
+    }
+}
+
+private data class ProtagonistEditorTarget(
+    val id: String?,
+    val draft: ProtagonistProfileDraft,
+) {
+    companion object {
+        /** 新档案预置一条空的「初始状态」文本词条：旧版 RP 设置里它是固定输入框，用户习惯从这里写起。 */
+        fun newProfile(): ProtagonistEditorTarget = ProtagonistEditorTarget(
+            id = null,
+            draft = ProtagonistProfileDraft(
+                name = "",
+                entries = listOf(
+                    RpEntry.Text(
+                        id = UUID.randomUUID().toString(),
+                        name = ProtagonistProfile.INITIAL_STATE_ENTRY_NAME,
+                    ),
+                ),
+            ),
+        )
+
+        fun fromExisting(profile: ProtagonistProfile): ProtagonistEditorTarget = ProtagonistEditorTarget(
+            id = profile.id,
+            draft = ProtagonistProfileDraft(
+                name = profile.name,
+                description = profile.description,
+                entries = profile.entries,
             ),
         )
     }

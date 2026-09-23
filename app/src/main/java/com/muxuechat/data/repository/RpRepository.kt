@@ -52,6 +52,23 @@ interface RpRepository {
     /** 删除档案等价于在所有绑定它的会话里解绑主角：只清主角组数值，角色组不动（§4）。 */
     suspend fun deleteProtagonistProfile(profileId: String)
 
+    /** 档案 id → 绑定它的会话数（含暂停 RP 的会话）；没有会话绑定的档案不在表里。 */
+    fun observeProtagonistProfileUsage(): Flow<Map<String, Int>>
+
+    /**
+     * 「另存为新档案，只给本会话用」（RP-3b）：用 [draft] 新建一份档案，并把本会话从
+     * [sourceProfileId] 改绑过去。源档案与其它会话都不动。
+     *
+     * 这**不是换主角**：草稿沿用源档案的词条 id，主角数值按 entryId 保留，
+     * 新增的条用初始值、删掉的条移除（与 [syncMetricDefinitionsFromProfiles] 同一规则）；角色组不动。
+     * 本会话当前没绑 [sourceProfileId] 时抛异常，避免把过期的编辑界面落到别的档案上。
+     */
+    suspend fun forkProtagonistProfileForConversation(
+        conversationId: String,
+        sourceProfileId: String,
+        draft: ProtagonistProfileDraft,
+    ): ProtagonistProfile
+
     fun observeSupportingCharacters(): Flow<List<SupportingCharacter>>
     suspend fun saveSupportingCharacter(id: String?, draft: SupportingCharacterDraft): SupportingCharacter
     suspend fun deleteSupportingCharacter(characterId: String)
@@ -92,11 +109,6 @@ interface RpRepository {
      * [writingStyleId]、[protagonistProfileId] 与 [roleCardId]、[worldSettingId] 一样是**必填**的：
      * null 表示解绑，不是「保持不变」。刻意不给默认值，
      * 逼每个调用点都想清楚要不要动这个绑定，避免默认值静默清空。
-     *
-     * [protagonistName]、[protagonistDescription]、[protagonistInitialState] 是 RP 设置里的
-     * 三个主角输入框（RP-2d 过渡方案）：它们改写 [protagonistProfileId] 指向的**档案本身**，
-     * 没绑档案且有内容时新建一条并绑定，改完什么都不剩时解绑；不再写 v9 的旧三列。
-     * 三个都为 null 表示不动主角档案。
      */
     suspend fun updateConversationRpSettings(
         conversationId: String,
@@ -105,9 +117,6 @@ interface RpRepository {
         worldSettingId: String?,
         writingStyleId: String?,
         protagonistProfileId: String?,
-        protagonistName: String? = null,
-        protagonistDescription: String? = null,
-        protagonistInitialState: String? = null,
         narrativeMinChars: Int? = null,
         narrativePerspective: RpNarrativePerspective? = null,
         plotSuggestionPerspective: RpPlotSuggestionPerspective? = null,

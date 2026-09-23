@@ -38,6 +38,7 @@ import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.ProtagonistProfile
+import com.muxuechat.domain.model.ProtagonistProfileDraft
 import com.muxuechat.domain.model.ProviderAuthKind
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
@@ -123,12 +124,13 @@ class ChatViewModel(
         if (conversationId == null) flowOf(null) else rpRepository.observeConversationRpSettings(conversationId)
     }
 
-    /** 当前会话设置连同它绑定的主角档案；档案被改名或删除时同样会推送。 */
+    /** 当前会话设置连同全部主角档案与共用数；档案被改名或删除时同样会推送。 */
     private val activeRpBinding = combine(
         activeRpSettings,
         rpRepository.observeProtagonistProfiles(),
-    ) { settings, profiles ->
-        settings to profiles.firstOrNull { it.id == settings?.protagonistProfileId }
+        rpRepository.observeProtagonistProfileUsage(),
+    ) { settings, profiles, usage ->
+        RpBindingSlice(settings = settings, protagonistProfiles = profiles, protagonistProfileUsage = usage)
     }
 
     private val activeRpStatusPanel = activeConversationId.flatMapLatest { conversationId ->
@@ -190,13 +192,14 @@ class ChatViewModel(
         rpRepository.observeWritingStyleProfiles(),
         activeRpBinding,
         activeRpStatusPanel,
-    ) { roleCards, worldSettings, writingStyles, (activeRpSettings, activeProtagonist), activeRpStatusPanel ->
+    ) { roleCards, worldSettings, writingStyles, binding, activeRpStatusPanel ->
         RpUiSlice(
             roleCards = roleCards,
             worldSettings = worldSettings,
             writingStyleProfiles = writingStyles,
-            activeRpSettings = activeRpSettings,
-            activeProtagonistProfile = activeProtagonist,
+            activeRpSettings = binding.settings,
+            protagonistProfiles = binding.protagonistProfiles,
+            protagonistProfileUsage = binding.protagonistProfileUsage,
             activeRpStatusPanel = activeRpStatusPanel,
         )
     }
@@ -228,7 +231,10 @@ class ChatViewModel(
             worldSettings = rp.worldSettings,
             activeRpSettings = rp.activeRpSettings,
             activeRoleCard = rp.roleCards.firstOrNull { it.id == rp.activeRpSettings?.roleCardId },
-            activeProtagonistProfile = rp.activeProtagonistProfile,
+            activeProtagonistProfile = rp.protagonistProfiles
+                .firstOrNull { it.id == rp.activeRpSettings?.protagonistProfileId },
+            protagonistProfiles = rp.protagonistProfiles,
+            protagonistProfileUsage = rp.protagonistProfileUsage,
             activeWorldSetting = rp.worldSettings.firstOrNull { it.id == rp.activeRpSettings?.worldSettingId },
             activeRpStatusPanel = rp.activeRpStatusPanel,
             writingStyleProfiles = rp.writingStyleProfiles,
@@ -820,6 +826,59 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * 保存主角档案（RP-3b）。编辑的正是当前会话绑定的那份时，视为对本会话的显式同步
+     * （与 [saveRoleCard] 同一规则）；其它绑定它的会话数值定义仍冻结（R6），文字部分实时跟随。
+     * 新建的档案不在这里绑定：RP 设置草稿会预选它，点保存才绑定。
+     */
+    fun saveProtagonistProfile(id: String?, draft: ProtagonistProfileDraft) {
+        viewModelScope.launch {
+            runCatching {
+                val saved = rpRepository.saveProtagonistProfile(id, draft)
+                val conversationId = activeConversationId.value
+                val editedBoundProfile = conversationId != null && id != null &&
+                    uiState.value.activeRpSettings?.protagonistProfileId == saved.id
+                if (editedBoundProfile) rpRepository.syncMetricDefinitionsFromProfiles(conversationId)
+                editedBoundProfile
+            }.onSuccess { synced ->
+                transient.update {
+                    it.copy(errorMessage = if (synced) "主角档案已保存，本会话已同步" else "主角档案已保存")
+                }
+            }.onFailure { error ->
+                Log.w(TAG, "Saving protagonist profile failed: ${error.message}", error)
+                transient.update { it.copy(errorMessage = "主角档案保存失败：${error.message ?: "未知错误"}") }
+            }
+        }
+    }
+
+    /** 「另存为新档案，只给本会话用」：源档案与其它会话不动，本会话主角数值按身份保留。 */
+    fun forkProtagonistProfile(sourceProfileId: String, draft: ProtagonistProfileDraft) {
+        val conversationId = activeConversationId.value ?: return
+        viewModelScope.launch {
+            runCatching {
+                rpRepository.forkProtagonistProfileForConversation(conversationId, sourceProfileId, draft)
+            }.onSuccess {
+                transient.update { it.copy(errorMessage = "已另存为新主角档案，只用于当前会话") }
+            }.onFailure { error ->
+                Log.w(TAG, "Forking protagonist profile failed: ${error.message}", error)
+                transient.update { it.copy(errorMessage = "另存主角档案失败：${error.message ?: "未知错误"}") }
+            }
+        }
+    }
+
+    fun deleteProtagonistProfile(profileId: String) {
+        viewModelScope.launch {
+            runCatching {
+                rpRepository.deleteProtagonistProfile(profileId)
+            }.onSuccess {
+                transient.update { it.copy(errorMessage = "主角档案已删除") }
+            }.onFailure { error ->
+                Log.w(TAG, "Deleting protagonist profile failed: ${error.message}", error)
+                transient.update { it.copy(errorMessage = "主角档案删除失败：${error.message ?: "未知错误"}") }
+            }
+        }
+    }
+
     fun saveWorldSetting(id: String?, draft: WorldSettingDraft) {
         viewModelScope.launch {
             runCatching {
@@ -851,30 +910,7 @@ class ChatViewModel(
         roleCardId: String?,
         worldSettingId: String?,
         writingStyleId: String?,
-    ) {
-        updateActiveConversationRpSettings(
-            isRpEnabled = isRpEnabled,
-            roleCardId = roleCardId,
-            worldSettingId = worldSettingId,
-            writingStyleId = writingStyleId,
-            protagonistName = null,
-            protagonistDescription = null,
-            protagonistInitialState = null,
-            narrativeMinChars = null,
-            narrativePerspective = null,
-            plotSuggestionPerspective = null,
-            rpMarkerMode = null,
-        )
-    }
-
-    fun updateActiveConversationRpSettings(
-        isRpEnabled: Boolean,
-        roleCardId: String?,
-        worldSettingId: String?,
-        writingStyleId: String?,
-        protagonistName: String?,
-        protagonistDescription: String?,
-        protagonistInitialState: String?,
+        protagonistProfileId: String?,
         narrativeMinChars: Int? = null,
         narrativePerspective: RpNarrativePerspective? = null,
         plotSuggestionPerspective: RpPlotSuggestionPerspective? = null,
@@ -898,13 +934,7 @@ class ChatViewModel(
                     roleCardId = roleCardId,
                     worldSettingId = worldSettingId,
                     writingStyleId = writingStyleId,
-                    // RP 设置界面还没有主角档案选择器（RP-3），先原样带回当前绑定。
-                    protagonistProfileId = uiState.value.activeRpSettings
-                        ?.takeIf { it.conversationId == conversationId }
-                        ?.protagonistProfileId,
-                    protagonistName = protagonistName,
-                    protagonistDescription = protagonistDescription,
-                    protagonistInitialState = protagonistInitialState,
+                    protagonistProfileId = protagonistProfileId,
                     narrativeMinChars = narrativeMinChars,
                     narrativePerspective = narrativePerspective,
                     plotSuggestionPerspective = plotSuggestionPerspective,
@@ -1202,8 +1232,15 @@ class ChatViewModel(
         val worldSettings: List<WorldSetting>,
         val writingStyleProfiles: List<WritingStyleProfile>,
         val activeRpSettings: ConversationRpSettings?,
-        val activeProtagonistProfile: ProtagonistProfile?,
+        val protagonistProfiles: List<ProtagonistProfile>,
+        val protagonistProfileUsage: Map<String, Int>,
         val activeRpStatusPanel: RpStatusPanel?,
+    )
+
+    private data class RpBindingSlice(
+        val settings: ConversationRpSettings?,
+        val protagonistProfiles: List<ProtagonistProfile>,
+        val protagonistProfileUsage: Map<String, Int>,
     )
 
     private data class ToolUiSlice(

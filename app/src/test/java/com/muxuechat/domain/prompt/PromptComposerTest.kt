@@ -701,6 +701,38 @@ class PromptComposerTest {
         assertEquals(2, Regex("(?m)^#### (?!.*状态条)").findAll(system).count())
     }
 
+    /** 角色卡文本词条（RP-3a）在开场白之后、边界之前；名字或内容为空的不输出。元数据补写也带上。 */
+    @Test
+    fun roleCardTextEntries_renderBeforeBoundariesAndInMetadata() {
+        val card = roleCard(texts = listOf("年龄" to "二十七", "备注" to " ", " " to "无名条"))
+        val system = composer.compose(
+            PromptContext(
+                settings = ChatSettings(),
+                rpSettings = rpSettings(),
+                roleCard = card,
+                worldSetting = null,
+                statusPanel = null,
+                history = listOf(PromptMessage(role = "user", content = "你好")),
+            ),
+        ).first().content
+
+        val section = system.indexOf("### 角色补充设定\n- 年龄: 二十七")
+        assertTrue(section > system.indexOf("### 开场白"))
+        assertTrue(section < system.indexOf("### 禁止事项与边界"))
+        assertFalse(system.contains("- 备注:"))
+        assertFalse(system.contains("无名条"))
+
+        val metadataUser = composer.composeRpMetadata(metadataContext().copy(roleCard = card)).last().content
+        assertTrue(metadataUser.contains("角色年龄：二十七"))
+        assertFalse(metadataUser.contains("无名条"))
+    }
+
+    /** 没有文本词条时不输出空的补充设定标题。 */
+    @Test
+    fun roleCardWithoutTextEntries_omitsSupplementSection() {
+        assertFalse(composeRp(rpSettings(), protagonistProfile = null).contains("### 角色补充设定"))
+    }
+
     /** 配角只进正文：元数据补写的两条消息里都没有配角；RP 关闭时也不出现。 */
     @Test
     fun supportingCharacters_stayOutOfMetadataAndPlainChat() {
@@ -789,6 +821,7 @@ class PromptComposerTest {
 
     private fun roleCard(
         metricDefinitions: List<RpMetricDefinition> = emptyList(),
+        texts: List<Pair<String, String>> = emptyList(),
     ) = RoleCard(
         id = "r1",
         name = "林澈",
@@ -798,7 +831,8 @@ class PromptComposerTest {
         userIdentity = "常客",
         openingMessage = "今天也来了？",
         boundaries = "不要跳出角色",
-        entries = metricDefinitions.map { it.toNumericEntry() },
+        entries = texts.mapIndexed { index, (entryName, value) -> RpEntry.Text("rt$index", entryName, value) } +
+            metricDefinitions.map { it.toNumericEntry() },
         createdAtMillis = 1L,
         updatedAtMillis = 1L,
     )

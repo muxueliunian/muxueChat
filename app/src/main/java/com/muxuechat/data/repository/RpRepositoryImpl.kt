@@ -33,6 +33,7 @@ import com.muxuechat.domain.model.WritingStyleProfileDraft
 import com.muxuechat.domain.model.toMetricDefinition
 import com.muxuechat.domain.rp.RpEffectiveDefinitions
 import com.muxuechat.domain.rp.RpEntryCodec
+import com.muxuechat.domain.rp.RpEntryRules
 import com.muxuechat.domain.rp.RpStateBlockFormat
 import com.muxuechat.domain.rp.RpStateMerger
 import kotlinx.coroutines.flow.Flow
@@ -212,6 +213,11 @@ class RpRepositoryImpl(
         }
     }
 
+    override fun observeProtagonistProfileUsage(): Flow<Map<String, Int>> =
+        chatDao.observeProtagonistProfileUsage().map { rows ->
+            rows.associate { it.profileId to it.conversationCount }
+        }
+
     // ---------- 配角 ----------
 
     override fun observeSupportingCharacters(): Flow<List<SupportingCharacter>> =
@@ -380,9 +386,6 @@ class RpRepositoryImpl(
         worldSettingId: String?,
         writingStyleId: String?,
         protagonistProfileId: String?,
-        protagonistName: String?,
-        protagonistDescription: String?,
-        protagonistInitialState: String?,
         narrativeMinChars: Int?,
         narrativePerspective: RpNarrativePerspective?,
         plotSuggestionPerspective: RpPlotSuggestionPerspective?,
@@ -395,14 +398,7 @@ class RpRepositoryImpl(
         val validRoleCardId = roleCardId?.takeIf { chatDao.getRoleCard(it) != null }
         val validWorldSettingId = worldSettingId?.takeIf { chatDao.getWorldSetting(it) != null }
         val validWritingStyleId = writingStyleId?.takeIf { chatDao.getWritingStyleProfile(it) != null }
-        val requestedProfileId = protagonistProfileId?.takeIf { chatDao.getProtagonistProfile(it) != null }
-        val editsProtagonist = protagonistName != null || protagonistDescription != null ||
-            protagonistInitialState != null
-        val validProtagonistProfileId = if (editsProtagonist) {
-            applyProtagonistTextEdit(requestedProfileId, protagonistName, protagonistDescription, protagonistInitialState)
-        } else {
-            requestedProfileId
-        }
+        val validProtagonistProfileId = protagonistProfileId?.takeIf { chatDao.getProtagonistProfile(it) != null }
         val nextEntity = ConversationRpSettingsEntity(
             conversationId = conversationId,
             isRpEnabled = isRpEnabled,
@@ -413,7 +409,7 @@ class RpRepositoryImpl(
             metricSnapshotJson = RpEntryCodec.encodeSnapshot(
                 nextMetricSnapshot(previousEntity, validRoleCardId, validProtagonistProfileId),
             ),
-            // v9 的主角三列已停用（RP-2d 起输入框改写档案），原样保留为取证材料。
+            // v9 的主角三列已停用（RP-2 起主角只读档案），原样保留为取证材料。
             protagonistName = previousSettings?.protagonistName.orEmpty(),
             protagonistDescription = previousSettings?.protagonistDescription.orEmpty(),
             protagonistInitialState = previousSettings?.protagonistInitialState.orEmpty(),
@@ -441,61 +437,46 @@ class RpRepositoryImpl(
         chatDao.touchConversation(conversationId, now)
     }
 
-    /**
-     * RP 设置里的主角三个输入框（RP-2d 过渡方案，RP-3 换成档案选择器）。
-     *
-     * 编辑的是**档案本身**：绑定同一档案的其他会话，文字部分会一起变；
-     * 数值定义有会话快照保护，不受影响（R6）。参数为 null 表示该项不改。
-     *
-     * - 已绑定：改名称、简介与「初始状态」词条，其它词条原样保留；内容没变时不写库。
-     *   改完后档案什么都不剩时，本会话解绑，档案本身保留（别的会话可能还在用）。
-     * - 未绑定：有内容就新建一条档案，由调用方在同一事务里绑定；全空则保持不绑。
-     *
-     * @return 本会话应绑定的档案 id，null 表示不绑。
-     */
-    private suspend fun applyProtagonistTextEdit(
-        profileId: String?,
-        name: String?,
-        description: String?,
-        initialState: String?,
-    ): String? {
-        val existing = profileId?.let { chatDao.getProtagonistProfile(it)?.toDomain() }
-        val nextName = name?.trim() ?: existing?.name.orEmpty()
-        val nextDescription = description?.trim() ?: existing?.description.orEmpty()
-        val nextEntries = withInitialState(existing?.entries.orEmpty(), initialState?.trim())
-        if (nextName.isBlank() && nextDescription.isBlank() && nextEntries.none { it.hasContent() }) {
-            return null
-        }
-        val draft = ProtagonistProfileDraft(name = nextName, description = nextDescription, entries = nextEntries)
-        if (existing == null) return saveProtagonistProfile(id = null, draft = draft).id
-        val unchanged = nextName == existing.name &&
-            nextDescription == existing.description &&
-            nextEntries == existing.entries
-        if (!unchanged) saveProtagonistProfile(id = existing.id, draft = draft)
-        return existing.id
-    }
-
-    /** 改写第一条「初始状态」文本词条：空值删掉它，没有就追加；null 表示不改。 */
-    private fun withInitialState(entries: List<RpEntry>, value: String?): List<RpEntry> {
-        if (value == null) return entries
-        val index = entries.indexOfFirst {
-            it is RpEntry.Text && it.name == ProtagonistProfile.INITIAL_STATE_ENTRY_NAME
-        }
-        return when {
-            index < 0 && value.isBlank() -> entries
-            index < 0 -> entries + RpEntry.Text(id = "", name = ProtagonistProfile.INITIAL_STATE_ENTRY_NAME, value = value)
-            value.isBlank() -> entries.filterIndexed { i, _ -> i != index }
-            else -> entries.mapIndexed { i, entry ->
-                if (i == index) (entry as RpEntry.Text).copy(value = value) else entry
-            }
-        }
-    }
-
     override suspend fun syncMetricDefinitionsFromProfiles(conversationId: String): Boolean =
         database.withTransaction {
             val previous = chatDao.getConversationRpSettings(conversationId) ?: return@withTransaction false
-            val oldSnapshot = previous.toDomain().metricSnapshot
-            var snapshot = oldSnapshot
+            resyncMetricGroups(previous, setOf(RpEntryOwner.ROLE_CARD, RpEntryOwner.PROTAGONIST))
+        }
+
+    override suspend fun forkProtagonistProfileForConversation(
+        conversationId: String,
+        sourceProfileId: String,
+        draft: ProtagonistProfileDraft,
+    ): ProtagonistProfile = database.withTransaction {
+        val previous = chatDao.getConversationRpSettings(conversationId)
+        require(previous != null && previous.protagonistProfileId == sourceProfileId) {
+            "本会话已不再使用这份主角档案，请重新打开编辑"
+        }
+        val forked = saveProtagonistProfile(id = null, draft = draft)
+        val rebound = previous.copy(protagonistProfileId = forked.id, updatedAtMillis = clock())
+        chatDao.upsertConversationRpSettings(rebound)
+        // 快照此刻仍是源档案的，按 entryId 对齐到新档案。这里刻意不走 applyBindingTransition：
+        // 那会把它当成换主角，把主角组数值重置为初始值（§4）。
+        if (!resyncMetricGroups(rebound, setOf(RpEntryOwner.PROTAGONIST))) {
+            chatDao.touchConversation(conversationId, clock())
+        }
+        forked
+    }
+
+    /**
+     * 把会话快照里 [owners] 这几组重新对齐到所绑档案的**最新**定义：按 entryId 保值（R14），
+     * 新条用初始值，删掉的条移除，面板与历史快照一起迁移。必须在事务内调用。
+     *
+     * @return 定义确实有变化并已写库时为 true；本来就一致时为 false，不写库。
+     */
+    private suspend fun resyncMetricGroups(
+        previous: ConversationRpSettingsEntity,
+        owners: Set<RpEntryOwner>,
+    ): Boolean {
+        val conversationId = previous.conversationId
+        val oldSnapshot = previous.toDomain().metricSnapshot
+        var snapshot = oldSnapshot
+        if (RpEntryOwner.ROLE_CARD in owners) {
             previous.roleCardId?.let { chatDao.getRoleCard(it)?.toDomain() }?.let { card ->
                 snapshot = RpEffectiveDefinitions.replaceGroup(
                     snapshot,
@@ -503,6 +484,8 @@ class RpRepositoryImpl(
                     RpEffectiveDefinitions.snapshotOf(RpEntryOwner.ROLE_CARD, card.entries),
                 )
             }
+        }
+        if (RpEntryOwner.PROTAGONIST in owners) {
             previous.protagonistProfileId?.let { chatDao.getProtagonistProfile(it)?.toDomain() }?.let { profile ->
                 snapshot = RpEffectiveDefinitions.replaceGroup(
                     snapshot,
@@ -510,23 +493,24 @@ class RpRepositoryImpl(
                     RpEffectiveDefinitions.snapshotOf(RpEntryOwner.PROTAGONIST, profile.entries),
                 )
             }
-            if (snapshot == oldSnapshot) return@withTransaction false
-
-            val now = clock()
-            // entryId → 旧 wireName：档案里改过名的条按身份找回原值，不因改名归零（R14）。
-            val previousNames = oldSnapshot.associate { it.entryId to it.wireName }
-            val definitions = RpEffectiveDefinitions.of(snapshot)
-            chatDao.upsertConversationRpSettings(
-                previous.copy(
-                    metricSnapshotJson = RpEntryCodec.encodeSnapshot(snapshot),
-                    updatedAtMillis = now,
-                ),
-            )
-            migrateStatusSnapshots(conversationId, definitions, previousNames, now)
-            alignStatusPanel(conversationId, definitions, previousNames, now)
-            chatDao.touchConversation(conversationId, now)
-            true
         }
+        if (snapshot == oldSnapshot) return false
+
+        val now = clock()
+        // entryId → 旧 wireName：档案里改过名的条按身份找回原值，不因改名归零（R14）。
+        val previousNames = oldSnapshot.associate { it.entryId to it.wireName }
+        val definitions = RpEffectiveDefinitions.of(snapshot)
+        chatDao.upsertConversationRpSettings(
+            previous.copy(
+                metricSnapshotJson = RpEntryCodec.encodeSnapshot(snapshot),
+                updatedAtMillis = now,
+            ),
+        )
+        migrateStatusSnapshots(conversationId, definitions, previousNames, now)
+        alignStatusPanel(conversationId, definitions, previousNames, now)
+        chatDao.touchConversation(conversationId, now)
+        return true
+    }
 
     /**
      * 绑定变化后该有的定义快照：**变了的组重拍、没变的组原样保留**。
@@ -725,7 +709,7 @@ class RpRepositoryImpl(
         val numericNames = mutableSetOf<String>()
         var numericCount = 0
         return entries.mapNotNull { entry ->
-            val name = entry.name.trim().replace(NEWLINE_REGEX, " ").take(MAX_NAME_LENGTH)
+            val name = RpEntryRules.normalizeName(entry.name)
             if (name.isBlank()) return@mapNotNull null
             val id = entry.id.ifBlank { UUID.randomUUID().toString() }
             when (entry) {
@@ -770,9 +754,9 @@ class RpRepositoryImpl(
     private fun Int?.orZero(): Int = this ?: 0
 
     private companion object {
-        const val MAX_NAME_LENGTH = 80
+        const val MAX_NAME_LENGTH = RpEntryRules.MAX_NAME_LENGTH
         const val MAX_NARRATIVE_MIN_CHARS = 5000
-        const val MAX_METRIC_DEFINITIONS = 12
+        const val MAX_METRIC_DEFINITIONS = RpEntryRules.MAX_NUMERIC_ENTRIES
         val NEWLINE_REGEX = Regex("[\\r\\n]+")
         val repositoryJson = Json { ignoreUnknownKeys = true }
     }

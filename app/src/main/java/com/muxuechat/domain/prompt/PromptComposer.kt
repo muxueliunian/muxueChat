@@ -371,6 +371,13 @@ class PromptComposer {
             appendSection("说话风格", roleCard.speakingStyle)
             appendSection("用户身份", roleCard.userIdentity)
             appendSection("开场白", roleCard.openingMessage)
+            // 文本词条（RP-3a）：静态补充设定，放在边界之前，让边界仍是角色卡的最后一段。
+            val cardEntries = roleCard.textEntries.filter { it.name.isNotBlank() && it.value.isNotBlank() }
+            if (cardEntries.isNotEmpty()) {
+                appendLine()
+                appendLine("### 角色补充设定")
+                cardEntries.forEach { entry -> appendProfileLine(entry.name, entry.value) }
+            }
             appendSection("禁止事项与边界", roleCard.boundaries)
         }
 
@@ -467,6 +474,11 @@ class PromptComposer {
         appendLine("角色名称：${context.roleCard.name}")
         appendLine("角色简介：${context.roleCard.description.take(METADATA_CONTEXT_LIMIT)}")
         appendLine("角色人设：${context.roleCard.persona.take(METADATA_CONTEXT_LIMIT)}")
+        context.roleCard.textEntries
+            .filter { it.name.isNotBlank() && it.value.isNotBlank() }
+            .forEach { entry ->
+                appendLine("角色${entry.name.trim()}：${entry.value.trim().take(METADATA_CONTEXT_LIMIT)}")
+            }
         if (context.roleCard.userIdentity.isNotBlank()) {
             appendLine("角色眼中的玩家身份：${context.roleCard.userIdentity.take(METADATA_CONTEXT_LIMIT)}")
             appendLine("注意：这只是角色对玩家的称呼/关系参考，不要把剧情推进建议误写成固定玩家台词。")

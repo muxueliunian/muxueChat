@@ -172,7 +172,7 @@ class ChatDaoIntegrityTest {
     }
 
     @Test
-    /** 与数值无关的设置（这里是主角名）不影响历史快照；旧实现会在任何设置改动时全部清空。 */
+    /** 与数值无关的设置（这里是正文最低字数）不影响历史快照；旧实现会在任何设置改动时全部清空。 */
     fun rpSettingsUnrelatedChange_keepsHistoryStatusSnapshot() = runBlocking {
         val conversation = conversation("conversation-a")
         val roleCard = roleCard("role-a")
@@ -198,10 +198,7 @@ class ChatDaoIntegrityTest {
             worldSettingId = null,
             writingStyleId = null,
             protagonistProfileId = null,
-            protagonistName = "同毫秒修改后的主角",
-            protagonistDescription = null,
-            protagonistInitialState = null,
-            narrativeMinChars = null,
+            narrativeMinChars = 300,
             narrativePerspective = null,
             plotSuggestionPerspective = null,
             rpMarkerMode = null,

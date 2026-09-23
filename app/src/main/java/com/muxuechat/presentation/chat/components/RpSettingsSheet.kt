@@ -52,6 +52,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RpMarkerMode
 import com.muxuechat.domain.model.RpNarrativePerspective
@@ -76,13 +77,7 @@ fun RpSettingsSheet(
     initialRoleCardId: String?,
     initialWorldSettingId: String?,
     initialWritingStyleId: String?,
-    initialProtagonistName: String,
-    initialProtagonistDescription: String,
-    initialProtagonistInitialState: String,
-    /** 会话是否绑了主角档案：决定输入框下方的说明（改档案会影响共用它的会话 / 保存时新建档案）。 */
-    isProtagonistProfileBound: Boolean,
-    /** 档案里没在这里显示的词条数，仍会照常发给模型。 */
-    protagonistHiddenEntryCount: Int,
+    initialProtagonistProfileId: String?,
     initialNarrativeMinChars: Int,
     initialNarrativePerspective: RpNarrativePerspective,
     initialPlotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -91,9 +86,7 @@ fun RpSettingsSheet(
     draftRoleCardId: String?,
     draftWorldSettingId: String?,
     draftWritingStyleId: String?,
-    draftProtagonistName: String,
-    draftProtagonistDescription: String,
-    draftProtagonistInitialState: String,
+    draftProtagonistProfileId: String?,
     draftNarrativeMinCharsText: String,
     draftNarrativePerspective: RpNarrativePerspective,
     draftPlotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -104,13 +97,14 @@ fun RpSettingsSheet(
     roleCards: List<RoleCard>,
     worldSettings: List<WorldSetting>,
     writingStyles: List<WritingStyleProfile>,
+    protagonistProfiles: List<ProtagonistProfile>,
+    /** 档案 id → 绑定它的会话数。 */
+    protagonistProfileUsage: Map<String, Int>,
     onDraftRpEnabledChange: (Boolean) -> Unit,
     onDraftRoleCardIdChange: (String?) -> Unit,
     onDraftWorldSettingIdChange: (String?) -> Unit,
     onDraftWritingStyleIdChange: (String?) -> Unit,
-    onDraftProtagonistNameChange: (String) -> Unit,
-    onDraftProtagonistDescriptionChange: (String) -> Unit,
-    onDraftProtagonistInitialStateChange: (String) -> Unit,
+    onDraftProtagonistProfileIdChange: (String?) -> Unit,
     onDraftNarrativeMinCharsTextChange: (String) -> Unit,
     onDraftNarrativePerspectiveChange: (RpNarrativePerspective) -> Unit,
     onDraftPlotSuggestionPerspectiveChange: (RpPlotSuggestionPerspective) -> Unit,
@@ -120,10 +114,7 @@ fun RpSettingsSheet(
         roleCardId: String?,
         worldSettingId: String?,
         writingStyleId: String?,
-        // 没改过的主角项传 null，保存时不覆盖档案里的现值。
-        protagonistName: String?,
-        protagonistDescription: String?,
-        protagonistInitialState: String?,
+        protagonistProfileId: String?,
         narrativeMinChars: Int,
         narrativePerspective: RpNarrativePerspective,
         plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -132,6 +123,9 @@ fun RpSettingsSheet(
     onCreateRoleCard: () -> Unit,
     onEditRoleCard: (RoleCard) -> Unit,
     onDeleteRoleCard: (RoleCard) -> Unit,
+    onCreateProtagonist: () -> Unit,
+    onEditProtagonist: (ProtagonistProfile) -> Unit,
+    onDeleteProtagonist: (ProtagonistProfile) -> Unit,
     onCreateWorldSetting: () -> Unit,
     onEditWorldSetting: (WorldSetting) -> Unit,
     onDeleteWorldSetting: (WorldSetting) -> Unit,
@@ -150,9 +144,7 @@ fun RpSettingsSheet(
         draftRoleCardId != initialRoleCardId ||
         draftWorldSettingId != initialWorldSettingId ||
         draftWritingStyleId != initialWritingStyleId ||
-        draftProtagonistName != initialProtagonistName ||
-        draftProtagonistDescription != initialProtagonistDescription ||
-        draftProtagonistInitialState != initialProtagonistInitialState ||
+        draftProtagonistProfileId != initialProtagonistProfileId ||
         draftNarrativeMinCharsText.toNarrativeMinChars() != initialNarrativeMinChars ||
         draftNarrativePerspective != initialNarrativePerspective ||
         draftPlotSuggestionPerspective != initialPlotSuggestionPerspective ||
@@ -171,9 +163,7 @@ fun RpSettingsSheet(
                         draftRoleCardId,
                         draftWorldSettingId,
                         draftWritingStyleId,
-                        draftProtagonistName.takeIf { it != initialProtagonistName },
-                        draftProtagonistDescription.takeIf { it != initialProtagonistDescription },
-                        draftProtagonistInitialState.takeIf { it != initialProtagonistInitialState },
+                        draftProtagonistProfileId,
                         draftNarrativeMinCharsText.toNarrativeMinChars(),
                         draftNarrativePerspective,
                         draftPlotSuggestionPerspective,
@@ -210,14 +200,14 @@ fun RpSettingsSheet(
                 title = "主角档案",
             )
             ProtagonistProfileSection(
-                name = draftProtagonistName,
-                description = draftProtagonistDescription,
-                initialState = draftProtagonistInitialState,
-                isProfileBound = isProtagonistProfileBound,
-                hiddenEntryCount = protagonistHiddenEntryCount,
-                onNameChange = onDraftProtagonistNameChange,
-                onDescriptionChange = onDraftProtagonistDescriptionChange,
-                onInitialStateChange = onDraftProtagonistInitialStateChange,
+                profiles = protagonistProfiles,
+                usage = protagonistProfileUsage,
+                selectedId = draftProtagonistProfileId,
+                isRpEnabled = draftRpEnabled,
+                onSelect = onDraftProtagonistProfileIdChange,
+                onCreate = onCreateProtagonist,
+                onEdit = onEditProtagonist,
+                onDelete = onDeleteProtagonist,
             )
 
             SectionTitle(
@@ -326,7 +316,7 @@ private fun SheetHeader() {
             color = MaterialTheme.colorScheme.onSurface,
         )
         Text(
-            text = "为当前会话绑定角色卡与世界观。点击保存后应用到当前会话，下一次发送消息时生效。",
+            text = "为当前会话绑定角色卡、主角与世界观。点击保存后应用到当前会话，下一次发送消息时生效。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp),
@@ -558,67 +548,66 @@ private fun WritingStyleSection(
 
 @Composable
 private fun ProtagonistProfileSection(
-    name: String,
-    description: String,
-    initialState: String,
-    isProfileBound: Boolean,
-    hiddenEntryCount: Int,
-    onNameChange: (String) -> Unit,
-    onDescriptionChange: (String) -> Unit,
-    onInitialStateChange: (String) -> Unit,
+    profiles: List<ProtagonistProfile>,
+    usage: Map<String, Int>,
+    selectedId: String?,
+    isRpEnabled: Boolean,
+    onSelect: (String?) -> Unit,
+    onCreate: () -> Unit,
+    onEdit: (ProtagonistProfile) -> Unit,
+    onDelete: (ProtagonistProfile) -> Unit,
 ) {
     Column(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
-            text = "描述玩家控制的主角。主角档案会写入 RP prompt，并作为剧情推进建议的重要参考。名称留空表示玩家本人。",
+            text = "玩家控制的主角，会写入 RP prompt，并作为剧情推进建议的依据。不绑定时视为玩家本人。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        OutlinedTextField(
-            value = name,
-            onValueChange = onNameChange,
-            label = { Text("主角名称") },
-            placeholder = { Text("例如：牧雪") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+        NoneOption(
+            label = "不绑定主角",
+            selected = selectedId == null,
+            enabled = isRpEnabled,
+            onSelect = { onSelect(null) },
         )
-        OutlinedTextField(
-            value = description,
-            onValueChange = onDescriptionChange,
-            label = { Text("主角简介") },
-            placeholder = { Text("玩家控制的主角是谁，和角色是什么关系") },
-            minLines = 2,
-            maxLines = 5,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = initialState,
-            onValueChange = onInitialStateChange,
-            label = { Text("初始状态") },
-            placeholder = { Text("当前处境、情绪、目标、随身物品或能力") },
-            minLines = 2,
-            maxLines = 5,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        // 过渡方案（RP-2d）：档案可被多个会话共用，改这里等于改档案本身，必须说清楚影响范围。
-        Text(
-            text = if (isProfileBound) {
-                buildString {
-                    append("这里改的是本会话绑定的主角档案。其他会话若绑定了同一个档案，")
-                    append("它们的主角名称、简介和初始状态也会一起改变；状态数值不受影响。")
-                    if (hiddenEntryCount > 0) {
-                        append("该档案另有 $hiddenEntryCount 条词条未在此显示，仍会照常生效。")
-                    } else {
-                        append("三项全部清空并保存后，本会话不再使用该档案，档案本身保留。")
+        profiles.forEach { profile ->
+            val displayName = profile.displayName()
+            val count = usage[profile.id] ?: 0
+            SelectableRow(
+                selected = profile.id == selectedId,
+                enabled = isRpEnabled,
+                onSelect = { onSelect(profile.id) },
+                title = displayName,
+                subtitle = listOfNotNull(
+                    "$count 个会话在用".takeIf { count > 0 },
+                    profile.description.ifBlank { null },
+                ).joinToString(" · ").ifBlank { null },
+                actions = {
+                    IconButton(
+                        onClick = { onEdit(profile) },
+                        modifier = Modifier.size(44.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.EditNote,
+                            contentDescription = "编辑主角「$displayName」",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
-                }
-            } else {
-                "填写后保存，会为本会话新建一个主角档案。"
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+                    IconButton(
+                        onClick = { onDelete(profile) },
+                        modifier = Modifier.size(44.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = "删除主角「$displayName」",
+                            tint = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                },
+            )
+        }
+        CreateButton(text = "新建主角", onClick = onCreate)
     }
 }
 

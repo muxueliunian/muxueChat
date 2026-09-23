@@ -39,6 +39,12 @@ enum class RpStateCommitResult {
     CONFIGURATION_CHANGED,
 }
 
+/** 一份主角档案被多少个会话绑定（RP-3b 档案列表的「N 个会话在用」）。 */
+data class ProtagonistProfileUsageRow(
+    val profileId: String,
+    val conversationCount: Int,
+)
+
 @Dao
 interface ChatDao {
     @Query("SELECT * FROM conversations ORDER BY updatedAtMillis DESC")
@@ -276,6 +282,17 @@ interface ChatDao {
 
     @Query("SELECT * FROM conversation_rp_settings WHERE protagonistProfileId = :profileId")
     suspend fun getConversationRpSettingsByProtagonist(profileId: String): List<ConversationRpSettingsEntity>
+
+    /** 暂停 RP 的会话也算：绑定还在，恢复后照样用这份档案。 */
+    @Query(
+        """
+        SELECT protagonistProfileId AS profileId, COUNT(*) AS conversationCount
+        FROM conversation_rp_settings
+        WHERE protagonistProfileId IS NOT NULL
+        GROUP BY protagonistProfileId
+        """,
+    )
+    fun observeProtagonistProfileUsage(): Flow<List<ProtagonistProfileUsageRow>>
 
     // ---------- 配角 ----------
 
