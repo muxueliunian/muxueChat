@@ -1097,7 +1097,8 @@ fun RpAuxiliaryModelSection(
     }.filter {
         // 已经选中的那个不用再列一遍；正文模型在跟随模式下选它等于不覆盖。
         it.isNotBlank() &&
-            it != settings.rpAuxiliaryModel.trim() &&
+            // 只排除「正在生效」的那个；旧版留下的无归属值不生效，必须还能被一键重新选上。
+            it != settings.rpAuxiliaryModelOverride &&
             (settings.rpAuxiliaryDivertsToDeepSeek || it != settings.activeModel)
     }
 
