@@ -48,6 +48,8 @@ import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.CustomProvider
+import com.muxuechat.domain.model.DeepSeekModels
+import com.muxuechat.domain.model.RpAuxiliaryProvider
 import com.muxuechat.presentation.common.ModelListWindow
 import com.muxuechat.presentation.common.components.MetaLine
 import com.muxuechat.presentation.common.components.ModelSearchField
@@ -1070,10 +1072,10 @@ private fun unusedRefreshLabelReference() = describeRefreshAction(false, false)
  *
  * RP 每轮正文之外还会再发一次请求，用来补写内心独白、剧情推进建议和状态块。
  * 那次请求只要求稳定的 JSON，不需要正文那档推理能力，却默认和正文用同一个模型，
- * 于是每轮都按贵模型的价格付了一次结构化输出的钱。这里允许单独指定一个便宜模型。
+ * 于是每轮都按贵模型的价格付了一次结构化输出的钱。这里允许单独指定供应商和模型：
+ * 正文用 Vertex 这类按量计费的大模型时，可以让辅助请求固定走 DeepSeek 的 Flash。
  *
- * 只覆盖模型名，不切换 Provider：Base URL 和 API Key 仍是当前供应商的，
- * 所以填的必须是当前供应商下可用的模型。
+ * 模型名只在它所属的供应商下有意义：保存时会记下归属，供应商对不上就当作没填。
  */
 @Composable
 fun RpAuxiliaryModelSection(
@@ -1084,22 +1086,45 @@ fun RpAuxiliaryModelSection(
     DebouncedTextSetting(
         fieldValue = fieldValue,
         persistedValue = settings.rpAuxiliaryModel,
-        onCommit = { value -> onChange { it.copy(rpAuxiliaryModel = value) } },
+        onCommit = { value -> onChange { it.withRpAuxiliaryModel(value) } },
     )
 
-    val candidates = if (settings.isCustomProvider) {
-        settings.activeCustomProvider?.models.orEmpty()
-    } else {
+    val targetsDeepSeek = settings.rpAuxiliaryTargetKey == ChatProviderId.DEEPSEEK.storageValue
+    val candidates = if (targetsDeepSeek) {
         settings.deepSeekModelDirectory.visibleModelIds
+    } else {
+        settings.activeCustomProvider?.models.orEmpty()
     }.filter {
-        // 正文模型不用列（选它等于不覆盖），已经选中的那个也不用再列一遍。
-        it.isNotBlank() && it != settings.activeModel && it != settings.rpAuxiliaryModel.trim()
+        // 已经选中的那个不用再列一遍；正文模型在跟随模式下选它等于不覆盖。
+        it.isNotBlank() &&
+            it != settings.rpAuxiliaryModel.trim() &&
+            (settings.rpAuxiliaryDivertsToDeepSeek || it != settings.activeModel)
     }
 
     SettingsSection(
-        title = "RP 辅助请求模型",
-        description = "留空则跟随正文模型。改动只影响 RP 的元数据补写与状态兜底，正文始终用你选定的主模型。",
+        title = "RP 辅助请求",
+        description = "只影响 RP 的剧情推进建议、元数据补写与状态兜底，正文始终用你选定的主模型。",
     ) {
+        RpAuxiliaryProviderChoices(settings = settings, onChange = onChange)
+        if (settings.rpAuxiliaryDivertsToDeepSeek) {
+            MetaLine(
+                text = "改道后，这些请求会把最近一轮对话、角色卡与状态定义发给 DeepSeek，" +
+                    "使用你保存的 DeepSeek API Key，费用记在 DeepSeek 账户。",
+            )
+            val directory = settings.deepSeekModelDirectory
+            if (directory.isFromServerCache && DeepSeekModels.FLASH !in directory.cachedModelIds) {
+                MetaLine(
+                    text = "提示：最近一次获取的 DeepSeek 模型列表里没有「${DeepSeekModels.FLASH}」，" +
+                        "请求可能被拒绝；可在下方手动指定可用的模型。",
+                )
+            }
+        }
+        if (settings.rpAuxiliaryModelIsStale) {
+            MetaLine(
+                text = "已保存的辅助模型「${settings.rpAuxiliaryModel}」属于其他供应商，" +
+                    "当前不会使用，已自动改用默认模型。可在下方重新选择。",
+            )
+        }
         Column(
             modifier = Modifier.padding(vertical = Spacing.Small),
             verticalArrangement = Arrangement.spacedBy(Spacing.Small),
@@ -1108,16 +1133,10 @@ fun RpAuxiliaryModelSection(
                 value = fieldValue.value,
                 onValueChange = { new -> fieldValue.value = new },
                 singleLine = true,
-                placeholder = { Text("留空 = 跟随正文模型") },
+                placeholder = { Text("留空 = ${rpAuxiliaryDefaultLabel(settings)}") },
                 label = { Text("模型名") },
                 supportingText = {
-                    Text(
-                        if (settings.rpAuxiliaryModel.isBlank()) {
-                            "当前：跟随正文模型（${settings.activeModel.ifBlank { "未选择" }}）"
-                        } else {
-                            "当前：${settings.effectiveRpAuxiliaryModel}"
-                        },
-                    )
+                    Text("当前实际使用：${settings.effectiveRpAuxiliaryModel.ifBlank { "未选择" }}")
                 },
                 modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
                 shape = Corner.Control,
@@ -1126,7 +1145,7 @@ fun RpAuxiliaryModelSection(
             // 手打模型名很容易拼错，而拼错要等到下一轮 RP 补写失败才会发现。
             // 这里把当前供应商已知的模型直接列出来，点一下就填上。
             if (candidates.isNotEmpty()) {
-                MetaLine(text = "当前供应商的其他可用模型：")
+                MetaLine(text = if (targetsDeepSeek) "DeepSeek 的可用模型：" else "当前供应商的其他可用模型：")
                 candidates.take(6).forEach { modelId ->
                     OutlinedButton(
                         onClick = {
@@ -1134,7 +1153,7 @@ fun RpAuxiliaryModelSection(
                                 text = modelId,
                                 selection = TextRange(modelId.length),
                             )
-                            onChange { it.copy(rpAuxiliaryModel = modelId) }
+                            onChange { it.withRpAuxiliaryModel(modelId) }
                         },
                         modifier = Modifier.fillMaxWidth().heightIn(min = MinTouchTarget),
                     ) {
@@ -1146,13 +1165,61 @@ fun RpAuxiliaryModelSection(
                 OutlinedButton(
                     onClick = {
                         fieldValue.value = TextFieldValue(text = "", selection = TextRange(0))
-                        onChange { it.copy(rpAuxiliaryModel = "") }
+                        onChange { it.withRpAuxiliaryModel("") }
                     },
                     modifier = Modifier.fillMaxWidth().heightIn(min = MinTouchTarget),
                 ) {
-                    Text("恢复为跟随正文模型")
+                    Text("恢复默认（${rpAuxiliaryDefaultLabel(settings)}）")
                 }
             }
         }
     }
+}
+
+/** 供应商二选一：状态靠文字与对勾表达，不只靠颜色。 */
+@Composable
+private fun RpAuxiliaryProviderChoices(
+    settings: ChatSettings,
+    onChange: (SettingsMutation) -> Unit,
+) {
+    val deepSeekActive = settings.provider == ChatProviderId.DEEPSEEK
+    Column(
+        modifier = Modifier.padding(vertical = Spacing.Small),
+        verticalArrangement = Arrangement.spacedBy(Spacing.Small),
+    ) {
+        listOf(
+            RpAuxiliaryProvider.FOLLOW_ACTIVE to "跟随正文供应商（${settings.activeProviderLabel}）",
+            RpAuxiliaryProvider.DEEPSEEK to "固定走 DeepSeek（更便宜，需已保存 DeepSeek API Key）",
+        ).forEach { (choice, label) ->
+            val selected = settings.rpAuxiliaryProvider == choice
+            OutlinedButton(
+                onClick = { onChange { it.copy(rpAuxiliaryProvider = choice) } },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = MinTouchTarget)
+                    .semantics { this.selected = selected },
+            ) {
+                if (selected) {
+                    Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                }
+                Text(
+                    text = if (selected) "已选 · $label" else label,
+                    modifier = Modifier.padding(start = if (selected) Spacing.Small else 0.dp),
+                )
+            }
+        }
+        if (deepSeekActive) {
+            MetaLine(text = "当前正文本来就是 DeepSeek，这个选项暂时没有区别。")
+        }
+    }
+}
+
+/** 没有单独指定模型时辅助请求用什么，给文案和占位用。 */
+private fun rpAuxiliaryDefaultLabel(settings: ChatSettings): String =
+    if (settings.rpAuxiliaryDivertsToDeepSeek) DeepSeekModels.FLASH else "跟随正文模型"
+
+/** 设置分组折叠时的摘要。 */
+fun rpAuxiliarySummary(settings: ChatSettings): String {
+    val where = if (settings.rpAuxiliaryDivertsToDeepSeek) "DeepSeek" else settings.activeProviderLabel
+    return "$where · ${settings.effectiveRpAuxiliaryModel.ifBlank { "未选择" }}"
 }

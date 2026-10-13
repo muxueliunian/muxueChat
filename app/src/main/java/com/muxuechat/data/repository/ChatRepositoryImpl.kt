@@ -186,7 +186,46 @@ class ChatRepositoryImpl(
         val hasLocalPanel: Boolean,
         val expectedRpState: Boolean,
         val requestSnapshot: ProviderRequestSnapshot,
+        /** 已解析好的辅助请求目标；为 null 时按 [requestSnapshot] 现解析。 */
+        val auxiliary: RpAuxiliaryTarget? = null,
     )
+
+    /**
+     * RP 辅助请求的实际目标：用哪个供应商快照发、用哪个模型名。
+     *
+     * 与正文快照分开表达，是因为辅助请求可以改道到 DeepSeek（[ChatSettings.rpAuxiliaryDivertsToDeepSeek]）：
+     * 此时 Base URL、凭据都必须是 DeepSeek 的，绝不能沿用正文（例如 Vertex）的那一份。
+     */
+    private class RpAuxiliaryTarget(val snapshot: ProviderRequestSnapshot, val model: String)
+
+    /** 改道到 DeepSeek 的目标：DeepSeek 的地址 + DeepSeek 的 Key，凭据只在这次请求的内存里。 */
+    private suspend fun deepSeekAuxiliaryTarget(settings: ChatSettings): RpAuxiliaryTarget {
+        val apiKey = settingsRepository.getApiKey()
+            ?: throw DeepSeekAuxiliaryKeyMissingException()
+        // 只借用设置里的 DeepSeek 字段（地址、模型目录）；provider 改成 DeepSeek，RP 请求不带思考与工具。
+        val deepSeekSettings = settings.normalized().copy(provider = ChatProviderId.DEEPSEEK)
+        val model = settings.normalized().effectiveRpAuxiliaryModel
+        return RpAuxiliaryTarget(
+            snapshot = ProviderRequestSnapshot(
+                provider = ChatProviderId.DEEPSEEK,
+                settings = deepSeekSettings,
+                credential = ProviderCredential.ApiKey(apiKey),
+                baseUrl = deepSeekSettings.baseUrl,
+                model = model,
+            ),
+            model = model,
+        )
+    }
+
+    private suspend fun rpAuxiliaryTarget(input: RpEnrichmentInput): RpAuxiliaryTarget {
+        input.auxiliary?.let { return it }
+        val main = input.requestSnapshot
+        return if (main.settings.rpAuxiliaryDivertsToDeepSeek) {
+            deepSeekAuxiliaryTarget(main.settings)
+        } else {
+            RpAuxiliaryTarget(main, main.settings.normalized().effectiveRpAuxiliaryModel)
+        }
+    }
 
     override fun observeEnrichingMessageIds(): Flow<Set<String>> = enrichmentTasks.enrichingMessageIds
 
@@ -404,7 +443,15 @@ class ChatRepositoryImpl(
         val lastConversationMessage = messages.lastOrNull { it.role == ChatRole.USER || it.role == ChatRole.ASSISTANT }
         require(lastConversationMessage?.id == lastAssistant.id) { "只能重试最新回复的剧情推进建议" }
 
-        val requestSnapshot = freezeProviderRequest()
+        // 辅助请求改道到 DeepSeek 时，重试建议与正文所用供应商无关：不能再为正文冻结一次请求，
+        // 否则正文是 Vertex 的话会白白去向 Play 服务索取 Google token，登录失效还会把重试一并拦住。
+        val currentSettings = settingsRepository.currentSettings().normalized()
+        val divertedTarget = if (currentSettings.rpAuxiliaryDivertsToDeepSeek) {
+            deepSeekAuxiliaryTarget(currentSettings)
+        } else {
+            null
+        }
+        val requestSnapshot = divertedTarget?.snapshot ?: freezeProviderRequest()
         val turn = captureRpTurnSnapshot(conversationId, lastAssistant.id)
         require(turn.roleCard != null) { "当前会话未启用可用的 RP 角色卡" }
         val input = RpEnrichmentInput(
@@ -414,6 +461,7 @@ class ChatRepositoryImpl(
             hasLocalPanel = true,
             expectedRpState = turn.definitions.isNotEmpty(),
             requestSnapshot = requestSnapshot,
+            auxiliary = divertedTarget,
         )
         val retryJob = currentCoroutineContext()[Job]
             ?: error("RP retry flow must run in a coroutine Job")
@@ -2308,9 +2356,17 @@ class ChatRepositoryImpl(
         requireOptions: Boolean,
     ): RpMessageMetadata? {
         check(isEnrichmentTaskCurrent(task)) { "补写任务已失效" }
-        val metadata = requestRpMessageMetadata(input)
+        var failureReason: String? = null
+        val metadata = requestRpMessageMetadata(
+            input,
+            failureSink = if (requireOptions) { reason -> failureReason = reason } else null,
+        )
         if (requireOptions) {
-            require(metadata != null && metadata.options.isNotEmpty()) { "未能生成有效剧情推进建议" }
+            // 请求本身失败时把原因带给用户（例如「模型不存在」「余额不足」），
+            // 而不是一律说「未能生成有效建议」，让人无从下手。
+            require(metadata != null && metadata.options.isNotEmpty()) {
+                failureReason?.let { "剧情推进建议生成失败：$it" } ?: "未能生成有效剧情推进建议"
+            }
         }
         val conversationId = input.expectedMessage.conversationId
         // 元数据里的状态整块对不上时，同样当作没给状态，继续走兜底请求。
@@ -2487,11 +2543,13 @@ class ChatRepositoryImpl(
         )
     }
 
-    private suspend fun requestRpMessageMetadata(input: RpEnrichmentInput): RpMessageMetadataDraft? {
+    private suspend fun requestRpMessageMetadata(
+        input: RpEnrichmentInput,
+        /** 重试建议时用来拿到失败原因（已转成用户可读文案）；自动补写传 null，只记日志。 */
+        failureSink: ((String) -> Unit)? = null,
+    ): RpMessageMetadataDraft? {
         val conversationId = input.expectedMessage.conversationId
         val assistantContent = input.expectedMessage.content
-        val requestSnapshot = input.requestSnapshot
-        val settings = requestSnapshot.settings
         val roleCard = input.turn.roleCard ?: return null
 
         val promptMessages = promptComposer.composeRpMetadata(
@@ -2506,10 +2564,13 @@ class ChatRepositoryImpl(
             ),
         )
 
-        // 用户可以给 RP 辅助请求单独指定一个便宜模型；留空时保持与正文一致。
-        val auxiliaryModelOverride = settings.rpAuxiliaryModel.trim()
-
+        var routeProvider = input.requestSnapshot.provider
         return runCatching {
+            // 目标可能改道到 DeepSeek（缺 Key 时在这里失败，走下面统一的失败路径）。
+            val target = rpAuxiliaryTarget(input)
+            val requestSnapshot = target.snapshot
+            val settings = requestSnapshot.settings
+            routeProvider = requestSnapshot.provider
             val content = when (requestSnapshot.provider) {
                 ChatProviderId.DEEPSEEK -> {
                     val request = DeepSeekRequestFactory.build(
@@ -2518,9 +2579,7 @@ class ChatRepositoryImpl(
                             DeepSeekMessageDto(role = message.role, content = message.content)
                         },
                         purpose = DeepSeekRequestFactory.Purpose.RP_METADATA,
-                        // 传原始覆盖值而不是 effectiveRpAuxiliaryModel：留空时让工厂回落到
-                        // 它自己归一化过的 model，避免绕过 normalizeSelectedId。
-                        modelOverride = auxiliaryModelOverride,
+                        modelOverride = target.model,
                     )
                     apiClient.completeChat(
                         requestSnapshot.requireApiKey(),
@@ -2532,8 +2591,7 @@ class ChatRepositoryImpl(
                 ChatProviderId.CUSTOM_OPENAI -> {
                     val request = OpenAiCompatibleRequestFactory.build(
                         settings = settings,
-                        // 留空时回落到本次请求快照里的模型，保持与覆盖前完全一致的行为。
-                        model = auxiliaryModelOverride.ifBlank { requestSnapshot.model },
+                        model = target.model,
                         messages = promptMessages.map { message ->
                             OpenAiCompatibleMessageDto(role = message.role, content = message.content)
                         },
@@ -2552,23 +2610,23 @@ class ChatRepositoryImpl(
                 Log.i(
                     TAG,
                     "RP metadata parsed: conversationId=$conversationId " +
-                        // 模型名不是敏感信息，但能直接看出辅助模型覆盖有没有真的生效。
-                        "auxiliaryModelOverridden=${auxiliaryModelOverride.isNotBlank()} " +
+                        // route 能直接看出这次请求实际发往哪条协议；模型名不是敏感信息。
+                        "route=${requestSnapshot.provider.storageValue} " +
+                        "auxiliaryModelOverridden=${input.requestSnapshot.settings.rpAuxiliaryModelOverride != null} " +
                         "responseLength=${content.length} optionsCount=${parsed?.options?.size ?: 0} " +
                         "parseSuccess=${parsed != null}",
                 )
             }
         }.onFailure { error ->
             if (error is CancellationException) throw error
-            Log.w(TAG, "RP metadata request failed: ${error.toSafeLogDescriptor()}")
+            Log.w(TAG, "RP metadata request failed: route=${routeProvider.storageValue} ${error.toSafeLogDescriptor()}")
+            failureSink?.invoke(error.toRpAuxiliaryFailureMessage(routeProvider))
         }.getOrNull()
     }
 
     private suspend fun requestFallbackRpStatusPanel(input: RpEnrichmentInput): RpStatusPanelDraft? {
         val conversationId = input.expectedMessage.conversationId
         val assistantContent = input.expectedMessage.content
-        val requestSnapshot = input.requestSnapshot
-        val settings = requestSnapshot.settings
         val definitions = input.turn.definitions
         if (definitions.isEmpty()) return null
 
@@ -2580,6 +2638,9 @@ class ChatRepositoryImpl(
         )
 
         return runCatching {
+            val target = rpAuxiliaryTarget(input)
+            val requestSnapshot = target.snapshot
+            val settings = requestSnapshot.settings
             val content = when (requestSnapshot.provider) {
                 ChatProviderId.DEEPSEEK -> {
                     val request = DeepSeekRequestFactory.build(
@@ -2588,7 +2649,7 @@ class ChatRepositoryImpl(
                             DeepSeekMessageDto(role = message.role, content = message.content)
                         },
                         purpose = DeepSeekRequestFactory.Purpose.RP_STATE_UPDATE,
-                        modelOverride = settings.rpAuxiliaryModel,
+                        modelOverride = target.model,
                     )
                     apiClient.completeChat(
                         requestSnapshot.requireApiKey(),
@@ -2600,7 +2661,7 @@ class ChatRepositoryImpl(
                 ChatProviderId.CUSTOM_OPENAI -> {
                     val request = OpenAiCompatibleRequestFactory.build(
                         settings = settings,
-                        model = settings.rpAuxiliaryModel.trim().ifBlank { requestSnapshot.model },
+                        model = target.model,
                         messages = promptMessages.map { message ->
                             OpenAiCompatibleMessageDto(role = message.role, content = message.content)
                         },
@@ -2772,6 +2833,19 @@ class ChatRepositoryImpl(
                 ChatProviderId.DEEPSEEK -> toDeepSeekUserFacingMessage()
                 ChatProviderId.CUSTOM_OPENAI -> toOpenAiCompatibleUserFacingMessage()
             }
+        }
+
+    /**
+     * RP 辅助请求失败的用户可读原因。
+     *
+     * 带安全标记的异常（文案由 App 生成）原样给出；其余按实际发请求的协议收敛成固定文案，
+     * 不暴露异常原文、地址或凭据。
+     */
+    private fun Throwable.toRpAuxiliaryFailureMessage(provider: ChatProviderId): String =
+        if (this is SafeUserFacingError) {
+            message.orEmpty()
+        } else {
+            toUserFacingMessage(provider)
         }
 
     /** 本地预检失败只落固定安全文案，不把异常原文、地址或凭据相关内容写进消息。 */

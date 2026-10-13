@@ -24,6 +24,7 @@ import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
 import com.muxuechat.domain.model.ReasoningEffort
+import com.muxuechat.domain.model.RpAuxiliaryProvider
 import com.muxuechat.domain.model.ThinkingMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -139,6 +140,9 @@ class SettingsDataStore internal constructor(
             customProviders = decodeProviders(prefs[CUSTOM_PROVIDERS]),
             activeCustomProviderId = prefs[ACTIVE_CUSTOM_PROVIDER_ID],
             rpAuxiliaryModel = prefs[RP_AUXILIARY_MODEL].orEmpty(),
+            // 旧版本没有这两个键：作用域为空 = 辅助模型不属于任何供应商，升级后不再被使用。
+            rpAuxiliaryModelScope = prefs[RP_AUXILIARY_MODEL_SCOPE].orEmpty(),
+            rpAuxiliaryProvider = RpAuxiliaryProvider.fromStorage(prefs[RP_AUXILIARY_PROVIDER]),
             defaultProtagonistProfileId = prefs[DEFAULT_PROTAGONIST_PROFILE_ID]?.takeIf { it.isNotBlank() },
         ).normalized()
 
@@ -166,6 +170,8 @@ class SettingsDataStore internal constructor(
         prefs[CHAT_PROVIDER] = normalized.provider.storageValue
         prefs[CUSTOM_PROVIDERS] = encodeProviders(normalized.customProviders)
         prefs[RP_AUXILIARY_MODEL] = normalized.rpAuxiliaryModel
+        prefs[RP_AUXILIARY_MODEL_SCOPE] = normalized.rpAuxiliaryModelScope
+        prefs[RP_AUXILIARY_PROVIDER] = normalized.rpAuxiliaryProvider.storageValue
         normalized.defaultProtagonistProfileId?.takeIf { it.isNotBlank() }
             ?.let { prefs[DEFAULT_PROTAGONIST_PROFILE_ID] = it }
             ?: prefs.remove(DEFAULT_PROTAGONIST_PROFILE_ID)
@@ -374,6 +380,8 @@ class SettingsDataStore internal constructor(
 
         /** RP 辅助请求的模型覆盖。空串表示跟随正文模型，是升级后的默认行为。 */
         private val RP_AUXILIARY_MODEL = stringPreferencesKey("rp_auxiliary_model")
+        private val RP_AUXILIARY_MODEL_SCOPE = stringPreferencesKey("rp_auxiliary_model_scope")
+        private val RP_AUXILIARY_PROVIDER = stringPreferencesKey("rp_auxiliary_provider")
         private val DEFAULT_PROTAGONIST_PROFILE_ID = stringPreferencesKey("default_protagonist_profile_id")
         private val DISPLAY_SCALE = stringPreferencesKey("display_scale")
 

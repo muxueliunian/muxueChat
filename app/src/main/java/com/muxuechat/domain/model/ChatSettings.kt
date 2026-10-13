@@ -55,25 +55,70 @@ data class ChatSettings(
     /** 当前选中的自定义供应商 id；provider 为 DEEPSEEK 时仍会保留，方便来回切换。 */
     val activeCustomProviderId: String? = null,
     /**
-     * RP 辅助请求（元数据补写与状态兜底）单独使用的模型名。留空表示跟随正文模型。
+     * RP 辅助请求（剧情推进建议、元数据补写与状态兜底）单独使用的模型名。留空表示用默认模型。
      *
-     * 这两类请求只要求稳定的结构化 JSON，不需要正文那档推理能力，
+     * 这几类请求只要求稳定的结构化 JSON，不需要正文那档推理能力，
      * 用便宜模型即可，正文仍走用户选定的主模型。
      *
-     * 只覆盖模型名，不切换 Provider：Base URL 与 API Key 仍取当前供应商的，
-     * 所以这里必须填当前供应商下可用的模型。
+     * 模型名只在**它所属的供应商**下才有意义，因此必须同 [rpAuxiliaryModelScope] 一起读：
+     * 两者对不上（例如填的是 DeepSeek 的名字、后来正文切到了 Vertex）时一律当作没填，
+     * 绝不把一家的模型名发给另一家。请通过 [rpAuxiliaryModelOverride] 读取。
      */
     val rpAuxiliaryModel: String = "",
+    /**
+     * [rpAuxiliaryModel] 是在哪个供应商下填写的（[ModelContextCatalog.providerKeyOf] 的口径）。
+     * 旧版本没有这个字段，升级后为空，空值永远对不上任何供应商，需要用户重新选一次。
+     */
+    val rpAuxiliaryModelScope: String = "",
+    /** RP 辅助请求发往哪家供应商；默认跟随正文，行为与升级前一致。 */
+    val rpAuxiliaryProvider: RpAuxiliaryProvider = RpAuxiliaryProvider.FOLLOW_ACTIVE,
     /** 仅用于新会话首次打开 RP 设置时预选；不会自动绑定或开启 RP。 */
     val defaultProtagonistProfileId: String? = null,
 ) {
     /**
-     * RP 辅助请求实际使用的模型名。
+     * RP 辅助请求是否改道发往 DeepSeek：用户选了「固定走 DeepSeek」，且正文并不是 DeepSeek。
+     * 正文本来就是 DeepSeek 时不存在改道，辅助请求照旧跟随正文。
+     */
+    val rpAuxiliaryDivertsToDeepSeek: Boolean
+        get() = rpAuxiliaryProvider == RpAuxiliaryProvider.DEEPSEEK && provider != ChatProviderId.DEEPSEEK
+
+    /** 辅助请求实际发往的供应商标识，口径与 [rpAuxiliaryModelScope] 相同。 */
+    val rpAuxiliaryTargetKey: String
+        get() = if (provider == ChatProviderId.DEEPSEEK || rpAuxiliaryProvider == RpAuxiliaryProvider.DEEPSEEK) {
+            ChatProviderId.DEEPSEEK.storageValue
+        } else {
+            ModelContextCatalog.providerKeyOf(this)
+        }
+
+    /**
+     * 用户填的辅助模型，且仅当它确实属于辅助请求的目标供应商时才返回；否则为 null。
+     * 这是「不把一家的模型名发给另一家」的唯一判据。
+     */
+    val rpAuxiliaryModelOverride: String?
+        get() = rpAuxiliaryModel.trim().takeIf { it.isNotEmpty() && rpAuxiliaryModelScope == rpAuxiliaryTargetKey }
+
+    /** 写入辅助模型并记下它属于哪个供应商；清空时一并清掉归属。 */
+    fun withRpAuxiliaryModel(model: String): ChatSettings {
+        val trimmed = model.trim()
+        return copy(
+            rpAuxiliaryModel = trimmed,
+            rpAuxiliaryModelScope = if (trimmed.isEmpty()) "" else rpAuxiliaryTargetKey,
+        )
+    }
+
+    /** 用户填了辅助模型，但它属于别的供应商，当前不会被使用。UI 据此提醒。 */
+    val rpAuxiliaryModelIsStale: Boolean
+        get() = rpAuxiliaryModel.isNotBlank() && rpAuxiliaryModelOverride == null
+
+    /**
+     * RP 辅助请求实际使用的模型名，绝不会是空串。
      *
-     * 留空、或填了个空白串时回落到正文模型，绝不会发出一个空 model。
+     * 没有可用的覆盖值时：改道到 DeepSeek 用 [DeepSeekModels.FLASH]（App 的标准 Flash 名，
+     * 不按名字去猜缓存列表）；否则回落到正文模型。
      */
     val effectiveRpAuxiliaryModel: String
-        get() = rpAuxiliaryModel.trim().ifBlank { activeModel }
+        get() = rpAuxiliaryModelOverride
+            ?: if (rpAuxiliaryDivertsToDeepSeek) DeepSeekModels.FLASH else activeModel
 
     /** 当前选中的自定义供应商。id 失效（例如已被删除）时回退到列表首项。 */
     val activeCustomProvider: CustomProvider?
@@ -185,6 +230,7 @@ data class ChatSettings(
         deepSeekModelContextWindows = normalizeContextWindows(deepSeekModelContextWindows),
         contextCostCapTokens = ModelContextCatalog.coerceCostCap(contextCostCapTokens),
         rpAuxiliaryModel = rpAuxiliaryModel.trim(),
+        rpAuxiliaryModelScope = rpAuxiliaryModelScope.trim(),
     )
 
     companion object {

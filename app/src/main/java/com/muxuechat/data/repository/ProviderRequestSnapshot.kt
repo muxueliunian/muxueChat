@@ -94,8 +94,16 @@ internal class XaiProviderNotConfiguredException(providerName: String) :
     SafeUserFacingError
 
 /**
+ * RP 辅助请求被设为固定走 DeepSeek，但没有保存 DeepSeek API Key。文案完全由 App 生成。
+ */
+internal class DeepSeekAuxiliaryKeyMissingException :
+    IllegalStateException("RP 辅助请求已设为走 DeepSeek，请先在设置中保存 DeepSeek API Key"),
+    SafeUserFacingError
+
+/**
  * 单轮请求的不可变路由快照。凭据只在内存中短暂保留，绝不进入日志、消息或持久化层。
- * 后台 RP 补写复用同一快照，避免用户切换设置后把同一轮请求拆到两个 Provider。
+ * 后台 RP 补写复用同一快照，避免用户切换设置后把同一轮请求拆到两个 Provider；
+ * 唯一例外是用户显式选择「RP 辅助请求固定走 DeepSeek」，此时辅助请求用 DeepSeek 自己的地址与 Key。
  */
 // 普通类不会像 data class 一样在误调用 toString() 时展开凭据、Base URL 与模型名。
 internal class ProviderRequestSnapshot(

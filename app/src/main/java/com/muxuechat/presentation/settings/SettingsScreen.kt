@@ -235,11 +235,7 @@ fun SettingsScreen(
                 }
                 SettingsGroup(
                     title = "RP 辅助请求",
-                    summary = if (settings.rpAuxiliaryModel.isBlank()) {
-                        "跟随正文模型"
-                    } else {
-                        "单独使用 ${settings.rpAuxiliaryModel}"
-                    },
+                    summary = rpAuxiliarySummary(settings),
                 ) {
                     RpAuxiliaryModelSection(settings, onSettingsChange)
                 }

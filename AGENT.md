@@ -42,6 +42,12 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 - 自定义供应商的输出预算字段由用户选择 `max_tokens` 或 `max_completion_tokens`，每次只发一个；旧配置默认 `max_tokens`。正文与内部请求使用相同字段策略、各自预算。xAI 适配器继续读取内部 `maxTokens` 后翻译为已实测字段。
 - 自定义供应商可显式配置合法的 `x-` 会话标识头，值为本 App 的稳定会话 ID，正文、工具续轮、摘要、标题及 RP 辅助请求一致。默认不发、不按厂商名称或地址启用，不发送到 xAI OAuth 链路；客户端标识使用 `muxueChat/1.0`。
 - `reasoning_effort` 只随正文对话发送；RP 元数据、状态兜底、上下文摘要一律不发。
+- **RP 辅助请求的供应商**（用户 2026-10-14 批准）：RP 剧情推进建议、元数据补写与状态兜底这三类请求，默认跟随正文所用供应商；用户可在设置中改为「固定走 DeepSeek」（正文本来就是 DeepSeek 时无区别），以免正文用 Vertex 等按量计费大模型时辅助请求成本翻倍。边界：
+  - 改道只发生在这三类请求上；正文、上下文摘要、AI 标题、设定生成仍严格同 Provider。改道目标只有 DeepSeek 这一个，没有新增传输实现，仍落在既有两条协议内。
+  - 改道时 Base URL 与凭据必须成对取自 DeepSeek（DeepSeek 的地址 + DeepSeek 的 Keystore Key），绝不沿用正文供应商的地址或凭据；没有已保存的 Key 时直接给出可读失败，不发请求。重试建议改道时不得再为正文冻结请求（不索取 Google token）。
+  - 设置页必须如实告知：改道后最近一轮对话、角色卡与状态定义会发给 DeepSeek，费用记在 DeepSeek 账户。
+  - 辅助模型名只在它所属的供应商下有效：保存时记下归属（`rpAuxiliaryModelScope`），归属对不上一律当作没填，改用默认（改道时为 `deepseek-flash`，跟随时为正文模型）；绝不把一家的模型名发给另一家。旧版本保存的无归属值同样不生效。
+  - 重试建议失败时，界面须给出具体原因（安全文案），不得只显示「未能生成有效建议」。
 - 每个自定义供应商的 API Key 与 DeepSeek API Key 分别保存，各占独立的 Android Keystore alias；删除供应商必须同时删除其 Key。
 - App 默认不实现、发起、保存或复用任何 OAuth：不得包含 OAuth client ID、授权码、access token、refresh token、Cookie 或第三方 CLI 的登录身份，用户只能填写服务已签发的 API Key。**OAuth 例外只有两个：xAI 订阅登录与 Google Vertex 登录。**xAI 订阅登录（用户 2026-09-22 批准）边界如下：
   - 仅限 xAI：OAuth 端点钉死 `https://auth.x.ai`，服务地址钉死 `https://cli-chat-proxy.grok.com/v1`，不接受用户编辑，不适用明文 HTTP 放行策略；任何情况下不得把 `Authorization` 头发往非钉死主机，禁止跟随跨主机重定向。
@@ -88,7 +94,7 @@ OpenAI 兼容链路已完成以下代码能力，但不等同于 App 代为部�
 - 自定义供应商的增删改与切换：名称、Base URL、API Key、模型列表。
 - 每个供应商一个独立 Keystore alias 保存 API Key，不明文展示、不跨供应商复用。
 - OpenAI 兼容的普通/流式聊天、停止生成、重新生成及协议级错误提示。
-- RP 正文、状态块、本地元数据补写与上下文压缩的同 Provider 路由。
+- RP 正文、状态块、本地元数据补写与上下文压缩的同 Provider 路由（唯一例外：RP 辅助请求可由用户改为固定走 DeepSeek，见上文「RP 辅助请求的供应商」）。
 - 模型列表通过 `GET {base}/models` 拉取并缓存，失败时回退用户手填。
 - 自定义供应商下不发送 DeepSeek thinking/reasoning 或 RP Marker；支持按供应商显式启用的标准 OpenAI 工具调用（仅非 RP 正文请求）。旧供应商默认关闭该能力，避免向只支持普通聊天的反代发送未知字段。
 
