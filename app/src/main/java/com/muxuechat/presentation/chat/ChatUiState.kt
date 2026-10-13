@@ -9,6 +9,7 @@ import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RpStatusPanel
+import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.model.WorldSetting
 import com.muxuechat.domain.model.WritingStyleProfile
 import com.muxuechat.domain.tool.SettingsToolDraft
@@ -28,6 +29,7 @@ data class ChatUiState(
     val settings: ChatSettings = ChatSettings(),
     val displaySettings: DisplaySettings = DisplaySettings(),
     val isGenerating: Boolean = false,
+    val aiRenamingConversationIds: Set<String> = emptySet(),
     val retryingRpOptionsMessageId: String? = null,
     val errorMessage: String? = null,
     val roleCards: List<RoleCard> = emptyList(),
@@ -39,6 +41,13 @@ data class ChatUiState(
     val protagonistProfiles: List<ProtagonistProfile> = emptyList(),
     /** 档案 id → 绑定它的会话数；没有会话绑定的档案不在表里。 */
     val protagonistProfileUsage: Map<String, Int> = emptyMap(),
+    val supportingCharacters: List<SupportingCharacter> = emptyList(),
+    /** 配角 id → 勾选它的会话数。 */
+    val supportingCharacterUsage: Map<String, Int> = emptyMap(),
+    /** 当前会话勾选的配角 id，顺序即 prompt 里的顺序。 */
+    val activeSupportingCharacterIds: List<String> = emptyList(),
+    /** 按 RP 设置草稿规划的上下文（只在 Sheet 打开期间有值），配角预算提示用。 */
+    val rpDraftContextPlan: ContextWindowPlan? = null,
     val activeWorldSetting: WorldSetting? = null,
     val activeRpStatusPanel: RpStatusPanel? = null,
     val writingStyleProfiles: List<WritingStyleProfile> = emptyList(),

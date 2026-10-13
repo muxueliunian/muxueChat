@@ -6,6 +6,20 @@ import com.muxuechat.domain.model.Conversation
 import com.muxuechat.domain.tool.SettingsToolDraft
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * RP 设置 Sheet 里尚未保存的绑定选择（RP-3c），用于预估「按这个选择发送时」的上下文占用。
+ * 字段语义与 `updateConversationRpSettings` 一致：null 表示不绑定。
+ */
+data class RpBindingDraft(
+    val isRpEnabled: Boolean,
+    val roleCardId: String?,
+    val worldSettingId: String?,
+    val writingStyleId: String?,
+    val protagonistProfileId: String?,
+    /** 勾选的配角，顺序即 prompt 里的顺序。 */
+    val supportingCharacterIds: List<String>,
+)
+
 interface ChatRepository {
     /**
      * 上下文占用的响应式视图。
@@ -16,10 +30,27 @@ interface ChatRepository {
     fun observeContextWindow(conversationId: String): Flow<ContextWindowPlan>
 
     /**
+     * 按 RP 设置草稿规划一次上下文（§6.2：配角预算的主警告必须依据草稿的实际规划结果）。
+     *
+     * 历史、摘要、状态面板与全局设置取库里的现值，只有绑定换成 [draft]；
+     * 换了角色卡或主角的组按新档案的最新定义估算状态栏。[conversationId] 为 null 表示还没有会话（空历史）。
+     * 结果只用于展示「预计」，不影响任何请求。
+     */
+    suspend fun planContextWindowForRpDraft(conversationId: String?, draft: RpBindingDraft): ContextWindowPlan
+
+    /**
      * 主动压缩：把最老的一段历史换成摘要。
      * 返回 true 表示压缩成功，false 表示摘要请求失败（状态未改变）。
      */
     suspend fun compactContext(conversationId: String): Boolean
+
+    /**
+     * 「AI 重命名」：用当前选中的供应商与模型，根据会话内容生成标题并直接保存。
+     * 会话没有内容、请求失败或模型没给出可用标题时抛出带中文原因的异常，标题不变。
+     *
+     * @return 保存后的标题。
+     */
+    suspend fun renameConversationWithAi(conversationId: String): String
 
     /** 正在后台补写剧情建议/状态的消息 id。UI 用它显示局部 loading。 */
     fun observeEnrichingMessageIds(): Flow<Set<String>>

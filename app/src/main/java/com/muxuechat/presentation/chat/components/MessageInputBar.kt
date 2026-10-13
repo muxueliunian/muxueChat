@@ -46,6 +46,8 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.muxuechat.presentation.chat.PendingAttachment
+import com.muxuechat.presentation.theme.MinTouchTarget
+import com.muxuechat.presentation.theme.Spacing
 
 @Composable
 fun MessageInputBar(
@@ -74,7 +76,7 @@ fun MessageInputBar(
                 // 键盘弹出时 IME 高度已经覆盖导航栏；两个 padding 分别加会多出一段空白，
                 // 收起时又只剩导航栏。union 让两种状态都恰好留出应有的高度。
                 .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
-                .padding(horizontal = 12.dp, vertical = 10.dp),
+                .padding(horizontal = Spacing.Medium, vertical = Spacing.Small),
         ) {
             if (isImportingAttachment) {
                 Text("正在提取文档文字，完成后即可发送…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(bottom = 8.dp))
@@ -94,7 +96,7 @@ fun MessageInputBar(
                         color = MaterialTheme.colorScheme.outlineVariant,
                         shape = com.muxuechat.presentation.theme.Corner.Container,
                     )
-                    .padding(start = 6.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                    .padding(Spacing.Tight),
             ) {
                 if (canAttach) {
                     IconButton(
@@ -109,7 +111,7 @@ fun MessageInputBar(
                         )
                     }
                 } else {
-                    Spacer(modifier = Modifier.size(10.dp))
+                    Spacer(modifier = Modifier.size(Spacing.Small))
                 }
                 MessageTextField(
                     value = value,
@@ -117,8 +119,8 @@ fun MessageInputBar(
                     modifier = Modifier
                         .weight(1f)
                         .semantics { contentDescription = "消息正文" }
-                        .heightIn(min = 40.dp, max = 180.dp)
-                        .padding(vertical = 10.dp),
+                        // 最小高度与右侧按钮一致，单行时文字和按钮垂直居中对齐。
+                        .heightIn(min = MinTouchTarget, max = 180.dp),
                 )
                 SendOrStopButton(
                     isGenerating = isGenerating,
@@ -203,7 +205,10 @@ private fun MessageTextField(
         ),
         modifier = modifier,
         decorationBox = { inner ->
-            Box(contentAlignment = Alignment.CenterStart) {
+            Box(
+                contentAlignment = Alignment.CenterStart,
+                modifier = Modifier.padding(vertical = Spacing.Medium),
+            ) {
                 if (value.text.isEmpty()) {
                     Text(
                         text = "发送消息……",

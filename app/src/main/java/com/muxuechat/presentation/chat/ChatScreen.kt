@@ -34,6 +34,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -47,6 +48,13 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.ProtagonistProfile
+import com.muxuechat.presentation.chat.components.SettingsDeletionSheet
+import com.muxuechat.domain.tool.RpSettingsInventory
+import com.muxuechat.domain.model.RpSettingRef
+import com.muxuechat.presentation.chat.components.SupportingCharacterEditorSheet
+import com.muxuechat.domain.model.SupportingCharacterDraft
+import com.muxuechat.domain.model.SupportingCharacter
+import com.muxuechat.data.repository.RpBindingDraft
 import java.util.UUID
 import com.muxuechat.presentation.chat.components.displayName
 import com.muxuechat.presentation.chat.components.ProtagonistEditorSheet
@@ -90,6 +98,7 @@ fun ChatScreen(
     onRetryRpOptions: () -> Unit,
     onDeleteConversation: (String) -> Unit,
     onRenameConversation: (String, String) -> Unit,
+    onAiRenameConversation: (String) -> Unit,
     onClearConversation: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onUpdateRpSettings: (
@@ -98,6 +107,7 @@ fun ChatScreen(
         worldSettingId: String?,
         writingStyleId: String?,
         protagonistProfileId: String?,
+        supportingCharacterIds: List<String>?,
         narrativeMinChars: Int,
         narrativePerspective: RpNarrativePerspective,
         plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -108,6 +118,9 @@ fun ChatScreen(
     onSaveProtagonist: (id: String?, draft: ProtagonistProfileDraft) -> Unit,
     onForkProtagonist: (sourceProfileId: String, draft: ProtagonistProfileDraft) -> Unit,
     onDeleteProtagonist: (profileId: String) -> Unit,
+    onSaveSupportingCharacter: (id: String?, draft: SupportingCharacterDraft) -> Unit,
+    onDeleteSupportingCharacter: (characterId: String) -> Unit,
+    onPreviewRpDraft: (RpBindingDraft?) -> Unit,
     onSaveWorldSetting: (id: String?, draft: WorldSettingDraft) -> Unit,
     onDeleteWorldSetting: (worldSettingId: String) -> Unit,
     onSaveWritingStyle: (id: String?, draft: WritingStyleProfileDraft) -> Unit,
@@ -121,10 +134,13 @@ fun ChatScreen(
     onCompressionTriggerChange: (Int) -> Unit,
     onConfirmSettingsDraft: (SettingsDraftConfirmation) -> Unit,
     onDiscardSettingsDraft: (String) -> Unit,
+    onConfirmSettingsDeletion: (draftId: String, refs: List<RpSettingRef>) -> Unit,
     onSelectDeepSeekModel: (String) -> Unit,
     onSelectCustomProviderModel: (providerId: String, model: String) -> Unit,
     onRefreshProviderModels: (String) -> Unit,
     modifier: Modifier = Modifier,
+    onSyncRpMetricDefinitions: (String, com.muxuechat.domain.model.RpEntryOwner) -> Unit = { _, _ -> },
+    onEditRpMetric: (String, com.muxuechat.domain.model.RpMetricSnapshot, Int) -> Unit = { _, _, _ -> },
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -144,6 +160,9 @@ fun ChatScreen(
     var protagonistEditor by remember { mutableStateOf<ProtagonistEditorTarget?>(null) }
     var pendingDeleteProtagonist by remember { mutableStateOf<ProtagonistProfile?>(null) }
     var pendingCreatedProtagonistIds by remember { mutableStateOf<Set<String>?>(null) }
+    var supportingEditor by remember { mutableStateOf<SupportingCharacterEditorTarget?>(null) }
+    var pendingDeleteSupporting by remember { mutableStateOf<SupportingCharacter?>(null) }
+    var pendingCreatedSupportingIds by remember { mutableStateOf<Set<String>?>(null) }
     var pendingDeleteWorldSetting by remember { mutableStateOf<WorldSetting?>(null) }
     var writingStyleEditor by remember { mutableStateOf<WritingStyleEditorTarget?>(null) }
     var pendingDeleteWritingStyle by remember { mutableStateOf<WritingStyleProfile?>(null) }
@@ -199,8 +218,10 @@ fun ChatScreen(
         ?.takeIf { it.isNotBlank() }
         ?: "新的对话"
 
-    val isRpActive = state.activeRpSettings?.isRpEnabled == true
-    val showStatusPanel = isRpActive && state.activeRpStatusPanel != null
+    val isRpActive = state.activeRpSettings?.isRpEnabled == true &&
+        state.activeRpSettings.conversationId == state.activeConversationId
+    val showStatusPanel = isRpActive && state.activeRpStatusPanel != null &&
+        state.activeRpStatusPanel.conversationId == state.activeConversationId
     val rpMarkerAvailability = state.settings.rpMarkerAvailability()
 
     LaunchedEffect(state.roleCards, pendingCreatedRoleCardIds) {
@@ -227,6 +248,18 @@ fun ChatScreen(
             protagonistProfileId = created.id,
         )
         pendingCreatedProtagonistIds = null
+    }
+
+    // 新建的配角加到草稿已选的末尾；点 RP 设置的保存才真正勾选。
+    LaunchedEffect(state.supportingCharacters, pendingCreatedSupportingIds) {
+        val beforeIds = pendingCreatedSupportingIds ?: return@LaunchedEffect
+        val created = state.supportingCharacters
+            .filterNot { it.id in beforeIds }
+            .maxByOrNull { it.createdAtMillis }
+            ?: return@LaunchedEffect
+        val base = rpSettingsDraft ?: RpSettingsDraft.from(state)
+        rpSettingsDraft = base.copy(supportingCharacterIds = base.supportingCharacterIds + created.id)
+        pendingCreatedSupportingIds = null
     }
 
     LaunchedEffect(state.worldSettings, pendingCreatedWorldSettingIds) {
@@ -273,7 +306,15 @@ fun ChatScreen(
                 },
                 onDelete = onDeleteConversation,
                 onRename = onRenameConversation,
+                onAiRename = onAiRenameConversation,
+                aiRenamingConversationIds = state.aiRenamingConversationIds,
                 onClear = onClearConversation,
+                onOpenSettings = {
+                    scope.launch {
+                        drawerState.close()
+                        onOpenSettings()
+                    }
+                },
             )
         },
     ) {
@@ -298,7 +339,6 @@ fun ChatScreen(
                     },
                     // 上下文占用由 Flow 持续推送，打开面板不需要再手动刷新一次。
                     onOpenContext = { contextSheetVisible = true },
-                    onOpenSettings = onOpenSettings,
                     contextUsagePercent = state.contextWindowPlan?.usagePercent,
                 )
             },
@@ -335,6 +375,9 @@ fun ChatScreen(
                         panel = state.activeRpStatusPanel!!,
                         roleCardName = state.activeRoleCard?.name,
                         metricSnapshot = state.activeRpSettings?.metricSnapshot.orEmpty(),
+                        onEditMetric = { definition, value ->
+                            onEditRpMetric(state.activeRpStatusPanel.conversationId, definition, value)
+                        },
                     )
                 }
                 // 草稿被收起后仍然存在，这条提示是把它重新打开的唯一入口。
@@ -345,51 +388,55 @@ fun ChatScreen(
                         onOpen = { draftId -> collapsedDraftIds = collapsedDraftIds - draftId },
                     )
                 }
-                MessageList(
-                    messages = state.messages,
-                    isGenerating = state.isGenerating,
-                    retryingRpOptionsMessageId = state.retryingRpOptionsMessageId,
-                    enrichingMessageIds = state.enrichingMessageIds,
-                    canRetryMissingRpOptions = isRpActive && state.activeRoleCard != null,
-                    onCopy = { text ->
-                        scope.launch {
-                            clipboard.setClipEntry(
-                                ClipEntry(ClipData.newPlainText("message", text)),
+                // 切换会话时重建列表，避免继承上一会话的位置与新内容提示。
+                key(state.activeConversationId) {
+                    MessageList(
+                        // combine 切换期间可能先收到新会话 ID，消息流仍是旧会话。
+                        messages = state.messages.filter { it.conversationId == state.activeConversationId },
+                        isGenerating = state.isGenerating,
+                        retryingRpOptionsMessageId = state.retryingRpOptionsMessageId,
+                        enrichingMessageIds = state.enrichingMessageIds,
+                        canRetryMissingRpOptions = isRpActive && state.activeRoleCard != null,
+                        onCopy = { text ->
+                            scope.launch {
+                                clipboard.setClipEntry(
+                                    ClipEntry(ClipData.newPlainText("message", text)),
+                                )
+                                snackbarHostState.showSnackbar("已复制")
+                            }
+                        },
+                        onRegenerate = onRegenerate,
+                        onRetryRpOptions = onRetryRpOptions,
+                        onSendOption = { option ->
+                            if (!state.isGenerating) {
+                                onSendMessage(option)
+                            }
+                        },
+                        onEditOption = { option ->
+                            inputValue = TextFieldValue(
+                                text = option,
+                                selection = TextRange(option.length),
                             )
-                            snackbarHostState.showSnackbar("已复制")
-                        }
-                    },
-                    onRegenerate = onRegenerate,
-                    onRetryRpOptions = onRetryRpOptions,
-                    onSendOption = { option ->
-                        if (!state.isGenerating) {
-                            onSendMessage(option)
-                        }
-                    },
-                    onEditOption = { option ->
-                        inputValue = TextFieldValue(
-                            text = option,
-                            selection = TextRange(option.length),
-                        )
-                    },
-                    onEditUserMessage = { message ->
-                        if (!state.isGenerating) {
-                            editingUserMessage = MessageEditTarget(
-                                messageId = message.id,
-                                initialContent = message.content,
-                            )
-                        }
-                    },
-                    onEditAssistantMessage = { message ->
-                        if (!state.isGenerating) {
-                            editingAssistantMessage = MessageEditTarget(
-                                messageId = message.id,
-                                initialContent = message.content,
-                            )
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                )
+                        },
+                        onEditUserMessage = { message ->
+                            if (!state.isGenerating) {
+                                editingUserMessage = MessageEditTarget(
+                                    messageId = message.id,
+                                    initialContent = message.content,
+                                )
+                            }
+                        },
+                        onEditAssistantMessage = { message ->
+                            if (!state.isGenerating) {
+                                editingAssistantMessage = MessageEditTarget(
+                                    messageId = message.id,
+                                    initialContent = message.content,
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
         }
     }
@@ -423,15 +470,36 @@ fun ChatScreen(
     }
 
     visibleDraft?.let { draft ->
-        SettingsDraftSheet(
-            draft = draft,
-            isSaving = state.isSavingSettingsDraft,
-            onConfirm = onConfirmSettingsDraft,
-            onDiscard = onDiscardSettingsDraft,
-            // 关闭不等于丢弃：草稿仍留在待确认区，可以从提示条重新打开。
-            onDismiss = { collapseSettingsDraft(draft.id) },
-        )
+        if (draft.isDeletion) {
+            SettingsDeletionSheet(
+                draft = draft,
+                inventory = RpSettingsInventory(
+                    roleCards = state.roleCards,
+                    supportingCharacters = state.supportingCharacters,
+                    protagonists = state.protagonistProfiles,
+                    worldSettings = state.worldSettings,
+                    writingStyles = state.writingStyleProfiles,
+                ),
+                isDeleting = state.isSavingSettingsDraft,
+                onConfirm = onConfirmSettingsDeletion,
+                onDiscard = onDiscardSettingsDraft,
+                onDismiss = { collapseSettingsDraft(draft.id) },
+            )
+        } else {
+            SettingsDraftSheet(
+                draft = draft,
+                isSaving = state.isSavingSettingsDraft,
+                onConfirm = onConfirmSettingsDraft,
+                onDiscard = onDiscardSettingsDraft,
+                // 关闭不等于丢弃：草稿仍留在待确认区，可以从提示条重新打开。
+                onDismiss = { collapseSettingsDraft(draft.id) },
+            )
+        }
     }
+
+    // 草稿的绑定一变就重新估算占用；Sheet 关闭（含切去编辑器）时停止估算。
+    val previewDraft = if (rpSheetVisible) (rpSettingsDraft ?: RpSettingsDraft.from(state)).toBindingDraft() else null
+    LaunchedEffect(previewDraft) { onPreviewRpDraft(previewDraft) }
 
     if (rpSheetVisible) {
         val draft = rpSettingsDraft ?: RpSettingsDraft.from(state)
@@ -441,6 +509,7 @@ fun ChatScreen(
             initialWorldSettingId = state.activeRpSettings?.worldSettingId,
             initialWritingStyleId = state.activeRpSettings?.writingStyleId,
             initialProtagonistProfileId = state.activeRpSettings?.protagonistProfileId,
+            initialSupportingCharacterIds = state.activeSupportingCharacterIds,
             initialNarrativeMinChars = state.activeRpSettings?.narrativeMinChars ?: 0,
             initialNarrativePerspective = state.activeRpSettings
                 ?.narrativePerspective
@@ -454,6 +523,7 @@ fun ChatScreen(
             draftWorldSettingId = draft.worldSettingId,
             draftWritingStyleId = draft.writingStyleId,
             draftProtagonistProfileId = draft.protagonistProfileId,
+            draftSupportingCharacterIds = draft.supportingCharacterIds,
             draftNarrativeMinCharsText = draft.narrativeMinCharsText,
             draftNarrativePerspective = draft.narrativePerspective,
             draftPlotSuggestionPerspective = draft.plotSuggestionPerspective,
@@ -466,6 +536,21 @@ fun ChatScreen(
             writingStyles = state.writingStyleProfiles,
             protagonistProfiles = state.protagonistProfiles,
             protagonistProfileUsage = state.protagonistProfileUsage,
+            supportingCharacters = state.supportingCharacters,
+            supportingCharacterUsage = state.supportingCharacterUsage,
+            draftContextPlan = state.rpDraftContextPlan,
+            metricSyncContent = {
+                com.muxuechat.presentation.chat.components.RpMetricSyncSection(
+                    metricSnapshot = state.activeRpSettings?.metricSnapshot.orEmpty(),
+                    roleCard = state.activeRoleCard,
+                    protagonistProfile = state.activeProtagonistProfile,
+                    onSync = { owner ->
+                        state.activeRpSettings?.conversationId?.let { onSyncRpMetricDefinitions(it, owner) }
+                    },
+                    bindingsSaved = draft.roleCardId == state.activeRpSettings?.roleCardId &&
+                        draft.protagonistProfileId == state.activeRpSettings?.protagonistProfileId,
+                )
+            },
             onDraftRpEnabledChange = {
                 rpSettingsDraft = draft.copy(isRpEnabled = it)
             },
@@ -480,6 +565,9 @@ fun ChatScreen(
             },
             onDraftProtagonistProfileIdChange = {
                 rpSettingsDraft = draft.copy(protagonistProfileId = it)
+            },
+            onDraftSupportingCharacterIdsChange = {
+                rpSettingsDraft = draft.copy(supportingCharacterIds = it)
             },
             onDraftNarrativeMinCharsTextChange = {
                 rpSettingsDraft = draft.copy(narrativeMinCharsText = it)
@@ -498,6 +586,7 @@ fun ChatScreen(
                     worldSettingId,
                     writingStyleId,
                     protagonistProfileId,
+                    supportingCharacterIds,
                     narrativeMinChars,
                     narrativePerspective,
                     plotSuggestionPerspective,
@@ -508,6 +597,7 @@ fun ChatScreen(
                     worldSettingId,
                     writingStyleId,
                     protagonistProfileId,
+                    supportingCharacterIds,
                     narrativeMinChars,
                     narrativePerspective,
                     plotSuggestionPerspective,
@@ -540,6 +630,15 @@ fun ChatScreen(
             onDeleteProtagonist = { profile ->
                 pendingDeleteProtagonist = profile
             },
+            onCreateSupportingCharacter = {
+                pendingCreatedSupportingIds = state.supportingCharacters.map { it.id }.toSet()
+                rpSheetVisible = false
+                supportingEditor = SupportingCharacterEditorTarget.newCharacter()
+            },
+            onEditSupportingCharacter = { character ->
+                rpSheetVisible = false
+                supportingEditor = SupportingCharacterEditorTarget.fromExisting(character)
+            },
             onCreateWorldSetting = {
                 pendingCreatedWorldSettingIds = state.worldSettings.map { it.id }.toSet()
                 rpSheetVisible = false
@@ -569,6 +668,7 @@ fun ChatScreen(
                 rpSettingsDraft = null
                 pendingCreatedRoleCardIds = null
                 pendingCreatedProtagonistIds = null
+                pendingCreatedSupportingIds = null
                 pendingCreatedWorldSettingIds = null
                 pendingCreatedWritingStyleIds = null
             },
@@ -614,6 +714,28 @@ fun ChatScreen(
                     pendingCreatedProtagonistIds = null
                 }
                 protagonistEditor = null
+                rpSheetVisible = true
+            },
+        )
+    }
+
+    supportingEditor?.let { target ->
+        val existing = target.id?.let { id -> state.supportingCharacters.firstOrNull { it.id == id } }
+        SupportingCharacterEditorSheet(
+            isEditing = target.id != null,
+            initialDraft = target.draft,
+            usedByConversationCount = target.id?.let { state.supportingCharacterUsage[it] } ?: 0,
+            onSave = { draft ->
+                onSaveSupportingCharacter(target.id, draft)
+                supportingEditor = null
+                rpSheetVisible = true
+            },
+            onDelete = existing?.let { character -> { pendingDeleteSupporting = character } },
+            onDismiss = {
+                if (target.id == null) {
+                    pendingCreatedSupportingIds = null
+                }
+                supportingEditor = null
                 rpSheetVisible = true
             },
         )
@@ -723,6 +845,40 @@ fun ChatScreen(
         )
     }
 
+    pendingDeleteSupporting?.let { character ->
+        val count = state.supportingCharacterUsage[character.id] ?: 0
+        AlertDialog(
+            onDismissRequest = { pendingDeleteSupporting = null },
+            title = { Text("删除配角") },
+            text = {
+                Text(
+                    text = "确定删除「${character.name.ifBlank { "未命名配角" }}」吗？" +
+                        if (count > 0) "有 $count 个会话勾选了它，这些会话会取消勾选；历史消息保留。" else "目前没有会话勾选它。",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteSupportingCharacter(character.id)
+                        rpSettingsDraft = rpSettingsDraft?.let { draft ->
+                            draft.copy(supportingCharacterIds = draft.supportingCharacterIds - character.id)
+                        }
+                        pendingDeleteSupporting = null
+                        supportingEditor = null
+                        rpSheetVisible = true
+                    },
+                ) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteSupporting = null }) {
+                    Text("取消")
+                }
+            },
+        )
+    }
+
     pendingDeleteRoleCard?.let { card ->
         AlertDialog(
             onDismissRequest = { pendingDeleteRoleCard = null },
@@ -807,12 +963,14 @@ private data class MessageEditTarget(
     val initialContent: String,
 )
 
-private data class RpSettingsDraft(
+internal data class RpSettingsDraft(
     val isRpEnabled: Boolean,
     val roleCardId: String?,
     val worldSettingId: String?,
     val writingStyleId: String?,
     val protagonistProfileId: String?,
+    /** 勾选的配角，顺序即 prompt 里的顺序。 */
+    val supportingCharacterIds: List<String>,
     val narrativeMinCharsText: String,
     val narrativePerspective: RpNarrativePerspective,
     val plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -824,7 +982,12 @@ private data class RpSettingsDraft(
             roleCardId = state.activeRpSettings?.roleCardId,
             worldSettingId = state.activeRpSettings?.worldSettingId,
             writingStyleId = state.activeRpSettings?.writingStyleId,
-            protagonistProfileId = state.activeRpSettings?.protagonistProfileId,
+            protagonistProfileId = if (state.activeRpSettings != null) {
+                state.activeRpSettings.protagonistProfileId
+            } else {
+                state.settings.defaultProtagonistProfileId?.takeIf { id -> state.protagonistProfiles.any { it.id == id } }
+            },
+            supportingCharacterIds = state.activeSupportingCharacterIds,
             narrativeMinCharsText = state.activeRpSettings
                 ?.narrativeMinChars
                 ?.takeIf { it > 0 }
@@ -971,13 +1134,41 @@ private data class RoleCardEditorTarget(
                 persona = card.persona,
                 speakingStyle = card.speakingStyle,
                 userIdentity = card.userIdentity,
-                openingMessage = card.openingMessage,
                 boundaries = card.boundaries,
                 metricDefinitions = card.metricDefinitions,
                 // 不带上文本词条，保存时它们会被当成删掉（RP-3a 之前的缺陷）。
                 textEntries = card.textEntries,
             ),
         )
+    }
+}
+
+private fun RpSettingsDraft.toBindingDraft(): RpBindingDraft = RpBindingDraft(
+    isRpEnabled = isRpEnabled,
+    roleCardId = roleCardId,
+    worldSettingId = worldSettingId,
+    writingStyleId = writingStyleId,
+    protagonistProfileId = protagonistProfileId,
+    supportingCharacterIds = supportingCharacterIds,
+)
+
+private data class SupportingCharacterEditorTarget(
+    val id: String?,
+    val draft: SupportingCharacterDraft,
+) {
+    companion object {
+        fun newCharacter(): SupportingCharacterEditorTarget =
+            SupportingCharacterEditorTarget(id = null, draft = SupportingCharacterDraft(name = ""))
+
+        fun fromExisting(character: SupportingCharacter): SupportingCharacterEditorTarget =
+            SupportingCharacterEditorTarget(
+                id = character.id,
+                draft = SupportingCharacterDraft(
+                    name = character.name,
+                    description = character.description,
+                    entries = character.entries,
+                ),
+            )
     }
 }
 
@@ -1080,11 +1271,15 @@ private fun PendingDraftBanner(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "${draft.typeLabel}草稿「${draft.displayName}」待确认",
+                            text = "${draft.pendingLabel}「${draft.displayName}」待确认",
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Text(
-                            text = "尚未保存，点击继续处理",
+                            text = when {
+                                draft.isDeletion -> "尚未删除任何内容，点击核对"
+                                draft.isUpdate -> "尚未修改任何内容，点击核对"
+                                else -> "尚未保存，点击继续处理"
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

@@ -134,8 +134,7 @@ class ChatContextPlannerTest {
             persona = "设".repeat(300),
             speakingStyle = "",
             userIdentity = "",
-            openingMessage = "",
-            boundaries = "",
+                        boundaries = "",
             createdAtMillis = 0L,
             updatedAtMillis = 0L,
         )

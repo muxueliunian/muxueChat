@@ -22,7 +22,7 @@ private fun ReadingDeskPreview() {
     MuxueChatTheme {
         Surface {
             Column {
-                ChatTopBar("写作练习", "示例供应商", "fixture-model-with-a-very-long-identifier", false, {}, {}, {}, {}, {})
+                ChatTopBar("写作练习", "示例供应商", "fixture-model-with-a-very-long-identifier", false, {}, {}, {}, {})
                 MessageList(emptyList(), false, null, emptySet(), false, {}, {}, {}, {}, {}, {}, {}, Modifier.weight(1f))
                 MessageInputBar(TextFieldValue(""), {}, false, {}, {}, canAttach = true)
             }

@@ -55,6 +55,7 @@ import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.prompt.AttachmentFormat
 import com.muxuechat.domain.model.ProtagonistDraft
 import com.muxuechat.domain.tool.SettingsToolDraft
+import com.muxuechat.domain.tool.SettingsUpdateTarget
 import com.muxuechat.domain.usecase.ClearConversationUseCase
 import com.muxuechat.domain.usecase.DeleteConversationUseCase
 import com.muxuechat.domain.usecase.EditAssistantMessageUseCase
@@ -64,6 +65,13 @@ import com.muxuechat.domain.usecase.RenameConversationUseCase
 import com.muxuechat.domain.usecase.RetryRpOptionsUseCase
 import com.muxuechat.domain.usecase.SendMessageUseCase
 import com.muxuechat.domain.usecase.StopGenerationUseCase
+import com.muxuechat.data.repository.RpBindingDraft
+import com.muxuechat.domain.model.SupportingCharacter
+import com.muxuechat.domain.model.RpSettingRef
+import com.muxuechat.domain.model.SupportingCharacterDraft
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -124,13 +132,57 @@ class ChatViewModel(
         if (conversationId == null) flowOf(null) else rpRepository.observeConversationRpSettings(conversationId)
     }
 
-    /** 当前会话设置连同全部主角档案与共用数；档案被改名或删除时同样会推送。 */
+    /** 全部配角、各自被几个会话勾选、当前会话勾选的顺序（RP-3c）。 */
+    private val supportingSlice = combine(
+        rpRepository.observeSupportingCharacters(),
+        rpRepository.observeSupportingCharacterUsage(),
+        activeConversationId.flatMapLatest { conversationId ->
+            if (conversationId == null) {
+                flowOf(emptyList())
+            } else {
+                rpRepository.observeConversationSupportingCharacters(conversationId)
+            }
+        },
+    ) { all, usage, active ->
+        SupportingSlice(all = all, usage = usage, activeIds = active.map { it.id })
+    }
+
+    /** RP 设置 Sheet 打开期间的草稿绑定；null 表示 Sheet 没开，不做估算。 */
+    private val rpDraftPreview = MutableStateFlow<RpBindingDraft?>(null)
+
+    /**
+     * 按草稿规划的上下文（§6.2 配角预算的主警告）。草稿每改一项都会推送，
+     * 防抖后再规划，避免连点勾选时对全量历史反复估算。
+     */
+    @OptIn(FlowPreview::class)
+    private val rpDraftContextPlan: Flow<ContextWindowPlan?> = combine(activeConversationId, rpDraftPreview) { id, draft ->
+        id to draft
+    }
+        .debounce(RP_DRAFT_PLAN_DEBOUNCE_MILLIS)
+        .mapLatest { (conversationId, draft) ->
+            draft?.let {
+                runCatching { chatRepository.planContextWindowForRpDraft(conversationId, it) }
+                    .onFailure { error -> Log.w(TAG, "Planning RP draft failed: ${error.message}", error) }
+                    .getOrNull()
+            }
+        }
+        .onStart { emit(null) }
+
+    /** 当前会话设置连同全部主角档案、配角与共用数；档案被改名或删除时同样会推送。 */
     private val activeRpBinding = combine(
         activeRpSettings,
         rpRepository.observeProtagonistProfiles(),
         rpRepository.observeProtagonistProfileUsage(),
-    ) { settings, profiles, usage ->
-        RpBindingSlice(settings = settings, protagonistProfiles = profiles, protagonistProfileUsage = usage)
+        supportingSlice,
+        rpDraftContextPlan,
+    ) { settings, profiles, usage, supporting, draftPlan ->
+        RpBindingSlice(
+            settings = settings,
+            protagonistProfiles = profiles,
+            protagonistProfileUsage = usage,
+            supporting = supporting,
+            rpDraftContextPlan = draftPlan,
+        )
     }
 
     private val activeRpStatusPanel = activeConversationId.flatMapLatest { conversationId ->
@@ -174,6 +226,7 @@ class ChatViewModel(
             messages = messages,
             settings = settings,
             isGenerating = transient.isGenerating,
+            aiRenamingConversationIds = transient.aiRenamingConversationIds,
             retryingRpOptionsMessageId = transient.retryingRpOptionsMessageId,
             errorMessage = transient.errorMessage,
             isCompactingContext = transient.isCompactingContext,
@@ -200,6 +253,8 @@ class ChatViewModel(
             activeRpSettings = binding.settings,
             protagonistProfiles = binding.protagonistProfiles,
             protagonistProfileUsage = binding.protagonistProfileUsage,
+            supporting = binding.supporting,
+            rpDraftContextPlan = binding.rpDraftContextPlan,
             activeRpStatusPanel = activeRpStatusPanel,
         )
     }
@@ -218,6 +273,7 @@ class ChatViewModel(
         settingsRepository.displaySettings,
         contextWindowPlan,
     ) { core, rp, tool, display, contextPlan ->
+        val currentRpSettings = rp.activeRpSettings?.takeIf { it.conversationId == core.activeConversationId }
         ChatUiState(
             conversations = core.conversations,
             activeConversationId = core.activeConversationId,
@@ -225,21 +281,26 @@ class ChatViewModel(
             settings = core.settings,
             displaySettings = display,
             isGenerating = core.isGenerating,
+            aiRenamingConversationIds = core.aiRenamingConversationIds,
             retryingRpOptionsMessageId = core.retryingRpOptionsMessageId,
             errorMessage = core.errorMessage,
             roleCards = rp.roleCards,
             worldSettings = rp.worldSettings,
-            activeRpSettings = rp.activeRpSettings,
-            activeRoleCard = rp.roleCards.firstOrNull { it.id == rp.activeRpSettings?.roleCardId },
+            activeRpSettings = currentRpSettings,
+            activeRoleCard = rp.roleCards.firstOrNull { it.id == currentRpSettings?.roleCardId },
             activeProtagonistProfile = rp.protagonistProfiles
-                .firstOrNull { it.id == rp.activeRpSettings?.protagonistProfileId },
+                .firstOrNull { it.id == currentRpSettings?.protagonistProfileId },
             protagonistProfiles = rp.protagonistProfiles,
             protagonistProfileUsage = rp.protagonistProfileUsage,
-            activeWorldSetting = rp.worldSettings.firstOrNull { it.id == rp.activeRpSettings?.worldSettingId },
-            activeRpStatusPanel = rp.activeRpStatusPanel,
+            supportingCharacters = rp.supporting.all,
+            supportingCharacterUsage = rp.supporting.usage,
+            activeSupportingCharacterIds = rp.supporting.activeIds,
+            rpDraftContextPlan = rp.rpDraftContextPlan,
+            activeWorldSetting = rp.worldSettings.firstOrNull { it.id == currentRpSettings?.worldSettingId },
+            activeRpStatusPanel = rp.activeRpStatusPanel?.takeIf { it.conversationId == core.activeConversationId },
             writingStyleProfiles = rp.writingStyleProfiles,
             activeWritingStyle = rp.writingStyleProfiles
-                .firstOrNull { it.id == rp.activeRpSettings?.writingStyleId },
+                .firstOrNull { it.id == currentRpSettings?.writingStyleId },
             enrichingMessageIds = tool.enrichingMessageIds,
             contextWindowPlan = contextPlan,
             isCompactingContext = core.isCompactingContext,
@@ -509,6 +570,24 @@ class ChatViewModel(
             }.onFailure { error ->
                 Log.w(TAG, "Renaming conversation failed: ${error.message}", error)
                 transient.update { it.copy(errorMessage = "重命名失败：${error.message ?: "未知错误"}") }
+            }
+        }
+    }
+
+    fun renameConversationWithAi(conversationId: String) {
+        if (conversationId in transient.value.aiRenamingConversationIds) return
+        transient.update { it.copy(aiRenamingConversationIds = it.aiRenamingConversationIds + conversationId) }
+        viewModelScope.launch {
+            try {
+                val title = chatRepository.renameConversationWithAi(conversationId)
+                transient.update { it.copy(errorMessage = "会话已重命名为「$title」") }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w(TAG, "AI renaming conversation failed: ${error.javaClass.simpleName}")
+                transient.update { it.copy(errorMessage = "AI 重命名失败：${error.message ?: "未知错误"}") }
+            } finally {
+                transient.update { it.copy(aiRenamingConversationIds = it.aiRenamingConversationIds - conversationId) }
             }
         }
     }
@@ -783,7 +862,7 @@ class ChatViewModel(
                 if (editedBoundCard) {
                     // 绑定没变，走 updateConversationRpSettings 不会重拍快照（R6）。
                     // 在当前会话里改自己绑的卡即视为显式同步，只影响这一个会话；其它绑定该卡的会话仍冻结。
-                    rpRepository.syncMetricDefinitionsFromProfiles(conversationId)
+                    rpRepository.syncMetricDefinitionsFromProfiles(conversationId, setOf(com.muxuechat.domain.model.RpEntryOwner.ROLE_CARD))
                 } else if (shouldApplyToCurrentConversation) {
                     rpRepository.updateConversationRpSettings(
                         conversationId = conversationId,
@@ -838,7 +917,7 @@ class ChatViewModel(
                 val conversationId = activeConversationId.value
                 val editedBoundProfile = conversationId != null && id != null &&
                     uiState.value.activeRpSettings?.protagonistProfileId == saved.id
-                if (editedBoundProfile) rpRepository.syncMetricDefinitionsFromProfiles(conversationId)
+                if (editedBoundProfile) rpRepository.syncMetricDefinitionsFromProfiles(conversationId, setOf(com.muxuechat.domain.model.RpEntryOwner.PROTAGONIST))
                 editedBoundProfile
             }.onSuccess { synced ->
                 transient.update {
@@ -870,11 +949,47 @@ class ChatViewModel(
         viewModelScope.launch {
             runCatching {
                 rpRepository.deleteProtagonistProfile(profileId)
+                settingsRepository.updateSettings { current ->
+                    if (current.defaultProtagonistProfileId == profileId) current.copy(defaultProtagonistProfileId = null)
+                    else current
+                }
             }.onSuccess {
                 transient.update { it.copy(errorMessage = "主角档案已删除") }
             }.onFailure { error ->
                 Log.w(TAG, "Deleting protagonist profile failed: ${error.message}", error)
                 transient.update { it.copy(errorMessage = "主角档案删除失败：${error.message ?: "未知错误"}") }
+            }
+        }
+    }
+
+    /** RP 设置 Sheet 的草稿变化时调用，用于预估按草稿发送的上下文占用；Sheet 关闭时传 null。 */
+    fun previewRpDraft(draft: RpBindingDraft?) {
+        rpDraftPreview.value = draft
+    }
+
+    /** 保存配角（RP-3c）。新建的配角不在这里勾选：RP 设置草稿会把它加到已选末尾，点保存才生效。 */
+    fun saveSupportingCharacter(id: String?, draft: SupportingCharacterDraft) {
+        viewModelScope.launch {
+            runCatching {
+                rpRepository.saveSupportingCharacter(id, draft)
+            }.onSuccess {
+                transient.update { it.copy(errorMessage = "配角已保存") }
+            }.onFailure { error ->
+                Log.w(TAG, "Saving supporting character failed: ${error.message}", error)
+                transient.update { it.copy(errorMessage = "配角保存失败：${error.message ?: "未知错误"}") }
+            }
+        }
+    }
+
+    fun deleteSupportingCharacter(characterId: String) {
+        viewModelScope.launch {
+            runCatching {
+                rpRepository.deleteSupportingCharacter(characterId)
+            }.onSuccess {
+                transient.update { it.copy(errorMessage = "配角已删除") }
+            }.onFailure { error ->
+                Log.w(TAG, "Deleting supporting character failed: ${error.message}", error)
+                transient.update { it.copy(errorMessage = "配角删除失败：${error.message ?: "未知错误"}") }
             }
         }
     }
@@ -911,6 +1026,8 @@ class ChatViewModel(
         worldSettingId: String?,
         writingStyleId: String?,
         protagonistProfileId: String?,
+        /** null 表示配角勾选没变，不改关联表。 */
+        supportingCharacterIds: List<String>? = null,
         narrativeMinChars: Int? = null,
         narrativePerspective: RpNarrativePerspective? = null,
         plotSuggestionPerspective: RpPlotSuggestionPerspective? = null,
@@ -940,6 +1057,10 @@ class ChatViewModel(
                     plotSuggestionPerspective = plotSuggestionPerspective,
                     rpMarkerMode = effectiveRpMarkerMode,
                 )
+                supportingCharacterIds?.let { ids ->
+                    rpRepository.setConversationSupportingCharacters(conversationId, ids)
+                }
+                settingsRepository.updateSettings { it.copy(defaultProtagonistProfileId = protagonistProfileId) }
             }.onSuccess {
                 transient.update { it.copy(errorMessage = "RP 设置已更新") }
             }.onFailure { error ->
@@ -950,6 +1071,24 @@ class ChatViewModel(
     }
 
     // ---------- 上下文 ----------
+
+    fun syncActiveRpMetricDefinitions(conversationId: String, owner: com.muxuechat.domain.model.RpEntryOwner) {
+        if (activeConversationId.value != conversationId) return
+        viewModelScope.launch {
+            runCatching { rpRepository.syncMetricDefinitionsFromProfiles(conversationId, setOf(owner)) }
+                .onSuccess { changed -> transient.update { it.copy(errorMessage = if (changed) "本组状态定义已同步，现有数值已保留" else "本组状态定义已经是最新") } }
+                .onFailure { error -> transient.update { it.copy(errorMessage = "同步失败：${error.message ?: "请重试"}") } }
+        }
+    }
+
+    fun updateActiveRpMetric(conversationId: String, definition: com.muxuechat.domain.model.RpMetricSnapshot, value: Int) {
+        if (activeConversationId.value != conversationId) return
+        viewModelScope.launch {
+            runCatching { rpRepository.updateMetricValue(conversationId, definition, value) }
+                .onSuccess { transient.update { it.copy(errorMessage = "当前数值已修正，下一轮会使用新值") } }
+                .onFailure { error -> transient.update { it.copy(errorMessage = "修正失败：${error.message ?: "请重试"}") } }
+        }
+    }
 
     fun compactContextNow() {
         val conversationId = activeConversationId.value ?: return
@@ -993,8 +1132,11 @@ class ChatViewModel(
     // ---------- 工具草稿 ----------
 
     fun discardSettingsDraft(draftId: String) {
+        val isDeletion = uiState.value.settingsToolDrafts.firstOrNull { it.id == draftId }?.isDeletion == true
         chatRepository.discardSettingsToolDraft(draftId)
-        transient.update { it.copy(errorMessage = "草稿已丢弃，未写入任何数据") }
+        transient.update {
+            it.copy(errorMessage = if (isDeletion) "已拒绝删除请求，没有删除任何内容" else "草稿已丢弃，未写入任何数据")
+        }
     }
 
     /**
@@ -1009,9 +1151,18 @@ class ChatViewModel(
         worldSetting: WorldSettingDraft?,
         writingStyle: WritingStyleProfileDraft?,
         protagonist: ProtagonistDraft?,
+        supportingCharacter: SupportingCharacterDraft?,
         bindToConversation: Boolean,
+        protagonistProfile: ProtagonistProfileDraft? = null,
     ) {
         if (transient.value.isSavingSettingsDraft) return
+        val update = uiState.value.settingsToolDrafts.firstOrNull { it.id == draftId }?.update
+        if (update != null) {
+            confirmSettingsUpdate(
+                draftId, update, roleCard, worldSetting, writingStyle, protagonistProfile, supportingCharacter,
+            )
+            return
+        }
 
         viewModelScope.launch {
             transient.update { it.copy(isSavingSettingsDraft = true, errorMessage = null) }
@@ -1021,6 +1172,7 @@ class ChatViewModel(
                     worldSetting = worldSetting,
                     writingStyle = writingStyle,
                     protagonist = protagonist,
+                    supportingCharacter = supportingCharacter,
                     bindToConversationId = activeConversationId.value
                         .takeIf { bindToConversation || protagonist != null },
                 )
@@ -1031,6 +1183,7 @@ class ChatViewModel(
                     saved.worldSetting?.let { "世界观" },
                     saved.writingStyle?.let { "文风" },
                     "主角".takeIf { saved.protagonistProfile != null },
+                    "配角".takeIf { saved.supportingCharacter != null },
                 ).joinToString("、")
                 transient.update {
                     it.copy(
@@ -1044,6 +1197,71 @@ class ChatViewModel(
             }.onFailure { error ->
                 Log.w(TAG, "Saving generated settings failed: ${error.message}", error)
                 transient.update { it.copy(errorMessage = "保存失败：${error.message ?: "未知错误"}") }
+            }
+            transient.update { it.copy(isSavingSettingsDraft = false) }
+        }
+    }
+
+    /** 用户确认 AI 的修改请求（`update_rp_setting`）：覆盖原设定，成功后才移除这份请求。 */
+    private fun confirmSettingsUpdate(
+        draftId: String,
+        target: SettingsUpdateTarget,
+        roleCard: RoleCardDraft?,
+        worldSetting: WorldSettingDraft?,
+        writingStyle: WritingStyleProfileDraft?,
+        protagonistProfile: ProtagonistProfileDraft?,
+        supportingCharacter: SupportingCharacterDraft?,
+    ) {
+        viewModelScope.launch {
+            transient.update { it.copy(isSavingSettingsDraft = true, errorMessage = null) }
+            runCatching {
+                rpRepository.applySettingsUpdate(
+                    target = target,
+                    roleCard = roleCard,
+                    worldSetting = worldSetting,
+                    writingStyle = writingStyle,
+                    protagonistProfile = protagonistProfile,
+                    supportingCharacter = supportingCharacter,
+                )
+            }.onSuccess { resetConversations ->
+                chatRepository.discardSettingsToolDraft(draftId)
+                val label = "${target.ref.kind.label}「${target.name}」"
+                transient.update {
+                    it.copy(
+                        errorMessage = if (resetConversations > 0) {
+                            "$label 已修改，$resetConversations 个会话的相关状态条已回到初始值"
+                        } else {
+                            "$label 已修改"
+                        },
+                    )
+                }
+            }.onFailure { error ->
+                Log.w(TAG, "Applying settings update failed: ${error.message}", error)
+                transient.update { it.copy(errorMessage = "修改失败，原设定未改动：${error.message ?: "未知错误"}") }
+            }
+            transient.update { it.copy(isSavingSettingsDraft = false) }
+        }
+    }
+
+    /**
+     * 用户在删除确认界面同意删除（`delete_rp_settings`）。[refs] 是用户最终勾选的项，
+     * 可能少于请求里的项；全部在一个事务里删除，成功后才移除这份请求。
+     */
+    fun confirmSettingsDeletion(draftId: String, refs: List<RpSettingRef>) {
+        if (transient.value.isSavingSettingsDraft || refs.isEmpty()) return
+
+        viewModelScope.launch {
+            transient.update { it.copy(isSavingSettingsDraft = true, errorMessage = null) }
+            runCatching {
+                rpRepository.deleteSettings(refs)
+            }.onSuccess { deleted ->
+                chatRepository.discardSettingsToolDraft(draftId)
+                transient.update {
+                    it.copy(errorMessage = if (deleted == refs.size) "已删除 $deleted 项设定" else "已删除 $deleted 项，其余已不存在")
+                }
+            }.onFailure { error ->
+                Log.w(TAG, "Deleting settings failed: ${error.message}", error)
+                transient.update { it.copy(errorMessage = "删除失败，未删除任何内容：${error.message ?: "未知错误"}") }
             }
             transient.update { it.copy(isSavingSettingsDraft = false) }
         }
@@ -1198,6 +1416,7 @@ class ChatViewModel(
 
     private data class TransientState(
         val isGenerating: Boolean = false,
+        val aiRenamingConversationIds: Set<String> = emptySet(),
         val retryingRpOptionsMessageId: String? = null,
         val errorMessage: String? = null,
         val isCompactingContext: Boolean = false,
@@ -1216,6 +1435,7 @@ class ChatViewModel(
         val messages: List<ChatMessage>,
         val settings: ChatSettings,
         val isGenerating: Boolean,
+        val aiRenamingConversationIds: Set<String>,
         val retryingRpOptionsMessageId: String?,
         val errorMessage: String?,
         val isCompactingContext: Boolean,
@@ -1234,13 +1454,23 @@ class ChatViewModel(
         val activeRpSettings: ConversationRpSettings?,
         val protagonistProfiles: List<ProtagonistProfile>,
         val protagonistProfileUsage: Map<String, Int>,
+        val supporting: SupportingSlice,
+        val rpDraftContextPlan: ContextWindowPlan?,
         val activeRpStatusPanel: RpStatusPanel?,
+    )
+
+    private data class SupportingSlice(
+        val all: List<SupportingCharacter>,
+        val usage: Map<String, Int>,
+        val activeIds: List<String>,
     )
 
     private data class RpBindingSlice(
         val settings: ConversationRpSettings?,
         val protagonistProfiles: List<ProtagonistProfile>,
         val protagonistProfileUsage: Map<String, Int>,
+        val supporting: SupportingSlice,
+        val rpDraftContextPlan: ContextWindowPlan?,
     )
 
     private data class ToolUiSlice(
@@ -1250,6 +1480,7 @@ class ChatViewModel(
 
     companion object {
         private const val TAG = "muxueChat.ChatViewModel"
+        private const val RP_DRAFT_PLAN_DEBOUNCE_MILLIS = 300L
 
         val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

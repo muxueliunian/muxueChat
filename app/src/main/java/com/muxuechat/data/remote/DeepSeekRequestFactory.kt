@@ -33,6 +33,9 @@ object DeepSeekRequestFactory {
 
         /** 把一段旧历史压成摘要。输出是自然语言，预算按摘要篇幅上限给。 */
         CONTEXT_SUMMARY,
+
+        /** 「AI 重命名」生成会话标题。输出只有一行，固定低随机性。 */
+        CONVERSATION_TITLE,
     }
 
     fun build(
@@ -76,7 +79,7 @@ object DeepSeekRequestFactory {
         Purpose.CHAT -> settings.thinkingMode == ThinkingMode.ENABLED
         // 结构化请求只要一段稳定 JSON，思考既慢又贵，且会让输出更容易夹带解释文字。
         Purpose.RP_METADATA, Purpose.RP_STATE_UPDATE, Purpose.SETTINGS_GENERATION,
-        Purpose.CONTEXT_SUMMARY,
+        Purpose.CONTEXT_SUMMARY, Purpose.CONVERSATION_TITLE,
         -> false
     }
 
@@ -86,6 +89,7 @@ object DeepSeekRequestFactory {
         Purpose.RP_STATE_UPDATE -> RP_STATE_UPDATE_MAX_TOKENS
         Purpose.SETTINGS_GENERATION -> SETTINGS_GENERATION_MAX_TOKENS
         Purpose.CONTEXT_SUMMARY -> CONTEXT_SUMMARY_MAX_TOKENS
+        Purpose.CONVERSATION_TITLE -> CONVERSATION_TITLE_MAX_TOKENS
     }
 
     private fun Purpose.temperature(settings: ChatSettings): Double = when (this) {
@@ -95,6 +99,7 @@ object DeepSeekRequestFactory {
         Purpose.SETTINGS_GENERATION -> SETTINGS_GENERATION_TEMPERATURE
         // 摘要要忠于原文，随机性越低越好。
         Purpose.CONTEXT_SUMMARY -> CONTEXT_SUMMARY_TEMPERATURE
+        Purpose.CONVERSATION_TITLE -> CONVERSATION_TITLE_TEMPERATURE
     }
 
     private fun Purpose.topP(settings: ChatSettings): Double = when (this) {
@@ -117,4 +122,8 @@ object DeepSeekRequestFactory {
     private const val RP_STATE_UPDATE_TEMPERATURE = 0.1
     private const val SETTINGS_GENERATION_TEMPERATURE = 0.3
     private const val CONTEXT_SUMMARY_TEMPERATURE = 0.2
+
+    /** 标题只有十几个字；上限留宽是为了不在少数模型多说几句时被截成半句。 */
+    const val CONVERSATION_TITLE_MAX_TOKENS = 256
+    private const val CONVERSATION_TITLE_TEMPERATURE = 0.3
 }

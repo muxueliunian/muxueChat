@@ -24,6 +24,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -59,8 +62,11 @@ fun ConversationDrawer(
     onNewChat: () -> Unit,
     onDelete: (String) -> Unit,
     onRename: (String, String) -> Unit,
+    onAiRename: (String) -> Unit,
     onClear: (String) -> Unit,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    aiRenamingConversationIds: Set<String> = emptySet(),
 ) {
     var deleteTarget by remember { mutableStateOf<Conversation?>(null) }
     var renameTarget by remember { mutableStateOf<Conversation?>(null) }
@@ -102,14 +108,21 @@ fun ConversationDrawer(
                         ConversationRow(
                             conversation = conversation,
                             selected = conversation.id == activeId,
+                            isAiRenaming = conversation.id in aiRenamingConversationIds,
                             onClick = { onSelect(conversation.id) },
                             onDelete = { deleteTarget = conversation },
                             onRename = { renameTarget = conversation },
+                            onAiRename = { onAiRename(conversation.id) },
                             onClear = { clearTarget = conversation },
                         )
                     }
                 }
             }
+            if (conversations.isEmpty()) {
+                Spacer(modifier = Modifier.weight(1f))
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            SettingsEntry(onClick = onOpenSettings)
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -156,6 +169,34 @@ fun ConversationDrawer(
     }
 }
 
+/** 设置是低频入口，放在抽屉底部，把顶栏宽度留给会话标题与模型名。 */
+@Composable
+private fun SettingsEntry(onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .defaultMinSize(minHeight = 48.dp)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Outlined.Settings,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(20.dp),
+        )
+        Text(
+            text = "设置",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(start = 12.dp),
+        )
+    }
+}
+
 @Composable
 private fun NewChatButton(onClick: () -> Unit) {
     Row(
@@ -188,9 +229,11 @@ private fun NewChatButton(onClick: () -> Unit) {
 private fun ConversationRow(
     conversation: Conversation,
     selected: Boolean,
+    isAiRenaming: Boolean,
     onClick: () -> Unit,
     onDelete: () -> Unit,
     onRename: () -> Unit,
+    onAiRename: () -> Unit,
     onClear: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -234,7 +277,7 @@ private fun ConversationRow(
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = formatConversationTime(conversation.updatedAtMillis),
+                text = if (isAiRenaming) "正在生成标题…" else formatConversationTime(conversation.updatedAtMillis),
                 style = MaterialTheme.typography.labelSmall,
                 color = if (selected) contentColor.copy(alpha = 0.75f)
                 else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -260,6 +303,14 @@ private fun ConversationRow(
                     onClick = {
                         menuExpanded = false
                         onRename()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(if (isAiRenaming) "正在生成标题…" else "AI 重命名") },
+                    enabled = !isAiRenaming,
+                    onClick = {
+                        menuExpanded = false
+                        onAiRename()
                     },
                 )
                 DropdownMenuItem(

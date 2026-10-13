@@ -15,6 +15,9 @@ import com.muxuechat.data.remote.OpenAiCompatibleStreamEvent
 import com.muxuechat.data.remote.OpenAiCompatibleToolCallAccumulator
 import com.muxuechat.data.remote.OpenAiCompatibleToolCallDto
 import com.muxuechat.data.remote.OpenAiCompatibleUserFacingError
+import com.muxuechat.data.remote.OpenAiCompatibleProtocolException
+import com.muxuechat.data.remote.OpenAiCompatibleToolCallValidator
+import com.muxuechat.data.remote.requireCompleteText
 import com.muxuechat.data.remote.DeepSeekApiClient
 import com.muxuechat.data.remote.DeepSeekMessageDto
 import com.muxuechat.data.remote.DeepSeekRequestFactory
@@ -28,6 +31,9 @@ import com.muxuechat.domain.tool.SettingsTool
 import com.muxuechat.domain.tool.SettingsToolArgumentParser
 import com.muxuechat.domain.tool.SettingsToolDraft
 import com.muxuechat.domain.tool.SettingsToolParseResult
+import com.muxuechat.domain.tool.RpSettingsListing
+import com.muxuechat.domain.tool.RpSettingPatcher
+import com.muxuechat.domain.tool.SettingsUpdateTarget
 import com.muxuechat.domain.model.ChatMessage
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatRole
@@ -54,11 +60,14 @@ import com.muxuechat.domain.context.ChatContextPlanner
 import com.muxuechat.domain.context.ContextToolDefinition
 import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.context.ModelContextCatalog
+import com.muxuechat.domain.prompt.ConversationTitlePrompt
 import com.muxuechat.domain.prompt.PromptComposer
 import com.muxuechat.domain.prompt.PromptContext
 import com.muxuechat.domain.prompt.PromptMessage
 import com.muxuechat.domain.prompt.RpMetadataPromptContext
 import com.muxuechat.domain.rp.RpEffectiveDefinitions
+import com.muxuechat.domain.model.RpEntryOwner
+import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.rp.RpMessageMetadataDraft
 import com.muxuechat.domain.rp.RpMessageMetadataParser
 import com.muxuechat.domain.rp.RpStatusPanelDraft
@@ -80,6 +89,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -88,6 +98,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.update
 import java.util.UUID
 
 class ChatRepositoryImpl(
@@ -104,6 +115,7 @@ class ChatRepositoryImpl(
     private val chatContextPlanner: ChatContextPlanner = ChatContextPlanner(promptComposer),
     private val settingsToolDraftStore: SettingsToolDraftStore = SettingsToolDraftStore(),
     private val settingsToolArgumentParser: SettingsToolArgumentParser = SettingsToolArgumentParser(),
+    private val settingsToolQueries: RpSettingsToolQueries = RpSettingsToolQueries(chatDao),
     /** 后台补写 RP 元数据用。与请求流分离，正文完成后不再阻塞用户。 */
     private val enrichmentScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val rpStateBlockParser: RpStateBlockParser = RpStateBlockParser(),
@@ -115,6 +127,13 @@ class ChatRepositoryImpl(
         ChatTransportRouter(openAiCompatibleClient, xaiResponsesTransport, xaiAccessTokens)
     private val generationSessions = GenerationSessionRegistry()
     private val enrichmentTasks = RpEnrichmentTaskRegistry()
+
+    /**
+     * 正在进行的历史替换（重新生成 / 编辑后重生成）。旧分支在提交前仍留在 Room 里，
+     * 以便失败或取消时原样保留；但界面上必须立即让位给临时回复，否则新回复会接在旧回复下方。
+     * 这里只影响 [observeMessages] 的展示，不改动库里的正式历史。
+     */
+    private val historyReplacementOverlays = MutableStateFlow<Map<String, HistoryReplacementPlan>>(emptyMap())
 
     /**
      * 正式历史保持不变时生成新分支所需的不可变快照。
@@ -155,6 +174,7 @@ class ChatRepositoryImpl(
 
     private data class RpEnrichmentInput(
         val expectedMessage: MessageEntity,
+        val expectedMetadata: com.muxuechat.data.local.MessageRpMetadataEntity?,
         val turn: RpTurnSnapshot,
         val hasLocalPanel: Boolean,
         val expectedRpState: Boolean,
@@ -169,9 +189,36 @@ class ChatRepositoryImpl(
     override fun observeMessages(conversationId: String): Flow<List<ChatMessage>> = combine(
         chatDao.observeMessages(conversationId),
         chatDao.observeMessageRpMetadata(conversationId),
-    ) { messages, metadataRows ->
+        historyReplacementOverlays,
+    ) { messages, metadataRows, overlays ->
         val metadataByMessageId = metadataRows.associate { it.messageId to it.toDomain() }
-        messages.map { message -> message.toDomain(metadataByMessageId[message.id]) }
+        val overlay = overlays[conversationId]
+        val visible = if (overlay == null) {
+            messages
+        } else {
+            HistoryReplacementHistory.visibleDuringReplacement(
+                messages = messages,
+                obsoleteMessageIds = overlay.obsoleteMessageIds,
+                editedUserMessage = overlay.editedUserMessage,
+            )
+        }
+        visible.map { message -> message.toDomain(metadataByMessageId[message.id]) }
+    }
+
+    /** 替换期间的展示遮罩；只清理自己登记的那一份，避免误清后来者。 */
+    private suspend fun <T> withHistoryReplacementOverlay(
+        conversationId: String,
+        plan: HistoryReplacementPlan,
+        block: suspend () -> T,
+    ): T {
+        historyReplacementOverlays.update { it + (conversationId to plan) }
+        try {
+            return block()
+        } finally {
+            historyReplacementOverlays.update { current ->
+                if (current[conversationId] === plan) current - conversationId else current
+            }
+        }
     }
 
     override suspend fun createConversation(title: String?): Conversation {
@@ -325,14 +372,16 @@ class ChatRepositoryImpl(
                 rpTurnSnapshot = rpTurnSnapshot,
             )
 
-            emitAll(
-                generateAssistant(
-                    conversationId = conversationId,
-                    requestSnapshot = requestSnapshot,
-                    replacementPlan = replacementPlan,
-                    registeredSessionId = sessionId,
-                ),
-            )
+            withHistoryReplacementOverlay(conversationId, replacementPlan) {
+                emitAll(
+                    generateAssistant(
+                        conversationId = conversationId,
+                        requestSnapshot = requestSnapshot,
+                        replacementPlan = replacementPlan,
+                        registeredSessionId = sessionId,
+                    ),
+                )
+            }
         } finally {
             generationSessions.finish(sessionId)
         }
@@ -353,6 +402,7 @@ class ChatRepositoryImpl(
         require(turn.roleCard != null) { "当前会话未启用可用的 RP 角色卡" }
         val input = RpEnrichmentInput(
             expectedMessage = lastAssistant,
+            expectedMetadata = chatDao.getMessageRpMetadataForMessage(lastAssistant.id),
             turn = turn,
             hasLocalPanel = true,
             expectedRpState = turn.definitions.isNotEmpty(),
@@ -425,14 +475,16 @@ class ChatRepositoryImpl(
                 rpTurnSnapshot = rpTurnSnapshot,
             )
 
-            emitAll(
-                generateAssistant(
-                    conversationId = original.conversationId,
-                    requestSnapshot = requestSnapshot,
-                    replacementPlan = replacementPlan,
-                    registeredSessionId = sessionId,
-                ),
-            )
+            withHistoryReplacementOverlay(original.conversationId, replacementPlan) {
+                emitAll(
+                    generateAssistant(
+                        conversationId = original.conversationId,
+                        requestSnapshot = requestSnapshot,
+                        replacementPlan = replacementPlan,
+                        registeredSessionId = sessionId,
+                    ),
+                )
+            }
         } finally {
             generationSessions.finish(sessionId)
         }
@@ -990,6 +1042,7 @@ class ChatRepositoryImpl(
                 var roundUsage: TokenUsageSnapshot? = null
 
                 val toolCalls: List<OpenAiCompatibleToolCallDto>
+                var finishReason: String? = null
                 // 回传 assistant(tool_calls) 时只带本轮的正文，不能重复上一轮的工具前言。
                 var responseContent = ""
                 val roundCursor = streamingAccumulator?.markRoundStart()
@@ -1002,6 +1055,8 @@ class ChatRepositoryImpl(
                         credential = credential,
                         baseUrl = requestSnapshot.baseUrl,
                         requestDto = request,
+                        conversationHeaderName = settings.activeCustomProvider?.conversationHeaderName.orEmpty(),
+                        conversationId = conversationId,
                     ).collect { event ->
                         when (event) {
                             is OpenAiCompatibleStreamEvent.Delta -> {
@@ -1014,13 +1069,14 @@ class ChatRepositoryImpl(
                                 }
                                 toolCallAccumulator.accept(event.toolCalls)
                                 textAccumulator.append(
-                                    contentDelta = event.content,
+                                    contentDelta = event.content?.takeIf { it.isNotEmpty() } ?: event.refusal,
                                     // 支持思考的模型会先推送 reasoning 增量，聊天页复用已有的折叠区展示。
                                     reasoningDelta = event.reasoningContent,
                                 )?.let { decision ->
                                     current = applyStreamingFlush(current, decision) { emit(it) }
                                 }
                                 if (event.finishReason != null) {
+                                    finishReason = event.finishReason
                                     receivedTerminalEvent = true
                                 }
                             }
@@ -1030,20 +1086,22 @@ class ChatRepositoryImpl(
                             }
                         }
                     }
-                    // 某些上游在纯工具调用后会直接断流；只要已收到调用，就继续下一轮。
-                    if (!receivedTerminalEvent && !toolCallAccumulator.hasCalls()) {
-                        error("OpenAI-compatible stream ended before completion")
+                    // 工具片段不代表完成，截断参数不能被执行或误标成功。
+                    if (!receivedTerminalEvent) {
+                        throw OpenAiCompatibleProtocolException("供应商响应在完成前中断，已保留收到的内容，请重试")
                     }
                     val forcedRoundSnapshot = textAccumulator.forceSnapshot()
                     roundFlushDecision = forcedRoundSnapshot
                     current = current.withStreamingSnapshot(forcedRoundSnapshot.snapshot)
                     responseContent = textAccumulator.snapshotSince(requireNotNull(roundCursor)).content
-                    toolCalls = if (tools != null) toolCallAccumulator.build() else emptyList()
+                    toolCalls = toolCallAccumulator.build()
                 } else {
                     val response = chatTransport.completeChat(
                         credential = credential,
                         baseUrl = requestSnapshot.baseUrl,
                         requestDto = request,
+                        conversationHeaderName = settings.activeCustomProvider?.conversationHeaderName.orEmpty(),
+                        conversationId = conversationId,
                     )
                     roundUsage = response.usage?.let { usage ->
                         TokenUsageNormalizer.normalize(
@@ -1053,19 +1111,32 @@ class ChatRepositoryImpl(
                         )
                     }
                     val message = response.choices.firstOrNull()?.message
-                    responseContent = message?.content.orEmpty()
+                    finishReason = response.choices.firstOrNull()?.finishReason
+                    responseContent = message?.content?.takeIf { it.isNotEmpty() } ?: message?.refusal.orEmpty()
                     current = current.copy(
-                        content = current.content + message?.content.orEmpty(),
+                        content = current.content + responseContent,
                         reasoningContent = appendNullable(current.reasoningContent, message?.anyReasoning),
                         updatedAtMillis = clock(),
                     )
-                    toolCalls = if (tools != null) {
-                        message?.toolCalls.orEmpty().filter { !it.id.isNullOrBlank() }
-                    } else {
-                        emptyList()
-                    }
+                    toolCalls = OpenAiCompatibleToolCallValidator.validate(message?.toolCalls.orEmpty())
                 }
                 lastUsage = roundUsage
+
+                when (finishReason) {
+                    "length" -> throw OpenAiCompatibleProtocolException("回复达到输出上限而被截断，已保留收到的内容。请提高上限或分次提问")
+                    "content_filter" -> throw OpenAiCompatibleProtocolException("供应商因内容过滤未返回完整回复，已保留收到的内容")
+                    "tool_calls" -> if (toolCalls.isEmpty()) {
+                        throw OpenAiCompatibleProtocolException("供应商声明了工具调用，但未返回完整的调用内容")
+                    }
+                    null, "stop" -> Unit
+                    else -> throw OpenAiCompatibleProtocolException("供应商返回了当前不支持的结束原因，未将回复标为完成")
+                }
+                if (tools == null && toolCalls.isNotEmpty()) {
+                    throw OpenAiCompatibleProtocolException("供应商返回了工具调用，但当前会话未启用工具")
+                }
+                if (toolCalls.isEmpty() && responseContent.isBlank()) {
+                    throw OpenAiCompatibleProtocolException("供应商未返回回复正文，请重试")
+                }
 
                 if (toolCalls.isEmpty()) break
 
@@ -1281,16 +1352,17 @@ class ChatRepositoryImpl(
             )
         }
 
-        // 世界观、文风、主角档案与配角的**正文**修改不会改动 conversation_rp_settings，
+        // 档案的正文修改不会改动 conversation_rp_settings，
         // 因此必须单独观察它们，否则改完设定后面板上的 token 数不动。
         // 配角的关联表查询同时覆盖勾选变化与配角内容修改（Room 按涉及的表失效）。
-        val settingSignals = combine(
-            settingsRepository.settings,
+        val profileSignals = combine(
             chatDao.observeWorldSettings(),
             chatDao.observeWritingStyleProfiles(),
             chatDao.observeProtagonistProfiles(),
+            chatDao.observeRoleCards(),
             chatDao.observeConversationSupportingCharacters(conversationId),
-        ) { settings, _, _, _, _ -> settings }
+        ) { _, _, _, _, _ -> Unit }
+        val settingSignals = combine(settingsRepository.settings, profileSignals) { settings, _ -> settings }
 
         return combine(conversationSignals, settingSignals) { signals, settings -> signals to settings }
             .debounce(CONTEXT_WINDOW_DEBOUNCE_MILLIS)
@@ -1338,6 +1410,68 @@ class ChatRepositoryImpl(
         )
     }
 
+    override suspend fun planContextWindowForRpDraft(
+        conversationId: String?,
+        draft: RpBindingDraft,
+    ): ContextWindowPlan = withContext(Dispatchers.Default) {
+        val settings = settingsRepository.currentSettings().normalized()
+        val stored = conversationId?.let { chatDao.getConversationRpSettings(it)?.toDomain() }
+        val rpEnabled = draft.isRpEnabled
+        val roleCard = draft.roleCardId?.takeIf { rpEnabled }?.let { chatDao.getRoleCard(it)?.toDomain() }
+        val protagonistProfile = draft.protagonistProfileId?.takeIf { rpEnabled }
+            ?.let { chatDao.getProtagonistProfile(it)?.toDomain() }
+
+        // 状态栏定义：绑定没变的组用会话快照（R6），换了的组按新档案的最新定义——与保存后的实际快照一致。
+        var snapshot = stored?.metricSnapshot.orEmpty()
+        if (stored?.roleCardId != draft.roleCardId) {
+            snapshot = RpEffectiveDefinitions.replaceGroup(
+                snapshot,
+                RpEntryOwner.ROLE_CARD,
+                RpEffectiveDefinitions.snapshotOf(RpEntryOwner.ROLE_CARD, roleCard?.entries.orEmpty()),
+            )
+        }
+        if (stored?.protagonistProfileId != draft.protagonistProfileId) {
+            snapshot = RpEffectiveDefinitions.replaceGroup(
+                snapshot,
+                RpEntryOwner.PROTAGONIST,
+                RpEffectiveDefinitions.snapshotOf(RpEntryOwner.PROTAGONIST, protagonistProfile?.entries.orEmpty()),
+            )
+        }
+        val rpSettings = (stored ?: ConversationRpSettings(conversationId = conversationId.orEmpty(), updatedAtMillis = 0L))
+            .copy(
+                isRpEnabled = rpEnabled,
+                roleCardId = draft.roleCardId,
+                worldSettingId = draft.worldSettingId,
+                writingStyleId = draft.writingStyleId,
+                protagonistProfileId = draft.protagonistProfileId,
+                metricSnapshot = snapshot,
+            )
+        val supportingCharacters = if (rpEnabled) {
+            draft.supportingCharacterIds.mapNotNull { chatDao.getSupportingCharacter(it)?.toDomain() }
+        } else {
+            emptyList()
+        }
+
+        chatContextPlanner.plan(
+            buildContextInput(
+                settings = settings,
+                rpSettings = rpSettings,
+                roleCard = roleCard,
+                worldSetting = loadWorldSetting(rpSettings, rpEnabled),
+                writingStyle = loadWritingStyle(rpSettings, rpEnabled),
+                protagonistProfile = protagonistProfile,
+                supportingCharacters = supportingCharacters,
+                // 面板当前值只占几行；换卡后会被重置，这里仍按现值估算，误差可以忽略。
+                statusPanel = conversationId?.let { chatDao.getRpStatusPanel(it)?.toDomain() }
+                    ?.takeIf { roleCard != null || protagonistProfile != null },
+                history = conversationId?.let { loadPromptHistory(it) }.orEmpty(),
+                summaryState = conversationId?.let { getSummaryState(it) } ?: ContextSummaryState.EMPTY,
+                settingsToolsAvailable = settings.settingsToolsEnabledForActiveProvider && !rpEnabled,
+                lastApiUsage = null,
+            ),
+        )
+    }
+
     override fun observeSettingsToolDrafts(): Flow<List<SettingsToolDraft>> = settingsToolDraftStore.drafts
 
     override fun discardSettingsToolDraft(draftId: String) {
@@ -1348,6 +1482,63 @@ class ChatRepositoryImpl(
         val requestSnapshot = freezeProviderRequest()
         return runCompaction(conversationId, requestSnapshot)
             ?: error("当前历史还不够长，没有可压缩的内容。")
+    }
+
+    override suspend fun renameConversationWithAi(conversationId: String): String {
+        val conversation = chatDao.getConversation(conversationId)
+            ?: error("会话已被删除，无法生成标题")
+        val messages = ConversationTitlePrompt.build(
+            chatDao.getMessages(conversationId)
+                .filter { it.status == MessageStatus.COMPLETED }
+                .map { ConversationTitlePrompt.Line(it.role, it.content) },
+        ) ?: error("会话还没有可用的内容，无法生成标题")
+        val requestSnapshot = freezeProviderRequest()
+        val settings = requestSnapshot.settings
+
+        val raw = try {
+            when (requestSnapshot.provider) {
+                ChatProviderId.DEEPSEEK -> apiClient.completeChat(
+                    requestSnapshot.requireApiKey(),
+                    requestSnapshot.baseUrl,
+                    DeepSeekRequestFactory.build(
+                        settings = settings,
+                        messages = messages.map { DeepSeekMessageDto(role = it.role, content = it.content) },
+                        purpose = DeepSeekRequestFactory.Purpose.CONVERSATION_TITLE,
+                    ),
+                ).choices.firstOrNull()?.message?.content.orEmpty()
+
+                ChatProviderId.CUSTOM_OPENAI -> chatTransport.completeChat(
+                    requestSnapshot.credential,
+                    requestSnapshot.baseUrl,
+                    OpenAiCompatibleRequestFactory.build(
+                        settings = settings,
+                        model = requestSnapshot.model,
+                        messages = messages.map { OpenAiCompatibleMessageDto(role = it.role, content = it.content) },
+                        purpose = OpenAiCompatibleRequestFactory.Purpose.CONVERSATION_TITLE,
+                    ),
+                    conversationHeaderName = settings.activeCustomProvider?.conversationHeaderName.orEmpty(),
+                    conversationId = conversationId,
+                ).requireCompleteText()
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            Log.w(TAG, "AI title failed: conversationId=$conversationId ${error.toSafeLogDescriptor()}")
+            error(error.toUserFacingMessage(requestSnapshot.provider))
+        }
+
+        val title = ConversationTitlePrompt.clean(raw, MAX_TITLE_LENGTH)
+            ?: error("模型没有返回可用的标题，请重试")
+        val updated = chatDao.updateConversationTitleIfUnchanged(
+            conversationId = conversationId,
+            expectedTitle = conversation.title,
+            expectedUpdatedAtMillis = conversation.updatedAtMillis,
+            title = title,
+            updatedAtMillis = clock(),
+        )
+        check(updated == 1) { "会话已修改或删除，本次 AI 标题未保存；请按需重新生成" }
+        Log.i(TAG, "AI title saved: conversationId=$conversationId titleLength=${title.length}")
+        return title
     }
 
     /**
@@ -1404,7 +1595,9 @@ class ChatRepositoryImpl(
                         requestSnapshot.credential,
                         requestSnapshot.baseUrl,
                         request,
-                    ).choices.firstOrNull()?.message?.content.orEmpty().trim()
+                        conversationHeaderName = settings.activeCustomProvider?.conversationHeaderName.orEmpty(),
+                        conversationId = conversationId,
+                    ).requireCompleteText().trim()
                 }
             }
             if (summary.isBlank()) {
@@ -1452,7 +1645,7 @@ class ChatRepositoryImpl(
      * **绝不写数据库。** 返回给模型的结果只说"草稿已创建"和 id，不回传草稿全文——
      * 否则同一份内容会在上下文里存两遍，白白翻倍 token。
      */
-    private fun executeSettingsToolCalls(
+    private suspend fun executeSettingsToolCalls(
         conversationId: String,
         toolCalls: List<DeepSeekToolCallDto>,
     ): List<DeepSeekMessageDto> = executeSettingsToolInvocations(
@@ -1475,7 +1668,7 @@ class ChatRepositoryImpl(
     }
 
     /** 将标准 OpenAI tool result 包装成协议要求的 role="tool" 消息。 */
-    private fun executeOpenAiCompatibleSettingsToolCalls(
+    private suspend fun executeOpenAiCompatibleSettingsToolCalls(
         conversationId: String,
         toolCalls: List<OpenAiCompatibleToolCallDto>,
     ): List<OpenAiCompatibleMessageDto> = executeSettingsToolInvocations(
@@ -1500,8 +1693,11 @@ class ChatRepositoryImpl(
     /**
      * 两条协议共享相同的工具业务语义：解析参数 → 只创建内存草稿 → 向模型返回简短结果。
      * DTO 适配保留在上方，避免 domain 草稿逻辑依赖任一供应商的网络类型。
+     *
+     * 例外是两个只读动作：`list_rp_settings` 把库里的设定全文返回给模型；
+     * `delete_rp_settings` 只查库确认 id 存在，生成删除请求草稿，**同样不写库**。
      */
-    private fun executeSettingsToolInvocations(
+    private suspend fun executeSettingsToolInvocations(
         conversationId: String,
         calls: List<SettingsToolInvocation>,
     ): List<SettingsToolExecutionResult> = calls.map { call ->
@@ -1529,7 +1725,7 @@ class ChatRepositoryImpl(
                             "warnings=${parsed.draft.warnings.size}",
                     )
                     buildString {
-                        append("已创建${parsed.draft.typeLabel}草稿（id=${parsed.draft.id}），")
+                        append("已创建${parsed.draft.pendingLabel}（id=${parsed.draft.id}），")
                         append("正在等待用户在预览界面确认。")
                         if (parsed.draft.warnings.isNotEmpty()) {
                             append("有 ${parsed.draft.warnings.size} 处参数已被本地规则修正。")
@@ -1541,6 +1737,96 @@ class ChatRepositoryImpl(
                 is SettingsToolParseResult.Failure -> {
                     Log.w(TAG, "Settings tool parse failed: tool=${tool.apiName} reason=${parsed.reason}")
                     "调用失败：${parsed.reason}请补齐必要字段后重试，或直接询问用户。"
+                }
+
+                is SettingsToolParseResult.ListRequest -> {
+                    val inventory = settingsToolQueries.inventory()
+                    // 只记条数：结果里是角色卡全文，禁止进日志（AGENT.md §6）。
+                    Log.i(TAG, "Settings listed: kinds=${parsed.kinds.size}")
+                    RpSettingsListing.format(inventory, parsed.kinds)
+                }
+
+                is SettingsToolParseResult.GetRequest -> {
+                    val detail = RpSettingsListing.item(settingsToolQueries.inventory(), parsed.ref)
+                    Log.i(TAG, "Setting read: kind=${parsed.ref.kind.apiName} found=${detail != null}")
+                    detail ?: "调用失败：${parsed.ref.kind.label} ${parsed.ref.id} 不存在。请先调用 list_rp_settings 获取正确的 id。"
+                }
+
+                is SettingsToolParseResult.UpdateRequest -> {
+                    val current = settingsToolQueries.current(parsed.ref)
+                    if (current == null) {
+                        "调用失败：${parsed.ref.kind.label} ${parsed.ref.id} 不存在。请先调用 list_rp_settings 获取正确的 id。"
+                    } else {
+                        RpSettingPatcher.apply(current, parsed.patch).fold(
+                            onSuccess = { patched ->
+                                val usage = settingsToolQueries.inventory().usage[parsed.ref] ?: 0
+                                val draft = SettingsToolDraft(
+                                    id = java.util.UUID.randomUUID().toString(),
+                                    tool = tool,
+                                    conversationId = conversationId,
+                                    roleCard = patched.roleCard,
+                                    worldSetting = patched.worldSetting,
+                                    writingStyle = patched.writingStyle,
+                                    supportingCharacter = patched.supportingCharacter,
+                                    protagonistProfile = patched.protagonistProfile,
+                                    update = SettingsUpdateTarget(
+                                        ref = parsed.ref,
+                                        name = current.displayName,
+                                        usageCount = usage,
+                                        baseUpdatedAtMillis = current.updatedAtMillis,
+                                        changes = patched.changes,
+                                        resetMetricNames = patched.resetMetricNames,
+                                    ),
+                                    warnings = parsed.warnings + patched.warnings,
+                                    createdAtMillis = clock(),
+                                )
+                                settingsToolDraftStore.add(draft)
+                                Log.i(
+                                    TAG,
+                                    "Update request created: kind=${parsed.ref.kind.apiName} draftId=${draft.id} " +
+                                        "changes=${patched.changes.size} resetMetrics=${patched.resetMetricNames.size}",
+                                )
+                                buildString {
+                                    append("已生成修改请求（${patched.changes.joinToString("、")}），正在等待用户在预览界面核对。")
+                                    if (patched.warnings.isNotEmpty()) {
+                                        append("本地规则提示：${patched.warnings.joinToString("；")}。")
+                                    }
+                                    append("用户确认前不会修改任何内容。请简短告知用户去预览界面核对，不要声称已经修改。")
+                                }
+                            },
+                            onFailure = { error ->
+                                Log.w(TAG, "Update request rejected: kind=${parsed.ref.kind.apiName}")
+                                "调用失败：${error.message}"
+                            },
+                        )
+                    }
+                }
+
+                is SettingsToolParseResult.DeleteRequest -> {
+                    val (found, missing) = settingsToolQueries.resolve(parsed.refs)
+                    val missingText = missing.joinToString("、") { "${it.kind.apiName} ${it.id}" }
+                    if (found.isEmpty()) {
+                        Log.w(TAG, "Delete request resolved nothing: requested=${parsed.refs.size}")
+                        "调用失败：这些 id 都不存在：$missingText。请先调用 list_rp_settings 获取正确的 id。"
+                    } else {
+                        val draft = SettingsToolDraft(
+                            id = java.util.UUID.randomUUID().toString(),
+                            tool = tool,
+                            conversationId = conversationId,
+                            deletion = found,
+                            warnings = parsed.warnings + listOfNotNull(
+                                missingText.takeIf { missing.isNotEmpty() }?.let { "以下 id 不存在，已忽略：$it" },
+                            ),
+                            createdAtMillis = clock(),
+                        )
+                        settingsToolDraftStore.add(draft)
+                        Log.i(TAG, "Delete request created: draftId=${draft.id} targets=${found.size} missing=${missing.size}")
+                        buildString {
+                            append("已生成删除请求（${found.size} 项），正在等待用户在确认界面核对。")
+                            if (missing.isNotEmpty()) append("以下 id 不存在，已忽略：$missingText。")
+                            append("用户同意前不会删除任何内容。请简短告知用户去确认界面核对，不要声称已经删除。")
+                        }
+                    }
                 }
             }
         }
@@ -1901,6 +2187,7 @@ class ChatRepositoryImpl(
                 launchRpEnrichment(
                     RpEnrichmentInput(
                         expectedMessage = completed,
+                        expectedMetadata = chatDao.getMessageRpMetadataForMessage(completed.id),
                         turn = capturedTurn.copy(
                             currentPanel = prepared.localStatusPanel ?: capturedTurn.currentPanel,
                             expectedStatusPanel = committedStatusPanel
@@ -1927,7 +2214,8 @@ class ChatRepositoryImpl(
     ): PreparedAssistant {
         val contentExtraction = rpStateBlockParser.extract(message.content)
         val reasoningExtraction = message.reasoningContent?.let { rpStateBlockParser.extract(it) }
-        val expectedRpState = turn.definitions.isNotEmpty()
+        val rpEnabled = turn.rpSettings?.isRpEnabled == true
+        val expectedRpState = rpEnabled && turn.definitions.isNotEmpty()
 
         // 只做本地解析。剧情建议、内心独白、兜底状态都需要额外的网络往返，
         // 放在这里会让用户看完正文后还要干等一整次请求，因此移到后台补写。
@@ -1943,7 +2231,7 @@ class ChatRepositoryImpl(
         val missingExpectedState = !metricsUpdated && expectedRpState
         // 元数据补写（内心独白、剧情建议）需要角色卡；没有角色卡时（RP-2f，只有主角），
         // 后台只在数值没更新时跑一次兜底状态请求。
-        val needsEnrichment = turn.roleCard != null || missingExpectedState
+        val needsEnrichment = rpEnabled && (turn.roleCard != null || missingExpectedState)
         val completed = message.copy(
             content = contentExtraction.cleanContent,
             reasoningContent = reasoningExtraction?.cleanContent ?: message.reasoningContent,
@@ -2066,6 +2354,7 @@ class ChatRepositoryImpl(
             statusPanel = candidatePanel?.toEntity(),
             missingStateMessage = missingStateMessage,
             updatedAtMillis = now,
+            expectedMetadata = input.expectedMetadata,
         )
         check(committed) { "回复或 RP 设置已发生变化，补写结果已丢弃" }
         return savedMetadata
@@ -2086,6 +2375,7 @@ class ChatRepositoryImpl(
         val configuration = chatDao.getRpTurnConfigurationSnapshot(
             conversationId = conversationId,
             statusBeforeMessageId = targetMessageId.takeIf { resolveStatusBeforeTarget },
+            includePausedBindings = resolveStatusBeforeTarget,
         )
         val rpSettingsEntity = configuration.settings
         val rpSettings = rpSettingsEntity?.toDomain()
@@ -2134,7 +2424,7 @@ class ChatRepositoryImpl(
     }
 
     /**
-     * 切点之前的状态。返回 null **只**表示 RP 未启用（暂停或未绑卡），调用方据此不动面板；
+     * 切点之前的状态。返回 null 表示未绑定任何可用角色或主角；暂停期间改写也必须回滚。
      * 角色卡没有状态条时也要返回面板，否则关系与场景不会随编辑 / 重新生成回滚。
      */
     private fun resolveRpStatusFromSnapshot(
@@ -2246,7 +2536,9 @@ class ChatRepositoryImpl(
                         requestSnapshot.credential,
                         requestSnapshot.baseUrl,
                         request,
-                    ).choices.firstOrNull()?.message?.content.orEmpty()
+                        conversationHeaderName = settings.activeCustomProvider?.conversationHeaderName.orEmpty(),
+                        conversationId = conversationId,
+                    ).requireCompleteText()
                 }
             }
             rpMessageMetadataParser.parse(content).also { parsed ->
@@ -2311,7 +2603,9 @@ class ChatRepositoryImpl(
                         requestSnapshot.credential,
                         requestSnapshot.baseUrl,
                         request,
-                    ).choices.firstOrNull()?.message?.content.orEmpty()
+                        conversationHeaderName = settings.activeCustomProvider?.conversationHeaderName.orEmpty(),
+                        conversationId = conversationId,
+                    ).requireCompleteText()
                 }
             }
             parseLooseRpStatusPanel(content)
