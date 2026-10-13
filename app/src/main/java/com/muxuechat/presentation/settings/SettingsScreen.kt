@@ -38,6 +38,7 @@ fun SettingsScreen(
     refreshingModelsProviderId: String?,
     onAddProvider: (name: String, baseUrl: String) -> Unit,
     onAddXaiProvider: () -> Unit,
+    onAddGoogleProvider: () -> Unit,
     onUpdateProvider: (providerId: String, transform: CustomProviderMutation) -> Unit,
     onDeleteProvider: (String) -> Unit,
     onSaveProviderKey: (providerId: String, apiKey: String) -> Unit,
@@ -48,6 +49,9 @@ fun SettingsScreen(
     onXaiCancelLogin: () -> Unit,
     onXaiSignOut: () -> Unit,
     onXaiBrowserUnavailable: () -> Unit,
+    googleAuthState: GoogleAuthUiState,
+    onGoogleLogin: () -> Unit,
+    onGoogleSignOut: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     refreshErrors: Map<String, String> = emptyMap(),
@@ -137,6 +141,7 @@ fun SettingsScreen(
                         onChange = { transform -> flushCoordinator.flush(); onSettingsChange(transform) },
                         onAddProvider = onAddProvider,
                         onAddXaiProvider = { flushCoordinator.flush(); onAddXaiProvider() },
+                        onAddGoogleProvider = { flushCoordinator.flush(); onAddGoogleProvider() },
                         onDeleteProvider = { id -> flushCoordinator.flush(); onDeleteProvider(id) },
                     )
                     refreshErrors[if (settings.isCustomProvider) settings.activeCustomProvider?.id else ChatProviderId.DEEPSEEK.storageValue]?.let {
@@ -162,6 +167,13 @@ fun SettingsScreen(
                                         onCancelLogin = onXaiCancelLogin,
                                         onSignOut = onXaiSignOut,
                                         onBrowserUnavailable = onXaiBrowserUnavailable,
+                                    )
+                                },
+                                googleAuthContent = {
+                                    GoogleAuthSection(
+                                        state = googleAuthState,
+                                        onLogin = onGoogleLogin,
+                                        onSignOut = onGoogleSignOut,
                                     )
                                 },
                             )
@@ -209,6 +221,16 @@ fun SettingsScreen(
                         onCancelLogin = onXaiCancelLogin,
                         onSignOut = onXaiSignOut,
                         onBrowserUnavailable = onXaiBrowserUnavailable,
+                    )
+                }
+                SettingsGroup(
+                    title = "Google Vertex 登录",
+                    summary = googleAuthSummary(googleAuthState.auth),
+                ) {
+                    GoogleAuthSection(
+                        state = googleAuthState,
+                        onLogin = onGoogleLogin,
+                        onSignOut = onGoogleSignOut,
                     )
                 }
                 SettingsGroup(

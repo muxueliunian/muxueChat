@@ -1,6 +1,10 @@
 package com.muxuechat.presentation
 
+import android.app.Activity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -9,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -17,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.muxuechat.presentation.chat.ChatScreen
 import com.muxuechat.presentation.chat.ChatViewModel
+import com.muxuechat.presentation.settings.GoogleAuthViewModel
 import com.muxuechat.presentation.settings.SettingsScreen
 import com.muxuechat.presentation.settings.XaiAuthViewModel
 import com.muxuechat.presentation.theme.MuxueChatTheme
@@ -24,9 +30,29 @@ import com.muxuechat.presentation.theme.MuxueChatTheme
 private enum class Destination { Chat, Settings }
 
 @Composable
-fun MuxueChatApp(viewModel: ChatViewModel, xaiAuthViewModel: XaiAuthViewModel) {
+fun MuxueChatApp(
+    viewModel: ChatViewModel,
+    xaiAuthViewModel: XaiAuthViewModel,
+    googleAuthViewModel: GoogleAuthViewModel,
+) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val xaiAuthState by xaiAuthViewModel.uiState.collectAsStateWithLifecycle()
+    val googleAuthState by googleAuthViewModel.uiState.collectAsStateWithLifecycle()
+
+    // Google 同意页只在这里拉起一次：设置页里有两处登录入口，不能各自监听而重复拉起。
+    val googleConsentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult(),
+    ) { result -> googleAuthViewModel.onConsentResult(result.resultCode, result.data) }
+    LaunchedEffect(googleAuthState.pendingConsent) {
+        googleAuthState.pendingConsent?.let { sender ->
+            googleAuthViewModel.consentLaunched()
+            try {
+                googleConsentLauncher.launch(IntentSenderRequest.Builder(sender).build())
+            } catch (_: Exception) {
+                googleAuthViewModel.onConsentResult(Activity.RESULT_CANCELED, null)
+            }
+        }
+    }
     val saveableStateHolder = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
     var destination by rememberSaveable { mutableStateOf(Destination.Chat) }
 
@@ -135,6 +161,7 @@ fun MuxueChatApp(viewModel: ChatViewModel, xaiAuthViewModel: XaiAuthViewModel) {
                         refreshingModelsProviderId = state.refreshingModelsProviderId,
                         onAddProvider = viewModel::addCustomProvider,
                         onAddXaiProvider = viewModel::addXaiProvider,
+                        onAddGoogleProvider = viewModel::addGoogleProvider,
                         onUpdateProvider = viewModel::updateCustomProvider,
                         onDeleteProvider = viewModel::deleteCustomProvider,
                         onSaveProviderKey = viewModel::saveProviderKey,
@@ -145,6 +172,9 @@ fun MuxueChatApp(viewModel: ChatViewModel, xaiAuthViewModel: XaiAuthViewModel) {
                         onXaiCancelLogin = xaiAuthViewModel::cancelLogin,
                         onXaiSignOut = xaiAuthViewModel::signOut,
                         onXaiBrowserUnavailable = xaiAuthViewModel::reportBrowserUnavailable,
+                        googleAuthState = googleAuthState,
+                        onGoogleLogin = googleAuthViewModel::startLogin,
+                        onGoogleSignOut = googleAuthViewModel::signOut,
                         onBack = { destination = Destination.Chat },
                     )
                 }

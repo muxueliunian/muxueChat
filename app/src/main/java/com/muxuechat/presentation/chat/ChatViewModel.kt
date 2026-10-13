@@ -24,6 +24,7 @@ import com.muxuechat.data.repository.RpRepositoryImpl
 import com.muxuechat.data.repository.SettingsRepository
 import com.muxuechat.data.repository.SettingsRepositoryImpl
 import com.muxuechat.data.remote.XaiResponsesTransport
+import com.muxuechat.data.repository.GoogleAuthRepository
 import com.muxuechat.data.repository.XaiAuthRepository
 import com.muxuechat.data.repository.XaiModelCatalog
 import com.muxuechat.domain.model.ChatMessage
@@ -752,6 +753,36 @@ class ChatViewModel(
                 }
             }.onFailure { error ->
                 Log.w(TAG, "Adding xAI provider failed: ${error.javaClass.simpleName}")
+                transient.update { it.copy(errorMessage = "供应商添加失败，请重试") }
+            }
+        }
+    }
+
+    /**
+     * 添加 Google Vertex 供应商：认证类型固定为 OAuth，地址由项目 ID 推导（项目 ID 填写前为空）。
+     * 登录是全局的，但项目 ID 属于供应商，因此允许为不同项目各建一个。
+     * 温度 / top_p 默认不发送：Vertex 上它们的效果尚未验证（用户可在供应商设置里自行开启）。
+     */
+    fun addGoogleProvider() {
+        viewModelScope.launch {
+            runCatching {
+                val provider = CustomProvider(
+                    id = UUID.randomUUID().toString(),
+                    name = CustomProvider.GOOGLE_DEFAULT_NAME,
+                    baseUrl = "",
+                    models = listOf(CustomProvider.GOOGLE_DEFAULT_MODEL),
+                    selectedModel = CustomProvider.GOOGLE_DEFAULT_MODEL,
+                    authKind = ProviderAuthKind.GOOGLE_OAUTH,
+                    sendTemperature = false,
+                    sendTopP = false,
+                ).normalized()
+                settingsRepository.upsertCustomProvider(provider)
+            }.onSuccess {
+                transient.update {
+                    it.copy(errorMessage = "已添加并切换到「${CustomProvider.GOOGLE_DEFAULT_NAME}」，请填写 GCP 项目 ID 并登录 Google")
+                }
+            }.onFailure { error ->
+                Log.w(TAG, "Adding Google provider failed: ${error.javaClass.simpleName}")
                 transient.update { it.copy(errorMessage = "供应商添加失败，请重试") }
             }
         }
@@ -1515,6 +1546,8 @@ class ChatViewModel(
                     xaiResponsesTransport = xaiResponsesTransport,
                     // 必须与设置页的 XaiAuthViewModel 共用同一个单例：刷新的串行化依赖同一把锁。
                     xaiAccessTokens = xaiAccessTokens,
+                    // 与设置页的 GoogleAuthViewModel 共用同一个单例：登录状态只有一份。
+                    googleAccessTokens = GoogleAuthRepository.getInstance(application),
                 )
                 val rpRepository = RpRepositoryImpl(database = database)
 

@@ -105,6 +105,7 @@ fun ProviderSection(
     onChange: (SettingsMutation) -> Unit,
     onAddProvider: (name: String, baseUrl: String) -> Unit,
     onAddXaiProvider: () -> Unit,
+    onAddGoogleProvider: () -> Unit,
     onDeleteProvider: (String) -> Unit,
 ) {
     var addDialogVisible by remember { mutableStateOf(false) }
@@ -134,6 +135,8 @@ fun ProviderSection(
                 title = provider.displayName,
                 subtitle = if (provider.usesXaiOAuth) {
                     "xAI 订阅登录 · ${provider.baseUrl}"
+                } else if (provider.usesGoogleOAuth) {
+                    "Google Vertex 登录 · ${provider.googleProjectId.ifBlank { "未填写项目 ID" }}"
                 } else {
                     provider.baseUrl.ifBlank { "未填写 Base URL" }
                 },
@@ -176,6 +179,15 @@ fun ProviderSection(
                 MetaLine("已添加 xAI 订阅供应商；所有 xAI 请求共用同一个登录，只能添加一个。")
             }
         }
+        // Google 登录是全局的，但项目 ID 属于供应商：不同项目可以各建一个供应商。
+        Column(modifier = Modifier.padding(bottom = Spacing.Small)) {
+            OutlinedButton(
+                onClick = onAddGoogleProvider,
+                modifier = Modifier.fillMaxWidth().heightIn(min = MinTouchTarget),
+            ) {
+                Text("添加 Google Vertex 供应商")
+            }
+        }
     }
 
     if (addDialogVisible) {
@@ -214,6 +226,9 @@ internal fun DeleteProviderDialog(
                 if (provider.usesXaiOAuth) {
                     "会同时删除：模型列表与逐模型上下文窗口。此操作无法撤销。\n\n" +
                         "不会退出 xAI 登录；如需退出，请到「xAI 订阅登录」分组操作。已有的聊天记录不受影响。"
+                } else if (provider.usesGoogleOAuth) {
+                    "会同时删除：项目 ID、模型列表与逐模型上下文窗口。此操作无法撤销。\n\n" +
+                        "不会退出 Google 登录；如需退出，请到「Google Vertex 登录」分组操作。已有的聊天记录不受影响。"
                 } else {
                     "会同时删除：地址、模型列表、逐模型上下文窗口，" +
                         "以及保存在这台设备上的该供应商 API Key。此操作无法撤销。\n\n" +
@@ -526,10 +541,13 @@ fun CustomProviderSection(
     onRefreshModels: () -> Unit,
     /** xAI 订阅供应商用它替代 API Key 输入区，复用设置页已有的 [XaiAuthSection]。 */
     xaiAuthContent: @Composable () -> Unit = {},
+    /** Google Vertex 供应商用它替代 API Key 输入区，复用设置页已有的 [GoogleAuthSection]。 */
+    googleAuthContent: @Composable () -> Unit = {},
 ) {
     val flushCoordinator = LocalSettingsFlushCoordinator.current
     val nameField = rememberSyncedTextFieldValue(external = provider.name)
     val baseUrlField = rememberSyncedTextFieldValue(external = provider.baseUrl)
+    val projectIdField = rememberSyncedTextFieldValue(external = provider.googleProjectId)
     var deleteDialogVisible by remember { mutableStateOf(false) }
     DebouncedTextSetting(
         fieldValue = nameField,
@@ -537,12 +555,21 @@ fun CustomProviderSection(
         canCommit = { it.isNotBlank() },
         onCommit = { value -> onUpdate { it.copy(name = value) } },
     )
-    if (!provider.usesXaiOAuth) {
+    if (!provider.usesOAuth) {
         DebouncedTextSetting(
             fieldValue = baseUrlField,
             persistedValue = provider.baseUrl,
             canCommit = { !validateBaseUrl(it).isError },
             onCommit = { value -> onUpdate { it.copy(baseUrl = value) } },
+        )
+    }
+    if (provider.usesGoogleOAuth) {
+        DebouncedTextSetting(
+            fieldValue = projectIdField,
+            persistedValue = provider.googleProjectId,
+            // 非法项目 ID 不落库：地址由它推导，半截内容会让 baseUrl 反复归零。
+            canCommit = { it.isBlank() || CustomProvider.isValidGoogleProjectId(it.trim()) },
+            onCommit = { value -> onUpdate { it.copy(googleProjectId = value.trim()) } },
         )
     }
     val validation = validateBaseUrl(baseUrlField.value.text)
@@ -551,6 +578,9 @@ fun CustomProviderSection(
         title = "供应商设置",
         description = if (provider.usesXaiOAuth) {
             "xAI 订阅供应商的地址由 App 固定，不可编辑，也不适用明文 HTTP。"
+        } else if (provider.usesGoogleOAuth) {
+            "Google Vertex 的地址由项目 ID 推导，主机固定为 ${CustomProvider.GOOGLE_VERTEX_HOST}，区域固定 global，" +
+                "只走 https，不可编辑。"
         } else {
             "局域网自建服务请填写手机可访问的 IP 或域名，不要填 localhost 或 127.0.0.1。"
         },
@@ -582,6 +612,33 @@ fun CustomProviderSection(
             )
             if (provider.usesXaiOAuth) {
                 MetaLine("地址（固定）：${provider.baseUrl}")
+            } else if (provider.usesGoogleOAuth) {
+                val projectError = projectIdField.value.text.isNotBlank() &&
+                    !CustomProvider.isValidGoogleProjectId(projectIdField.value.text.trim())
+                OutlinedTextField(
+                    value = projectIdField.value,
+                    onValueChange = { new -> projectIdField.value = new.copy(text = new.text.take(MAX_PROJECT_ID_LENGTH)) },
+                    singleLine = true,
+                    isError = projectError,
+                    label = { Text("GCP 项目 ID") },
+                    placeholder = { Text("my-project-123456") },
+                    supportingText = {
+                        Text(
+                            when {
+                                projectIdField.value.text.isBlank() -> "必填。注意是项目 ID，不是项目名称或项目编号"
+                                projectError -> "格式无效，暂未保存：6~30 位小写字母、数字、连字符，字母开头"
+                                else -> "格式有效；是否有权限需要发一条消息验证"
+                            },
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
+                    shape = Corner.Control,
+                    colors = quietTextFieldColors(),
+                )
+                MetaLine(
+                    if (provider.baseUrl.isBlank()) "地址：填写有效项目 ID 后自动生成"
+                    else "地址（固定主机，自动生成）：${provider.baseUrl}",
+                )
             } else {
                 OutlinedTextField(
                     value = baseUrlField.value,
@@ -603,6 +660,10 @@ fun CustomProviderSection(
     if (provider.usesXaiOAuth) {
         SettingsSection(title = "xAI 登录") {
             xaiAuthContent()
+        }
+    } else if (provider.usesGoogleOAuth) {
+        SettingsSection(title = "Google 登录") {
+            googleAuthContent()
         }
     } else {
         SecureKeySection(
@@ -628,7 +689,11 @@ fun CustomProviderSection(
 
     // xAI 订阅链路只给工具开关：用量总在 response.completed 里返回，适配器不发 stream_options，
     // 「请求流式用量统计」对它没有意义，显示出来反而让人以为关掉就拿不到用量。
-    if (!provider.usesXaiOAuth) {
+    if (provider.usesGoogleOAuth) {
+        com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具调用") {
+            GoogleToolCallingSection(provider = provider, onUpdate = onUpdate)
+        }
+    } else if (!provider.usesXaiOAuth) {
         com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具、用量与接口兼容") {
             ProviderToolCallingSection(provider = provider, onUpdate = onUpdate)
             ProviderProtocolSection(provider = provider, onUpdate = onUpdate)
@@ -708,6 +773,38 @@ private fun ProviderToolCallingSection(
 }
 
 /**
+ * Google Vertex 的工具开关。实测：工具轮回放必须原样带回服务端返回的 `extra_content`
+ * （AGENT.md §2「不透明字段回传」），App 已处理；默认仍关闭，由用户显式开启。
+ */
+@Composable
+private fun GoogleToolCallingSection(
+    provider: CustomProvider,
+    onUpdate: (CustomProviderMutation) -> Unit,
+) {
+    SettingsSection(
+        title = "端点能力",
+        description = "开启后非 RP 聊天可让模型生成设定草稿，确认后才会保存；RP 请求从不发送工具。" +
+            "若出现 400 之类的失败，关闭此项即可恢复普通聊天。",
+    ) {
+        SettingsRow(
+            title = "启用工具调用",
+            subtitle = if (provider.toolCallingEnabled) {
+                "非 RP 聊天中，模型可以生成设定草稿，确认后才会保存"
+            } else {
+                "默认关闭"
+            },
+            trailing = {
+                Switch(
+                    checked = provider.toolCallingEnabled,
+                    onCheckedChange = { enabled -> onUpdate { it.copy(toolCallingEnabled = enabled) } },
+                    colors = quietSwitchColors(),
+                )
+            },
+        )
+    }
+}
+
+/**
  * xAI 订阅链路的工具开关。与自定义供应商共用 [CustomProvider.toolCallingEnabled]，默认关闭。
  *
  * 回放时不带 reasoning 与 `fc_` id 是否被上游接受仍待真机确认（线上格式 §5.5），
@@ -773,6 +870,9 @@ private fun ProviderModelsSection(
         title = "可用模型",
         description = if (provider.usesXaiOAuth) {
             "模型列表来自 xAI 订阅服务，需先登录。窗口覆盖统一在「上下文管理」中配置。"
+        } else if (provider.usesGoogleOAuth) {
+            "Vertex 的 OpenAI 兼容端点不提供模型列表（实测 404），请手动添加模型 ID，例如 " +
+                "${CustomProvider.GOOGLE_DEFAULT_MODEL}。窗口覆盖统一在「上下文管理」中配置。"
         } else {
             "服务不支持 /models 时可手动添加。窗口覆盖统一在「上下文管理」中配置。"
         },
@@ -866,15 +966,29 @@ private fun ProviderModelsSection(
                 }
             }
 
-            RefreshModelsButton(
-                isRefreshingThis = isRefreshingThis,
-                isRefreshingOther = isRefreshingOther,
-                idleLabel = "从服务获取模型列表",
-                onRefresh = onRefresh,
-            )
+            if (provider.usesGoogleOAuth) {
+                // 禁用必须说明原因，而不是点了没反应。
+                OutlinedButton(
+                    onClick = {},
+                    enabled = false,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = MinTouchTarget),
+                ) {
+                    Text("从服务获取模型列表")
+                }
+                MetaLine("不可用：Google Vertex 的 openapi 端点没有 /models，请用上方的「手动添加模型 ID」。")
+            } else {
+                RefreshModelsButton(
+                    isRefreshingThis = isRefreshingThis,
+                    isRefreshingOther = isRefreshingOther,
+                    idleLabel = "从服务获取模型列表",
+                    onRefresh = onRefresh,
+                )
+            }
         }
     }
 }
+
+private const val MAX_PROJECT_ID_LENGTH = 30
 
 @Composable
 private fun ProviderModelRow(
