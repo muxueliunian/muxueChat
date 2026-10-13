@@ -9,7 +9,7 @@
 - Windows 命令默认使用 PowerShell 7（`pwsh`）。验证直接比较实际字段或字节；非必要不计算 SHA256 或其他哈希/指纹。交接必须保留这项约束。
 - 当前唯一界面目标机型是用户的 realme Neo7（2026-10-02 确认），不扩展其它机型或分辨率验收矩阵；仍需处理同机显示缩放、系统栏与键盘，不把物理像素当作 Compose 布局尺寸。
 - 本项目是个人使用 App，不做账号系统、云同步、埋点、推送通知、多用户权限或后台服务，且 App 自身不部署、运维或代理后台服务。
-- App 可以作为客户端调用用户自行配置的 OpenAI 兼容 `chat/completions` 端点（自定义供应商，可保存多个，允许 http 或 https）；这些服务本身的部署、账号、OAuth 登录与运维均不在本项目范围内（唯一例外见 §2「xAI 订阅登录例外」）。
+- App 可以作为客户端调用用户自行配置的 OpenAI 兼容 `chat/completions` 端点（自定义供应商，可保存多个，允许 http 或 https）；这些服务本身的部署、账号、OAuth 登录与运维均不在本项目范围内（例外只有两个，见 §2「OAuth 例外」：xAI 订阅登录与 Google Vertex 登录）。
 - 本项目只考虑 Android 16 及以上：
   - `minSdk = 36`
   - `targetSdk = 36`
@@ -34,22 +34,32 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 - **上层永远只有「DeepSeek 专属协议」与「OpenAI 兼容协议」两条分支**，不按供应商名称分叉出第三条链路，也不为某个具体厂商写特判。仓库、Prompt 拼装、RP、上下文规划、错误映射都只认这两条。错误映射尤其不得识别厂商专属异常类型：需要原样展示的文案通过通用的「安全文案」标记接口传递。
 - 传输层允许存在多个**实现**，但必须藏在 OpenAI 兼容协议的同一个接口之后，对上层不可见。**唯一例外是 xAI 订阅链路**（用户 2026-09-22 批准）：它在钉死地址上说 Responses 协议，因此以适配器形态实现该接口，负责把 OpenAI 兼容请求翻译过去、再把响应翻译回来。判定依据只能是供应商的认证类型（`ProviderAuthKind.XAI_OAUTH`），不得按名称或地址字符串匹配。
 - 该例外不得扩大：除 xAI 订阅链路外，不允许为任何厂商新增传输实现；用户填写地址的自定义供应商一律只走标准 OpenAI 兼容传输。
-- 上游是谁（OpenAI、任意中转）与 App 无关：除上述 xAI 例外外，App 的边界只到 OpenAI 兼容协议本身，不直接适配任何厂商的私有协议、私有字段或 SDK。
+- **Google Vertex 链路**（用户 2026-10-14 批准）说的就是标准 OpenAI 兼容协议（`POST {base}/chat/completions`），**不新增传输实现、不构成适配层**；它只是 `OpenAiCompatibleClient` 的第二个**钉死主机的实例**（强制 https、主机固定 `aiplatform.googleapis.com`、禁止任何重定向）。路由判定依据只能是供应商的认证类型（`ProviderAuthKind.GOOGLE_OAUTH`）与凭据类型，不得按名称或地址字符串匹配。区域固定 `global`，项目 ID 由用户填写。
+- 上游是谁（OpenAI、任意中转）与 App 无关：除上述 xAI 例外与下一条的不透明回传外，App 的边界只到 OpenAI 兼容协议本身，不直接适配任何厂商的私有协议、私有字段或 SDK。
+- **不透明字段回传（工具调用）**（用户 2026-10-14 批准）：OpenAI 兼容响应里，工具调用对象若带有 `extra_content`，App 必须在**同一次请求链**的后续工具轮里，把它**原样、不解析、不修改**地放回对应 assistant `tool_calls[]` 项中。仅在服务端实际返回该字段时才回传，没有则不发，因此其他供应商的请求字节不变。该字段不进入 Room、DataStore、日志、错误提示或 UI，不跨请求链保留；App 不读取其内容，也不据此写供应商特判。这是「不适配厂商私有字段」的唯一例外，依据是 Vertex 缺少该字段时对工具轮回放返回 400（2026-10-14 实测）。
 - 自定义供应商下不发送 DeepSeek 的 `thinking` 对象或 RP Marker；只有全局“设定生成工具”开关和当前供应商的“启用标准工具调用”开关都开启时，才在非 RP 正文请求中发送标准 OpenAI `tools` / `tool_choice` 并处理 `tool_calls`。不得按具体厂商写特判。
 - 自定义供应商的思考等级走 OpenAI 系的顶层 `reasoning_effort` 字段，取值由用户自行填写，App 不做枚举校验（各家档位不统一）。留空时**必须完全不发送该字段**——不支持思考的模型收到未知字段可能直接 400。
 - 自定义供应商的输出预算字段由用户选择 `max_tokens` 或 `max_completion_tokens`，每次只发一个；旧配置默认 `max_tokens`。正文与内部请求使用相同字段策略、各自预算。xAI 适配器继续读取内部 `maxTokens` 后翻译为已实测字段。
 - 自定义供应商可显式配置合法的 `x-` 会话标识头，值为本 App 的稳定会话 ID，正文、工具续轮、摘要、标题及 RP 辅助请求一致。默认不发、不按厂商名称或地址启用，不发送到 xAI OAuth 链路；客户端标识使用 `muxueChat/1.0`。
 - `reasoning_effort` 只随正文对话发送；RP 元数据、状态兜底、上下文摘要一律不发。
 - 每个自定义供应商的 API Key 与 DeepSeek API Key 分别保存，各占独立的 Android Keystore alias；删除供应商必须同时删除其 Key。
-- App 默认不实现、发起、保存或复用任何 OAuth：不得包含 OAuth client ID、授权码、access token、refresh token、Cookie 或第三方 CLI 的登录身份，用户只能填写服务已签发的 API Key。**唯一例外是 xAI 订阅登录**（用户 2026-09-22 批准），边界如下：
+- App 默认不实现、发起、保存或复用任何 OAuth：不得包含 OAuth client ID、授权码、access token、refresh token、Cookie 或第三方 CLI 的登录身份，用户只能填写服务已签发的 API Key。**OAuth 例外只有两个：xAI 订阅登录与 Google Vertex 登录。**xAI 订阅登录（用户 2026-09-22 批准）边界如下：
   - 仅限 xAI：OAuth 端点钉死 `https://auth.x.ai`，服务地址钉死 `https://cli-chat-proxy.grok.com/v1`，不接受用户编辑，不适用明文 HTTP 放行策略；任何情况下不得把 `Authorization` 头发往非钉死主机，禁止跟随跨主机重定向。
   - 复用 Grok CLI 公开 client_id 构成客户端身份冒用，可能违反 xAI 服务条款乃至导致账号被封，风险由用户承担；设置页必须如实提示。
   - 仍然禁止：读取任何第三方 CLI 的本地凭据文件（如 `~/.grok/auth.json`）、保存或读取浏览器 Cookie、Token 手工导入。
   - xAI 认证模块本身属于该例外，不视为请求层的厂商特判。
   - 不得借此为其他厂商或其他 OAuth 场景开口；新增任何 OAuth 厂商须由用户另行批准并修改本条。
   - 该例外不改变「App 不做后台服务」的约束：token 刷新只在前台按需进行，不得为刷新引入后台任务或定时器。
+- **Google Vertex 登录**（用户 2026-10-14 批准）边界如下：
+  - 仅限 Google Vertex AI：服务地址钉死 `https://aiplatform.googleapis.com/v1/projects/{projectId}/locations/global/endpoints/openapi`（项目 ID 由用户填写并经格式校验，每次归一化都重新生成地址，不接受用户编辑地址），不适用明文 HTTP 放行策略；任何情况下不得把 `Authorization` 头发往非钉死主机，禁止任何重定向。
+  - 只通过 Google Identity Services（`AuthorizationClient`，Play 服务）获取 `https://www.googleapis.com/auth/cloud-platform` 的 access token，使用**用户自己 GCP 项目**里的 Android 类型 OAuth 客户端；该客户端由「包名 + 签名 SHA-1」识别，源码中不得出现 client ID 或 secret。它不冒用任何第三方 CLI 的身份。
+  - **App 不保存任何 Google token**（access / refresh / id token 均无）：token 只在每轮请求冻结时静默获取，只存在于该轮请求的内存快照里。DataStore 只保存项目 ID 与「已登录」标记，二者都不是凭据。
+  - 静默获取失败（需要重新同意）时只提示用户到设置页重新登录，不得在后台弹窗、不得引入后台任务或定时器；401 后允许强制刷新并重试一次。
+  - 仍然禁止：读取任何第三方 CLI 的本地凭据文件、保存或读取浏览器 Cookie、Token 手工导入、把 token 发往非钉死主机。
+  - 设置页必须如实提示：调用按用户自己的 GCP 项目计费，登录账号需要该项目的 Vertex AI 权限。
+  - 不得借此为其他厂商或其他 OAuth 场景开口；新增任何 OAuth 厂商须由用户另行批准并修改本条。
 - 自定义供应商同时接受 `https://` 与 `http://` 端点。明文 HTTP 是**用户明确要求并接受风险**的能力，用于接入没有证书的局域网自建服务；应用层不再限制地址范围，但 UI 必须在选中 http 端点时给出明文提示。
-- 「一般化」的边界到此为止：不引入通用多 Provider SDK，不为 Anthropic、Gemini 等非 OpenAI 协议新增适配层。用户需要这些服务时，应填写它们的 OpenAI 兼容端点。
+- 「一般化」的边界到此为止：不引入通用多 Provider SDK，不为 Anthropic、Gemini 等非 OpenAI 协议新增适配层。用户需要这些服务时，应填写它们的 OpenAI 兼容端点（Google Vertex 的 `openapi` 端点即属此类，见上文「Google Vertex 链路」）。
 - 设置页必须明确告知用户「只支持 DeepSeek 协议与 OpenAI 兼容格式」，不要让用户以为填任意厂商地址都能用。
 
 当前 MVP 已验证：
@@ -147,9 +157,10 @@ com.muxuechat
 
 规则：
 
-- DeepSeek API Key、每个自定义供应商的 API Key 与 xAI OAuth 凭据必须分别用 Android Keystore 保护；不得明文写入 Room、DataStore、日志、错误提示或测试快照。
+- DeepSeek API Key、每个自定义供应商的 API Key 与 xAI OAuth 凭据必须分别用 Android Keystore 保护（Google Vertex 不保存 token，见下）；不得明文写入 Room、DataStore、日志、错误提示或测试快照。
 - 供应商的名称、Base URL、模型列表属于普通设置，可以进 DataStore；Key 绝不可以。
 - App 不保存浏览器会话、Cookie 或第三方 CLI 登录状态。
+- Google Vertex 登录**不保存任何 token**：不进 Keystore、DataStore、Room、SharedPreferences、日志或测试快照，只允许存在于单轮请求快照的内存里。DataStore 只存项目 ID 与「已登录」标记。
 - xAI OAuth 凭据（access / refresh / id token）与 API Key 同法保存：独立 Keystore alias 持有 AES 密钥，AES/GCM 密文与 IV 写入应用私有 SharedPreferences，明文只在内存中存在。解密失败按未登录处理并清理残留密文，不得崩溃；登出同时删除密文与 alias。
 - 会话和消息数据优先通过 DAO 暴露，避免 UI 层直接操作数据库。
 - 删除会话应依赖 Room 外键级联删除消息，避免手工多处删除导致不一致。
@@ -167,7 +178,8 @@ com.muxuechat
 - OpenAI 兼容协议的**传输**由一个接口承载，默认实现是 `OpenAiCompatibleClient`（标准 `POST {base}/chat/completions`）。按 §2 的 xAI 例外，允许存在第二个实现：xAI 订阅链路的 Responses 适配器，入口同样是这个接口，翻译全部封在实现内部。**调用方不得知道自己拿到的是哪个实现**，也不得因此改变请求 DTO 的构造方式。
 - 适配器只做协议翻译，不得引入新的上层概念：它接收同一个 OpenAI 兼容请求 DTO，产出同一套流式事件与用量快照（`input_tokens`/`output_tokens` 必须归一化为 `prompt_tokens`/`completion_tokens`）。
 - 线上格式**只能依据 `docs/XAI_WIRE_FORMAT.md` 的实测记录实现**。该文档 §3.4 / §5.5 列出的未采集场景（截断、错误事件、流中取消、429、无终止事件断流）**不得凭 OpenAI Responses 的经验猜测**：未采集的事件一律走保守兜底（未知事件忽略、缺终止事件按失败处理并给可读文案），不得臆造字段语义。
-- `OpenAiCompatibleClient` 请求用户配置的 `http(s)://` 端点；除 §2 的 xAI 例外外，不允许 App 内 OAuth。地址仍不得包含 user-info、query 或 fragment。
+- `OpenAiCompatibleClient` 请求用户配置的 `http(s)://` 端点；除 §2 的 xAI 与 Google Vertex 例外外，不允许 App 内 OAuth。地址仍不得包含 user-info、query 或 fragment。Google Vertex 使用该客户端的**钉死主机实例**（https、主机固定、禁止重定向），并对 401 抛出带类型的异常供上层强制刷新后重试一次；用户可见文案与其他供应商一致。
+- 通用错误解析必须兼容「单元素数组包着的 error 对象」（Vertex 的 `[{"error":{...}}]`），否则会落到误导性的「请检查 API Key」。这是结构兼容，不是厂商特判。
 - 对自定义 OpenAI 兼容供应商，上游服务的 OAuth、令牌刷新、部署和运维均由该服务自身负责，App 不参与。
 - `GET {base}/models` 只用于填充模型选择列表；服务不支持时必须优雅降级到手填，不能阻断聊天。
 - 思考内容的响应字段名不统一：`reasoning_content`（DeepSeek/Qwen/GLM 等）与 `reasoning`（OpenRouter）都要解析，取先出现的非空值。这是字段别名，不是厂商特判。
@@ -334,7 +346,7 @@ DeepSeek 官方文档明确：**`thinking` 的缺省值是 `enabled`**（默认 
 - Room entity 与 domain model 分离。
 - Entity 到 domain 的转换放在 local 层或邻近文件。
 - DataStore 用于普通设置（含自定义供应商列表：名称、Base URL、模型列表、当前选中项），不存任何 Provider 凭据。
-- DeepSeek API Key 与各自定义供应商的 API Key 只能通过 Keystore 加密存储；OAuth 凭据仅限 xAI，同样只能通过 Keystore 加密存储，不进 DataStore、Room。
+- DeepSeek API Key 与各自定义供应商的 API Key 只能通过 Keystore 加密存储；OAuth 凭据仅限 xAI，同样只能通过 Keystore 加密存储，不进 DataStore、Room；Google Vertex 不保存任何 token。
 
 ### 5.4 网络
 
@@ -365,6 +377,7 @@ DeepSeek 官方文档明确：**`thinking` 的缺省值是 `enabled`**（默认 
 - API Key。
 - Authorization header。
 - OAuth 的 access token、refresh token、id token、授权码、`device_code`、`user_code`、PKCE `code_verifier`、`state`。
+- Google 的 `AuthorizationResult`、授权 `PendingIntent`、工具调用的 `extra_content`（含 `thought_signature`）。
 - 完整用户消息。
 - 完整 system prompt。
 - 角色卡敏感内容。
@@ -407,6 +420,7 @@ Windows 下优先使用：
 - 不要随意新增第三方依赖。
 - 新增依赖前必须说明用途和替代方案。
 - 现有技术可解决时，优先使用现有依赖。
+- `com.google.android.gms:play-services-auth`（Google Identity Services `AuthorizationClient`）经用户 2026-10-14 批准，**仅用于** Google Vertex 登录获取 access token，不得用于其他用途或其他厂商。
 - 不引入大型框架，例如 Hilt、Navigation Compose、通用多 Provider SDK，除非用户明确确认。
 - 已确认的双协议路由保持手写、轻量，仅覆盖 DeepSeek 与 OpenAI 兼容协议。
 - 当前项目使用手写轻量依赖组装，保持简单。
@@ -438,7 +452,8 @@ Windows 下优先使用：
 - 各 Provider 的 API Key 手动保存，且不展示已保存明文。
 - 其他设置实时保存。
 - 必须提示”设置会在下一次发送消息时生效”。
-- 设置页不提供 Token 导入或第三方 CLI 身份复用入口。唯一允许的登录入口是 xAI 订阅登录，入口旁必须显示账号风险提示；登出必须二次确认（与「清除 Key」一致）。
+- 设置页不提供 Token 导入或第三方 CLI 身份复用入口。允许的登录入口只有两个：xAI 订阅登录（入口旁必须显示账号风险提示）与 Google Vertex 登录（入口旁必须显示「按你自己的 GCP 项目计费、账号需有 Vertex AI 权限」的提示）；登出必须二次确认（与「清除 Key」一致）。
+- Google Vertex 供应商没有 API Key，其登录是全局的：删除该供应商只删除它的配置，**不退出登录**；退出登录是「Google Vertex 登录」分组的独立操作，二次确认同样适用。该供应商不支持 `GET /models`（实测 404），「获取模型列表」必须置灰并写明原因。
 - 供应商地址为 http 时，设置页必须显示明文风险提示。
 - 供应商的增删改在设置页完成；删除供应商必须二次确认，并同时清除其 Keystore 条目。xAI 订阅供应商没有 API Key，其登录是全局的：删除该供应商只删除它的模型列表与上下文窗口配置，**不退出登录**；退出登录是「xAI 订阅登录」分组的独立操作，二次确认同样适用。删除对话框必须写明这一点。
 - thinking mode、reasoning effort 及其采样参数提示仅适用于 DeepSeek；自定义供应商下不得误导性展示为可生效的 DeepSeek 专属配置。
@@ -482,7 +497,7 @@ Windows 下优先使用：
 - 禁止把 API Key 明文保存到 Room/DataStore。
 - 禁止擅自降级 Android SDK。
 - 禁止把 OpenAI 兼容链路扩展成通用多 Provider 框架，或为某个具体厂商新增私有协议适配。**唯一例外是 §2 / §3.3 所述 xAI 订阅链路的 Responses 传输适配器**：它藏在 OpenAI 兼容传输接口之后，对上层不可见，且不得扩大到其它厂商。
-- 禁止在 App 内实现或复用任何 OAuth、浏览器 Cookie、第三方 CLI client ID、access token、refresh token 或登录身份。唯一例外为 §2 所述 xAI 订阅登录；该例外内仍禁止读取第三方 CLI 本地凭据文件、保存浏览器 Cookie、将 OAuth token 发往非钉死主机。
+- 禁止在 App 内实现或复用任何 OAuth、浏览器 Cookie、第三方 CLI client ID、access token、refresh token 或登录身份。例外只有 §2 所述 xAI 订阅登录与 Google Vertex 登录；这些例外内仍禁止读取第三方 CLI 本地凭据文件、保存浏览器 Cookie、将 OAuth token 发往非钉死主机，Google 例外内还禁止保存任何 token。
 - 禁止在未经用户确认的情况下改动明文 HTTP 策略（收紧或进一步放开都算）。
 - 禁止把任一供应商的 API Key 写入 DataStore、Room 或供应商列表 JSON。
 - 禁止把 RP 模式直接做成一段不可维护的硬编码 prompt。
