@@ -629,8 +629,9 @@ fun CustomProviderSection(
     // xAI 订阅链路只给工具开关：用量总在 response.completed 里返回，适配器不发 stream_options，
     // 「请求流式用量统计」对它没有意义，显示出来反而让人以为关掉就拿不到用量。
     if (!provider.usesXaiOAuth) {
-        com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具调用与流式用量统计") {
+        com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具、用量与接口兼容") {
             ProviderToolCallingSection(provider = provider, onUpdate = onUpdate)
+            ProviderProtocolSection(provider = provider, onUpdate = onUpdate)
         }
     } else {
         com.muxuechat.presentation.settings.components.SettingsGroup("高级连接选项", "工具调用") {

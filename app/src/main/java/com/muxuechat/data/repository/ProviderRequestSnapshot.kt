@@ -19,14 +19,34 @@ internal sealed interface ProviderCredential {
         override fun toString(): String = "ProviderCredential.ApiKey"
     }
 
-    class OAuthBearer(val accessToken: String) : ProviderCredential {
+    class OAuthBearer(val accessToken: String, val sessionGeneration: Long? = null) : ProviderCredential {
+        fun lease(): XaiAccessTokenLease = XaiAccessTokenLease(accessToken, sessionGeneration)
         override fun toString(): String = "ProviderCredential.OAuthBearer"
     }
 }
 
 /** 冻结请求时向 xAI 订阅登录索取一个当前有效的 access token（必要时先刷新）。 */
+/** 仅在内存中存在的认证租约；刷新可换 token，但不能改变所属登录会话。 */
+class XaiAccessTokenLease(val accessToken: String, val sessionGeneration: Long? = null) {
+    override fun toString(): String = "XaiAccessTokenLease"
+}
+
 interface XaiAccessTokenSource {
     suspend fun getValidAccessToken(rejectedAccessToken: String? = null): String
+
+    // 默认实现只用于无登录生命周期的替身；生产仓库严格要求非空会话世代。
+    suspend fun acquireAccessToken(): XaiAccessTokenLease = XaiAccessTokenLease(getValidAccessToken())
+
+    suspend fun refreshAccessToken(lease: XaiAccessTokenLease): XaiAccessTokenLease =
+        XaiAccessTokenLease(getValidAccessToken(lease.accessToken), lease.sessionGeneration)
+
+    suspend fun validateSession(lease: XaiAccessTokenLease) = Unit
+
+    /** 校验与动作在同一认证临界区；动作不得再调用认证方法。 */
+    suspend fun <T> withCurrentSession(lease: XaiAccessTokenLease, block: suspend () -> T): T {
+        validateSession(lease)
+        return block()
+    }
 }
 
 /**
@@ -141,12 +161,12 @@ internal class ProviderRequestFreezer(
                 // 地址不取自用户数据，直接用钉死常量，再校验一次作为纵深防御。
                 val baseUrl = CustomProvider.XAI_SUBSCRIPTION_BASE_URL
                 validateProviderRequest(baseUrl, frozen.settings.activeModel)
-                val accessToken = xaiAccessTokens.getValidAccessToken(rejectedAccessToken = null)
+                val lease = xaiAccessTokens.acquireAccessToken()
                 customProviderSnapshot(
                     settings = frozen.settings,
                     activeProvider = frozen.activeProvider,
                     baseUrl = baseUrl,
-                    credential = ProviderCredential.OAuthBearer(accessToken),
+                    credential = ProviderCredential.OAuthBearer(lease.accessToken, lease.sessionGeneration),
                 )
             }
         }

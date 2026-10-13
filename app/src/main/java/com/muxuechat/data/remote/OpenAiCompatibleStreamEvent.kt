@@ -10,6 +10,8 @@ sealed interface OpenAiCompatibleStreamEvent {
         val usage: OpenAiCompatibleUsageDto?,
         /** 工具调用分片。name 和 arguments 可能分多个 chunk 到达，需要按 index 拼接。 */
         val toolCalls: List<OpenAiCompatibleToolCallDto>? = null,
+        /** 标准文本拒绝增量，与正文独立保留，避免 content=null 时丢掉说明。 */
+        val refusal: String? = null,
     ) : OpenAiCompatibleStreamEvent
 
     data object Done : OpenAiCompatibleStreamEvent

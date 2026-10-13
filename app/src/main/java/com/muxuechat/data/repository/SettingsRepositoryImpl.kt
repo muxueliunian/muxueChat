@@ -231,14 +231,15 @@ class SettingsRepositoryImpl(
      */
     private suspend fun refreshXaiProviderModels(providerId: String): List<String> {
         val catalog = xaiModelCatalog ?: error("当前版本无法获取 xAI 模型列表，请手动填写模型名")
-        val models = catalog.listModels()
-        settingsMutationMutex.withLock {
-            val latest = settings.first().customProviders.firstOrNull { it.id == providerId }
-                ?: error("供应商已被删除，已忽略本次模型列表")
-            require(latest.usesXaiOAuth) { "供应商类型已变化，请重新获取模型列表" }
-            writeProviderModels(providerId, models, System.currentTimeMillis())
+        return catalog.withModels { models ->
+            settingsMutationMutex.withLock {
+                val latest = settings.first().customProviders.firstOrNull { it.id == providerId }
+                    ?: error("供应商已被删除，已忽略本次模型列表")
+                require(latest.usesXaiOAuth) { "供应商类型已变化，请重新获取模型列表" }
+                writeProviderModels(providerId, models, System.currentTimeMillis())
+            }
+            models
         }
-        return models
     }
 
     override suspend fun refreshDeepSeekModels(): List<String> {

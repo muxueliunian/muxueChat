@@ -20,6 +20,7 @@ data class OpenAiCompatibleChatRequest(
     /** 不提供默认值，确保即使为 false 也会实际序列化到请求体。 */
     val stream: Boolean,
     @SerialName("max_tokens") val maxTokens: Int? = null,
+    @SerialName("max_completion_tokens") val maxCompletionTokens: Int? = null,
     val temperature: Double? = null,
     @SerialName("top_p") val topP: Double? = null,
     /**
@@ -128,6 +129,7 @@ data class OpenAiCompatibleChoiceDto(
 @Serializable
 data class OpenAiCompatibleDeltaDto(
     val content: String? = null,
+    val refusal: String? = null,
     @SerialName("reasoning_content") val reasoningContent: String? = null,
     val reasoning: String? = null,
     @SerialName("tool_calls") val toolCalls: List<OpenAiCompatibleToolCallDto>? = null,
@@ -140,6 +142,7 @@ data class OpenAiCompatibleDeltaDto(
 data class OpenAiCompatibleMessageResponseDto(
     val role: String? = null,
     val content: String? = null,
+    val refusal: String? = null,
     @SerialName("reasoning_content") val reasoningContent: String? = null,
     val reasoning: String? = null,
     @SerialName("tool_calls") val toolCalls: List<OpenAiCompatibleToolCallDto>? = null,

@@ -143,6 +143,23 @@ DataStore 序列化：`custom_providers` 存 kotlinx.serialization 的 JSON 字�
 
 ## 6. 已知风险 / 未覆盖
 
+### 2026-10-02：本轮兼容范围与配置
+
+用户将目标收敛为 Command Code GOAT 与 OpenCode Go/Go Plus 的文本 Chat Completions 模型。用户尚未订阅 OpenCode，接受官方文档核对、合成 HTTP/SSE、代码集成回归；真实连通性及服务对普通聊天/RP 用途的接纳不作为本轮完成前置，保持“未验证”。
+
+| 服务 | Base URL | 接入说明 |
+| --- | --- | --- |
+| Command Code GOAT | `https://api.commandcode.ai/provider/v1` | 只选支持 `/chat/completions` 的模型；目录 `/models` |
+| OpenCode Go / Go Plus | `https://opencode.ai/zen/go/v1` | 只选官方端点表中的 Chat Completions 模型；会话标识头填写 `x-opencode-session`；目录 `/models` |
+
+来源：[Command Code Provider API](https://commandcode.ai/docs/provider)、[OpenCode Go](https://opencode.ai/docs/go/)，2026-10-02 核对。Go 文档面向编程代理请求，协议模拟通过不等于该服务已接受本 App 的聊天/RP 流量；不伪装为其它客户端。仅有 Responses 或 Messages 接口的模型不属于本轮目标。
+
+实现采用通用设置，不按服务名称分叉：高级连接选项新增输出预算字段选择（旧默认 `max_tokens`，可选 `max_completion_tokens`）与可选会话标识头。标准 OpenAI 兼容客户端使用自身 `muxueChat/1.0` 标识。会话标识在正文、工具续轮、标题、压缩、RP 元数据与状态兜底请求保持一致；xAI OAuth 不接收此配置。
+
+响应完整性：`refusal` 显示为可读回复；缺终止事件、截断工具参数、重复调用 ID 与不完整调用明确失败；`length` / `content_filter` 保留已收到正文并显示原因；HTTP 200 中的通用错误包也进入同一安全清理边界。对应合成回归覆盖普通和流式、工具结果回传及 usage-only 尾块，结果见 `docs/DEFECT_FIX_TASKS.md`。
+
+### 既有边界
+
 - 真机连通性、各家中转站 `/models` 的实际返回格式需用户实测。
 - 部分服务的 `/models` 会返回上百个模型且混有 embedding/tts 模型，本版不做过滤，只按 id 排序。
 - 供应商删除后，历史消息不会回溯标注它们由哪个供应商生成（当前数据模型本就不记录）。

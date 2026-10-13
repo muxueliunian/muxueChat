@@ -174,7 +174,7 @@ internal class XaiResponsesStreamParser(
             val status = event.response?.status
             // 只承认实测过的成功形状。其它 status 的含义未采集（截断？失败？），
             // 不能一律当作正常结束，否则会把残缺回复当成完整回复落库。
-            if (status != null && status != STATUS_COMPLETED) {
+            if (status != STATUS_COMPLETED) {
                 throw XaiResponsesTransport.XaiResponsesException("xAI 回复未正常结束，请重试")
             }
             if (openMessageIndices.isNotEmpty() || openFunctionCalls.isNotEmpty()) {

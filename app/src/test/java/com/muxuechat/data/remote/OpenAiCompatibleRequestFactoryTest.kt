@@ -3,6 +3,8 @@ package com.muxuechat.data.remote
 import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.CustomProvider
+import com.muxuechat.domain.model.OpenAiOutputTokenField
+import com.muxuechat.domain.model.ProviderAuthKind
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
@@ -31,6 +33,37 @@ class OpenAiCompatibleRequestFactoryTest {
         temperature = 1.1,
         topP = 0.8,
     )
+
+    @Test
+    fun configuredCompletionBudget_isExclusiveForEveryPurpose() {
+        val configured = settings.copy(customProviders = settings.customProviders.map {
+            it.copy(outputTokenField = OpenAiOutputTokenField.MAX_COMPLETION_TOKENS)
+        })
+        OpenAiCompatibleRequestFactory.Purpose.entries.forEach { purpose ->
+            val legacy = OpenAiCompatibleRequestFactory.build(settings, "model", messages, purpose)
+            val request = OpenAiCompatibleRequestFactory.build(configured, "model", messages, purpose)
+            assertNull(request.maxTokens)
+            assertEquals(legacy.maxTokens, request.maxCompletionTokens)
+            val encoded = json.encodeToString(request)
+            assertTrue(encoded.contains("\"max_completion_tokens\":"))
+            assertFalse(encoded.contains("\"max_tokens\":"))
+        }
+    }
+
+    @Test
+    fun xaiKeepsAdapterBudgetAndOmitsUnsupportedSampling() {
+        val configured = settings.copy(customProviders = settings.customProviders.map {
+            it.copy(authKind = ProviderAuthKind.XAI_OAUTH,
+                outputTokenField = OpenAiOutputTokenField.MAX_COMPLETION_TOKENS)
+        })
+        val request = OpenAiCompatibleRequestFactory.build(
+            configured, "grok", messages, OpenAiCompatibleRequestFactory.Purpose.CHAT,
+        )
+        assertEquals(settings.maxTokens, request.maxTokens)
+        assertNull(request.maxCompletionTokens)
+        assertNull(request.temperature)
+        assertNull(request.topP)
+    }
 
     @Test
     fun chat_usesFrozenCliModelAndNormalGenerationParameters() {

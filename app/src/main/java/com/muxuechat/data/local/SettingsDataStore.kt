@@ -19,6 +19,7 @@ import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.CustomProvider
 import com.muxuechat.domain.model.ProviderAuthKind
+import com.muxuechat.domain.model.OpenAiOutputTokenField
 import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
@@ -65,6 +66,8 @@ private data class CustomProviderDto(
      * 因此已有 API Key 供应商的存储内容与改动前逐字节一致。
      */
     val authKind: String = "api_key",
+    val outputTokenField: String = "max_tokens",
+    val conversationHeaderName: String = "",
 )
 
 /**
@@ -134,6 +137,7 @@ class SettingsDataStore internal constructor(
             customProviders = decodeProviders(prefs[CUSTOM_PROVIDERS]),
             activeCustomProviderId = prefs[ACTIVE_CUSTOM_PROVIDER_ID],
             rpAuxiliaryModel = prefs[RP_AUXILIARY_MODEL].orEmpty(),
+            defaultProtagonistProfileId = prefs[DEFAULT_PROTAGONIST_PROFILE_ID]?.takeIf { it.isNotBlank() },
         ).normalized()
 
     @Suppress("DEPRECATION")
@@ -160,6 +164,9 @@ class SettingsDataStore internal constructor(
         prefs[CHAT_PROVIDER] = normalized.provider.storageValue
         prefs[CUSTOM_PROVIDERS] = encodeProviders(normalized.customProviders)
         prefs[RP_AUXILIARY_MODEL] = normalized.rpAuxiliaryModel
+        normalized.defaultProtagonistProfileId?.takeIf { it.isNotBlank() }
+            ?.let { prefs[DEFAULT_PROTAGONIST_PROFILE_ID] = it }
+            ?: prefs.remove(DEFAULT_PROTAGONIST_PROFILE_ID)
         normalized.activeCustomProviderId
             ?.let { prefs[ACTIVE_CUSTOM_PROVIDER_ID] = it }
             ?: prefs.remove(ACTIVE_CUSTOM_PROVIDER_ID)
@@ -280,6 +287,8 @@ class SettingsDataStore internal constructor(
                     modelContextWindows = dto.modelContextWindows,
                     streamUsageEnabled = dto.streamUsageEnabled,
                     authKind = ProviderAuthKind.fromStorage(dto.authKind),
+                    outputTokenField = OpenAiOutputTokenField.fromStorage(dto.outputTokenField),
+                    conversationHeaderName = dto.conversationHeaderName,
                 )
             }
         }.onFailure { error ->
@@ -362,6 +371,7 @@ class SettingsDataStore internal constructor(
 
         /** RP 辅助请求的模型覆盖。空串表示跟随正文模型，是升级后的默认行为。 */
         private val RP_AUXILIARY_MODEL = stringPreferencesKey("rp_auxiliary_model")
+        private val DEFAULT_PROTAGONIST_PROFILE_ID = stringPreferencesKey("default_protagonist_profile_id")
         private val DISPLAY_SCALE = stringPreferencesKey("display_scale")
 
         /** 一般化改造前的写死配置，仅用于一次性迁移。 */
@@ -399,6 +409,8 @@ class SettingsDataStore internal constructor(
                         modelContextWindows = provider.modelContextWindows,
                         streamUsageEnabled = provider.streamUsageEnabled,
                         authKind = provider.authKind.storageValue,
+                        outputTokenField = provider.outputTokenField.storageValue,
+                        conversationHeaderName = provider.conversationHeaderName,
                     )
                 },
             )

@@ -38,6 +38,7 @@ internal class ModelCatalogRequester(
         val request = Request.Builder()
             .url(requestUrl)
             .header("Authorization", "Bearer $normalizedApiKey")
+            .header("User-Agent", "muxueChat/1.0")
             .get()
             .build()
 

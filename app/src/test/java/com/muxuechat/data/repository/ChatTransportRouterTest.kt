@@ -5,6 +5,7 @@ import com.muxuechat.data.remote.OpenAiCompatibleClient
 import com.muxuechat.data.remote.OpenAiCompatibleMessageDto
 import com.muxuechat.data.remote.OpenAiCompatibleStreamEvent
 import com.muxuechat.data.remote.RecordingAuthLogger
+import com.muxuechat.data.remote.XaiAuthException
 import com.muxuechat.data.remote.XaiResponsesTransport
 import com.muxuechat.domain.model.CustomProvider
 import kotlinx.coroutines.flow.toList
@@ -27,13 +28,15 @@ class ChatTransportRouterTest {
     private val sentAuthorizations: MutableList<String?> = Collections.synchronizedList(mutableListOf())
 
     /** 前 [unauthorizedTimes] 次返回 401，之后返回一条正常的流。 */
-    private fun transport(unauthorizedTimes: Int): XaiResponsesTransport {
+    private fun transport(unauthorizedTimes: Int, onRequest: (Int) -> Unit = {}): XaiResponsesTransport {
         var seen = 0
         val client = OkHttpClient.Builder()
             .addInterceptor { chain ->
                 val request: Request = chain.request()
                 sentAuthorizations += request.header("Authorization")
-                val unauthorized = seen++ < unauthorizedTimes
+                val requestIndex = seen++
+                val unauthorized = requestIndex < unauthorizedTimes
+                onRequest(requestIndex)
                 Response.Builder()
                     .request(request)
                     .protocol(Protocol.HTTP_1_1)
@@ -58,9 +61,9 @@ class ChatTransportRouterTest {
         }
     }
 
-    private fun router(unauthorizedTimes: Int, tokens: XaiAccessTokenSource) = ChatTransportRouter(
+    private fun router(unauthorizedTimes: Int, tokens: XaiAccessTokenSource, onRequest: (Int) -> Unit = {}) = ChatTransportRouter(
         openAiCompatibleClient = OpenAiCompatibleClient(),
-        xaiResponsesTransport = transport(unauthorizedTimes),
+        xaiResponsesTransport = transport(unauthorizedTimes, onRequest),
         xaiAccessTokens = tokens,
     )
 
@@ -115,6 +118,60 @@ class ChatTransportRouterTest {
         // RP 补写、状态兜底、摘要与设定生成都走这条路；正文结束后才发出的补写最容易撞上过期。
         assertEquals("你好呀", chunk.choices.single().message?.content)
         assertEquals(listOf(OLD_TOKEN), tokens.rejected)
+    }
+
+    private class SessionTokens : XaiAccessTokenSource {
+        @Volatile var generation = 1L
+        var legacyCalls = 0
+        override suspend fun getValidAccessToken(rejectedAccessToken: String?): String {
+            legacyCalls++
+            return NEW_TOKEN
+        }
+        override suspend fun validateSession(lease: XaiAccessTokenLease) {
+            if (lease.sessionGeneration != generation) throw XaiAuthException.NotSignedIn()
+        }
+        override suspend fun refreshAccessToken(lease: XaiAccessTokenLease): XaiAccessTokenLease {
+            validateSession(lease)
+            return XaiAccessTokenLease(NEW_TOKEN, generation)
+        }
+    }
+
+    @Test
+    fun frozenSessionCannotSendAfterSwitchingAccounts() = runBlocking {
+        val tokens = SessionTokens().apply { generation = 2L }
+        val router = router(0, tokens)
+        val old = ProviderCredential.OAuthBearer(OLD_TOKEN, 1L)
+        assertTrue(runCatching { router.streamChat(old, BASE_URL, request()).toList() }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertTrue(runCatching { router.completeChat(old, BASE_URL, request()) }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertTrue(sentAuthorizations.isEmpty())
+    }
+
+    @Test
+    fun unauthorizedAfterAccountSwitchDoesNotSendMessageWithNewAccount() = runBlocking {
+        listOf(true, false).forEach { streaming ->
+            sentAuthorizations.clear()
+            val tokens = SessionTokens()
+            val router = router(1, tokens) { tokens.generation = 2L }
+            val old = ProviderCredential.OAuthBearer(OLD_TOKEN, 1L)
+            val error = runCatching {
+                if (streaming) router.streamChat(old, BASE_URL, request()).toList()
+                else router.completeChat(old, BASE_URL, request())
+            }.exceptionOrNull()
+            assertTrue(error is XaiAuthException.NotSignedIn)
+            assertEquals(listOf("Bearer $OLD_TOKEN"), sentAuthorizations)
+            assertEquals(0, tokens.legacyCalls)
+        }
+    }
+
+    @Test
+    fun completedOldAccountResponseIsRejectedBeforeDelivery() = runBlocking {
+        val tokens = SessionTokens()
+        val router = router(0, tokens) { tokens.generation = 2L }
+        val error = runCatching {
+            router.completeChat(ProviderCredential.OAuthBearer(OLD_TOKEN, 1L), BASE_URL, request())
+        }.exceptionOrNull()
+        assertTrue(error is XaiAuthException.NotSignedIn)
+        assertEquals(listOf("Bearer $OLD_TOKEN"), sentAuthorizations)
     }
 
     private companion object {

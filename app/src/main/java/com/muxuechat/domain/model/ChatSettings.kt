@@ -64,6 +64,8 @@ data class ChatSettings(
      * 所以这里必须填当前供应商下可用的模型。
      */
     val rpAuxiliaryModel: String = "",
+    /** 仅用于新会话首次打开 RP 设置时预选；不会自动绑定或开启 RP。 */
+    val defaultProtagonistProfileId: String? = null,
 ) {
     /**
      * RP 辅助请求实际使用的模型名。

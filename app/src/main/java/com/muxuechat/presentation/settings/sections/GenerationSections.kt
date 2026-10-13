@@ -102,7 +102,7 @@ fun GenerationSection(
         SettingsRow(
             title = "设定生成工具",
             subtitle = if (settings.settingsToolsEnabled) {
-                "关闭 RP 时，允许已启用工具能力的供应商创建角色卡、世界观、文风和主角草稿"
+                "关闭 RP 时，允许已启用工具能力的供应商创建、查看、删除角色卡、配角、主角、世界观和文风（创建与删除都需你确认）"
             } else {
                 "已关闭：不会向任何供应商发送 tools 字段"
             },
@@ -356,11 +356,15 @@ private fun SamplingSection(
     onChange: (SettingsMutation) -> Unit,
     onUpdateProvider: (providerId: String, transform: CustomProviderMutation) -> Unit,
 ) {
-    val effective = settings.samplingParametersEffective
     val provider = settings.activeCustomProvider.takeIf { settings.isCustomProvider }
+    val effective = settings.samplingParametersEffective && provider?.usesXaiOAuth != true
     val temperatureEnabled = effective && (provider?.sendTemperature != false)
     val topPEnabled = effective && (provider?.sendTopP != false)
-    val ineffectiveReason = "思考模式开启时 DeepSeek 会忽略这两个参数，App 也不会发送它们。"
+    val ineffectiveReason = if (provider?.usesXaiOAuth == true) {
+        "当前 xAI 订阅链路不支持 Temperature 和 Top P，App 不会发送这两个参数。"
+    } else {
+        "思考模式开启时 DeepSeek 会忽略这两个参数，App 也不会发送它们。"
+    }
 
     SettingsSection(
         title = "采样参数",
@@ -370,7 +374,7 @@ private fun SamplingSection(
             else -> null
         },
     ) {
-        provider?.let { customProvider ->
+        provider?.takeUnless { it.usesXaiOAuth }?.let { customProvider ->
             SettingsRow(
                 title = "发送 Temperature",
                 subtitle = if (customProvider.sendTemperature) {
@@ -401,7 +405,7 @@ private fun SamplingSection(
                 else -> null
             },
         )
-        provider?.let { customProvider ->
+        provider?.takeUnless { it.usesXaiOAuth }?.let { customProvider ->
             SettingsRow(
                 title = "发送 Top P",
                 subtitle = if (customProvider.sendTopP) {

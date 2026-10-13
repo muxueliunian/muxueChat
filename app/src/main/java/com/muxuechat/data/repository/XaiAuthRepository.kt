@@ -52,20 +52,30 @@ class XaiAuthRepository internal constructor(
     private val refreshMutex = Mutex()
     private val storeMutex = Mutex()
     private var generation = 0L
+    /** 即使持久化清理失败，本进程也不得重新使用用户已经退出的凭据。 */
+    private var locallySignedOut = false
     private val loginRunning = AtomicBoolean(false)
-    private val initialized = AtomicBoolean(false)
+    private var initialized = false
 
     /** 读取本机登录状态。重复调用无副作用；进程内首次调用时处理上次被中断的登录。 */
     suspend fun initialize() {
-        if (!initialized.compareAndSet(false, true)) return
         storeMutex.withLock {
-            val credential = io { store.load() }
-            val interrupted = io { store.isLoginInProgress() } && !loginRunning.get()
-            if (interrupted) io { store.setLoginInProgress(false) }
-            _state.value = when {
-                credential != null -> XaiAuthState.SignedIn(credential.account)
-                interrupted -> XaiAuthState.SignedOut("上次登录未完成，请重新登录")
-                else -> XaiAuthState.SignedOut()
+            if (initialized) return
+            try {
+                val credential = io { store.load() }
+                val interrupted = io { store.isLoginInProgress() } && !loginRunning.get()
+                if (interrupted) io { store.setLoginInProgress(false) }
+                _state.value = when {
+                    credential != null -> XaiAuthState.SignedIn(credential.account)
+                    interrupted -> XaiAuthState.SignedOut("上次登录未完成，请重新登录")
+                    else -> XaiAuthState.SignedOut()
+                }
+                initialized = true
+            } catch (error: Exception) {
+                if (error !is CancellationException) {
+                    _state.value = XaiAuthState.SignedOut("读取 xAI 登录状态失败，请重新登录重试")
+                }
+                throw error
             }
         }
     }
@@ -77,17 +87,23 @@ class XaiAuthRepository internal constructor(
      * 失败时抛出 [XaiAuthException]，状态回到登录前；取消时同样回到登录前，不留半截状态。
      */
     suspend fun signInWithDeviceCode() {
+        initialize()
+        val (previousState, loginGeneration) = storeMutex.withLock { _state.value to generation }
         if (!loginRunning.compareAndSet(false, true)) throw XaiAuthException.LoginAlreadyRunning()
-        val previousState = _state.value
-        val loginGeneration = storeMutex.withLock { generation }
         try {
-            io { store.setLoginInProgress(true) }
-            _state.value = XaiAuthState.RequestingCode
+            storeMutex.withLock {
+                if (generation != loginGeneration) throw CancellationException("登出后中止登录")
+                io { store.setLoginInProgress(true) }
+                _state.value = XaiAuthState.RequestingCode
+            }
 
             val deviceCode = client.requestDeviceCode()
             val verificationUri = XaiVerificationUriPolicy.select(deviceCode)
             val deadline = clock() + minOf(deviceCode.expiresInSeconds * 1_000, MAX_LOGIN_MILLIS)
-            _state.value = XaiAuthState.AwaitingUser(deviceCode.userCode, verificationUri, deadline)
+            storeMutex.withLock {
+                if (generation != loginGeneration) throw CancellationException("登出后中止登录")
+                _state.value = XaiAuthState.AwaitingUser(deviceCode.userCode, verificationUri, deadline)
+            }
             logger.info("xAI device login awaiting user")
 
             var intervalMillis = deviceCode.intervalSeconds * 1_000
@@ -99,11 +115,15 @@ class XaiAuthRepository internal constructor(
                     XaiDevicePollResult.SlowDown -> intervalMillis += SLOW_DOWN_STEP_MILLIS
                     is XaiDevicePollResult.Granted -> {
                         val credential = result.tokens.toCredential(previous = null)
-                        storeMutex.withLock {
-                            // 登录期间发生过登出（理论上界面不会同时提供两个入口），以登出为准。
-                            if (generation != loginGeneration) throw CancellationException("登出后丢弃登录结果")
-                            io { store.save(credential) }
-                            _state.value = XaiAuthState.SignedIn(credential.account)
+                        // 持久化与世代切换不可被分开取消，否则磁盘已换账号，旧租约却仍有效。
+                        withContext(NonCancellable) {
+                            storeMutex.withLock {
+                                if (generation != loginGeneration) throw CancellationException("登出后丢弃登录结果")
+                                io { store.save(credential) }
+                                generation++
+                                locallySignedOut = false
+                                _state.value = XaiAuthState.SignedIn(credential.account)
+                            }
                         }
                         logger.info("xAI device login completed")
                         return
@@ -111,18 +131,25 @@ class XaiAuthRepository internal constructor(
                 }
             }
         } catch (error: Throwable) {
-            if (_state.value !is XaiAuthState.SignedIn) {
-                _state.value = when (previousState) {
-                    XaiAuthState.Loading, XaiAuthState.RequestingCode, is XaiAuthState.AwaitingUser ->
-                        XaiAuthState.SignedOut()
-                    else -> previousState
+            withContext(NonCancellable) {
+                storeMutex.withLock {
+                    if (generation == loginGeneration && _state.value !is XaiAuthState.SignedIn) {
+                        _state.value = when (previousState) {
+                            XaiAuthState.Loading, XaiAuthState.RequestingCode, is XaiAuthState.AwaitingUser ->
+                                XaiAuthState.SignedOut()
+                            else -> previousState
+                        }
+                    }
                 }
             }
             if (error is XaiAuthException) logger.warn("xAI device login failed: ${error.javaClass.simpleName}")
             throw error
         } finally {
-            withContext(NonCancellable) { io { store.setLoginInProgress(false) } }
-            loginRunning.set(false)
+            try {
+                withContext(NonCancellable) { io { store.setLoginInProgress(false) } }
+            } finally {
+                loginRunning.set(false)
+            }
         }
     }
 
@@ -134,21 +161,57 @@ class XaiAuthRepository internal constructor(
      *
      * 失败时抛出 [XaiAuthException]：只有 [XaiAuthException.AuthorizationRevoked] 会清除凭据。
      */
-    override suspend fun getValidAccessToken(rejectedAccessToken: String?): String {
+    override suspend fun getValidAccessToken(rejectedAccessToken: String?): String =
+        acquireLease(rejectedAccessToken, expectedGeneration = null).accessToken
+
+    override suspend fun acquireAccessToken(): XaiAccessTokenLease =
+        acquireLease(rejectedAccessToken = null, expectedGeneration = null)
+
+    override suspend fun refreshAccessToken(lease: XaiAccessTokenLease): XaiAccessTokenLease =
+        acquireLease(lease.accessToken, lease.sessionGeneration ?: throw XaiAuthException.NotSignedIn())
+
+    override suspend fun validateSession(lease: XaiAccessTokenLease) {
+        storeMutex.withLock { requireCurrentSession(lease) }
+    }
+
+    override suspend fun <T> withCurrentSession(lease: XaiAccessTokenLease, block: suspend () -> T): T =
+        storeMutex.withLock {
+            requireCurrentSession(lease)
+            if (io { store.load() } == null) {
+                invalidateMissingCredential()
+                throw XaiAuthException.NotSignedIn()
+            }
+            block()
+        }
+
+    private fun requireCurrentSession(lease: XaiAccessTokenLease) {
+        if (locallySignedOut || lease.sessionGeneration == null || lease.sessionGeneration != generation) {
+            throw XaiAuthException.NotSignedIn()
+        }
+    }
+
+    private suspend fun acquireLease(rejectedAccessToken: String?, expectedGeneration: Long?): XaiAccessTokenLease {
         // **进入刷新锁之前**先记下世代号。只在锁内取会留一个窗口：
         // 调用方排队等锁期间用户登出并换号登录，拿到锁后读到的就是另一个账号的凭据，
         // 登出前编好的这条消息会被发到新账号名下。
         val enqueuedGeneration = storeMutex.withLock { generation }
-        return refreshMutex.withLock { refreshLocked(rejectedAccessToken, enqueuedGeneration) }
+        if (expectedGeneration != null && expectedGeneration != enqueuedGeneration) throw XaiAuthException.NotSignedIn()
+        val accessToken = refreshMutex.withLock { refreshLocked(rejectedAccessToken, enqueuedGeneration) }
+        return storeMutex.withLock {
+            if (generation != enqueuedGeneration) throw XaiAuthException.NotSignedIn()
+            XaiAccessTokenLease(accessToken, enqueuedGeneration)
+        }
     }
 
     private suspend fun refreshLocked(rejectedAccessToken: String?, enqueuedGeneration: Long): String {
-        val (credential, refreshGeneration) = storeMutex.withLock { io { store.load() } to generation }
-        // 排队期间发生过登出（可能还换了账号）：这次请求属于上一个登录会话，直接作废。
-        if (refreshGeneration != enqueuedGeneration) throw XaiAuthException.NotSignedIn()
-        if (credential == null) {
-            syncSignedOutState()
-            throw XaiAuthException.NotSignedIn()
+        val refreshGeneration = enqueuedGeneration
+        val credential = storeMutex.withLock {
+            // 排队期间发生过登出或新登录：不能读另一个会话的凭据。
+            if (locallySignedOut || generation != enqueuedGeneration) throw XaiAuthException.NotSignedIn()
+            io { store.load() } ?: run {
+                invalidateMissingCredential()
+                throw XaiAuthException.NotSignedIn()
+            }
         }
         val forced = rejectedAccessToken != null && rejectedAccessToken == credential.accessToken
         if (!forced && credential.expiresAtMillis - REFRESH_MARGIN_MILLIS > clock()) {
@@ -194,12 +257,20 @@ class XaiAuthRepository internal constructor(
      *   这次请求按 §2.2 同样返回 200，无副作用。
      */
     suspend fun signOut() {
-        val revoked = storeMutex.withLock {
-            generation++
-            val current = io { store.load() }
-            io { store.clear() }
-            _state.value = XaiAuthState.SignedOut()
-            current
+        val revoked = withContext(NonCancellable) {
+            storeMutex.withLock {
+                generation++
+                locallySignedOut = true
+                initialized = true
+                try {
+                    val current = runCatching { io { store.load() } }
+                    val cleared = runCatching { io { store.clear() } }
+                    cleared.getOrThrow()
+                    current.getOrThrow()
+                } finally {
+                    _state.value = XaiAuthState.SignedOut()
+                }
+            }
         }
         logger.info("xAI signed out")
         revoked?.let { revokeBestEffort(it) }
@@ -241,13 +312,20 @@ class XaiAuthRepository internal constructor(
         storeMutex.withLock {
             if (generation != expectedGeneration) return
             generation++
-            io { store.clear() }
-            _state.value = XaiAuthState.SignedOut("xAI 授权已失效，请重新登录")
+            locallySignedOut = true
+            try {
+                io { store.clear() }
+            } finally {
+                _state.value = XaiAuthState.SignedOut("xAI 授权已失效，请重新登录")
+            }
         }
         logger.warn("xAI authorization revoked; credential cleared")
     }
 
-    private fun syncSignedOutState() {
+    /** 调用方必须持有 storeMutex。解密失败也须使已冻结的旧租约失效。 */
+    private fun invalidateMissingCredential() {
+        generation++
+        locallySignedOut = true
         if (_state.value is XaiAuthState.SignedIn) {
             _state.value = XaiAuthState.SignedOut("本机保存的 xAI 登录已失效，请重新登录")
         }

@@ -75,6 +75,10 @@ data class CustomProvider(
     val streamUsageEnabled: Boolean = false,
     /** 旧数据缺省为 [ProviderAuthKind.API_KEY]。 */
     val authKind: ProviderAuthKind = ProviderAuthKind.API_KEY,
+    /** 输出上限字段，旧端点默认沿用 max_tokens。 */
+    val outputTokenField: OpenAiOutputTokenField = OpenAiOutputTokenField.MAX_TOKENS,
+    /** 可选的每会话标识扩展头；值由 App 填稳定会话 ID，不保存任何凭据。 */
+    val conversationHeaderName: String = "",
 ) {
     val usesXaiOAuth: Boolean
         get() = authKind == ProviderAuthKind.XAI_OAUTH
@@ -106,6 +110,7 @@ data class CustomProvider(
             // 刻意不按 models 裁剪：`/models` 刷新时上游临时不列出某个模型，
             // 不应把用户手填过的窗口悄悄删掉。只有设置页显式移除模型才删对应项。
             modelContextWindows = ChatSettings.normalizeContextWindows(modelContextWindows),
+            conversationHeaderName = if (usesXaiOAuth) "" else ConversationHeaderPolicy.normalize(conversationHeaderName),
         )
     }
 

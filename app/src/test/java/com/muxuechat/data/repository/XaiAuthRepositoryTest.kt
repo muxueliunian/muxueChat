@@ -1,6 +1,7 @@
 package com.muxuechat.data.repository
 
 import com.muxuechat.data.local.XaiCredential
+import com.muxuechat.data.local.XaiCredentialStore
 import com.muxuechat.data.remote.FakeAuthReply
 import com.muxuechat.data.remote.FakeXaiAuthServer
 import com.muxuechat.data.remote.InMemoryXaiCredentialStore
@@ -9,6 +10,7 @@ import com.muxuechat.data.remote.XaiAuthException
 import com.muxuechat.data.remote.XaiFixtures
 import com.muxuechat.domain.model.XaiAuthState
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -189,6 +191,199 @@ class XaiAuthRepositoryTest {
         repository.initialize()
 
         assertEquals(XaiAuthState.SignedIn("reader@example.com"), repository.state.value)
+    }
+
+    @Test
+    fun initialize_failureOrCancellationCanBeRetried() = runTest {
+        listOf(IllegalStateException("synthetic storage failure"), CancellationException("synthetic cancellation"))
+            .forEach { failure ->
+                var fail = true
+                val failingStore = object : XaiCredentialStore by store {
+                    override suspend fun load(): XaiCredential? {
+                        if (fail) throw failure
+                        return store.load()
+                    }
+                }
+                store.credential = signedInCredential(10_000_000)
+                val repository = XaiAuthRepository(
+                    server.client(), failingStore, StandardTestDispatcher(testScheduler),
+                    { testScheduler.currentTime }, server.logger,
+                )
+                val error = runCatching { repository.initialize() }.exceptionOrNull()
+                // 协程栈恢复可能复制异常，比较类型和文案而不是对象身份。
+                assertEquals(failure.javaClass, error?.javaClass)
+                assertEquals(failure.message, error?.message)
+                fail = false
+                repository.initialize()
+                assertEquals(XaiAuthState.SignedIn("reader@example.com"), repository.state.value)
+            }
+    }
+
+    @Test
+    fun leaseCannotRefreshOrReadNewAccountAfterSignOutAndLogin() = runTest {
+        store.credential = signedInCredential(10_000_000)
+        server.handler = { request ->
+            when (request.url) {
+                XaiAuthClient.REVOKE_URL -> FakeAuthReply.Http(200, "")
+                XaiAuthClient.DEVICE_CODE_URL -> FakeAuthReply.Http(200, XaiFixtures.deviceCodeBody())
+                else -> FakeAuthReply.Http(200, XaiFixtures.tokenBody("synthetic-other-account", "synthetic-other-refresh"))
+            }
+        }
+        val repository = repository()
+        repository.initialize()
+        val oldLease = repository.acquireAccessToken()
+        repository.signOut()
+        repository.signInWithDeviceCode()
+        val requestCount = server.requests.size
+
+        assertTrue(runCatching { repository.refreshAccessToken(oldLease) }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertTrue(runCatching { repository.validateSession(oldLease) }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertEquals(requestCount, server.requests.size)
+        assertEquals("synthetic-other-account", repository.acquireAccessToken().accessToken)
+    }
+
+    @Test
+    fun refreshedLeaseRemainsInSameSessionAndReusesConcurrentRefresh() = runTest {
+        store.credential = signedInCredential(10_000_000)
+        server.handler = { FakeAuthReply.Http(200, XaiFixtures.tokenBody(XaiFixtures.NEW_ACCESS_TOKEN)) }
+        val repository = repository()
+        repository.initialize()
+        val lease = repository.acquireAccessToken()
+        val refreshed = repository.refreshAccessToken(lease)
+        val reused = repository.refreshAccessToken(lease)
+
+        assertEquals(lease.sessionGeneration, refreshed.sessionGeneration)
+        assertEquals(refreshed.accessToken, reused.accessToken)
+        assertEquals(1, server.tokenRequests().size)
+        repository.validateSession(lease)
+    }
+
+    @Test
+    fun legacyLeaseWithoutSessionIsRejectedByProductionRepository() = runTest {
+        store.credential = signedInCredential(10_000_000)
+        val repository = repository()
+        repository.initialize()
+        val unbound = XaiAccessTokenLease(XaiFixtures.ACCESS_TOKEN)
+        assertTrue(runCatching { repository.validateSession(unbound) }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertTrue(runCatching { repository.refreshAccessToken(unbound) }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertTrue(server.requests.isEmpty())
+    }
+
+    @Test
+    fun sessionGuardAndSignOutAreAtomicForCatalogWriteback() = runTest {
+        store.credential = signedInCredential(10_000_000)
+        server.handler = { FakeAuthReply.Http(200, "") }
+        val repository = repository()
+        repository.initialize()
+        val lease = repository.acquireAccessToken()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var wroteModels = false
+        val writing = launch {
+            repository.withCurrentSession(lease) {
+                entered.complete(Unit)
+                release.await()
+                wroteModels = true
+            }
+        }
+        entered.await()
+        val logout = launch { repository.signOut() }
+        runCurrent()
+        assertFalse(logout.isCompleted)
+        assertFalse(wroteModels)
+        release.complete(Unit)
+        writing.join()
+        logout.join()
+        assertTrue(wroteModels)
+        assertEquals(XaiAuthState.SignedOut(), repository.state.value)
+        assertTrue(runCatching { repository.withCurrentSession(lease) { error("must not write") } }
+            .exceptionOrNull() is XaiAuthException.NotSignedIn)
+    }
+
+    @Test
+    fun signOutDuringDeviceCodeRequest_doesNotRestorePreviousSignedInState() = runTest {
+        store.credential = signedInCredential(10_000_000)
+        val arrived = CompletableDeferred<Unit>()
+        val release = CountDownLatch(1)
+        server.handler = { request ->
+            if (request.url == XaiAuthClient.DEVICE_CODE_URL) {
+                arrived.complete(Unit)
+                release.await(10, TimeUnit.SECONDS)
+                FakeAuthReply.Http(200, XaiFixtures.deviceCodeBody())
+            } else {
+                FakeAuthReply.Http(200, "")
+            }
+        }
+        val repository = repository()
+        repository.initialize()
+        val login = async { runCatching { repository.signInWithDeviceCode() } }
+        arrived.await()
+        try {
+            repository.signOut()
+        } finally {
+            release.countDown()
+        }
+        assertTrue(login.await().exceptionOrNull() is CancellationException)
+        assertEquals(XaiAuthState.SignedOut(), repository.state.value)
+        assertNull(store.credential)
+        assertFalse(store.loginMarker)
+    }
+
+    @Test
+    fun signOutStorageFailureStillInvalidatesLeaseAndCanRetryCleanup() = runTest {
+        store.credential = signedInCredential(10_000_000)
+        var failClear = true
+        val failingStore = object : XaiCredentialStore by store {
+            override suspend fun clear() {
+                if (failClear) error("synthetic cleanup failure")
+                store.clear()
+            }
+        }
+        server.handler = { FakeAuthReply.Http(200, "") }
+        val repository = XaiAuthRepository(
+            server.client(), failingStore, StandardTestDispatcher(testScheduler),
+            { testScheduler.currentTime }, server.logger,
+        )
+        repository.initialize()
+        val lease = repository.acquireAccessToken()
+        assertTrue(runCatching { repository.signOut() }.isFailure)
+        repository.initialize()
+        assertEquals(XaiAuthState.SignedOut(), repository.state.value)
+        assertTrue(runCatching { repository.acquireAccessToken() }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertTrue(runCatching { repository.validateSession(lease) }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        failClear = false
+        repository.signOut()
+        assertNull(store.credential)
+    }
+
+    @Test
+    fun loginMarkerCleanupFailureDoesNotPermanentlyBlockNewLogin() = runTest {
+        var failCleanup = true
+        val failingStore = object : XaiCredentialStore by store {
+            override fun setLoginInProgress(inProgress: Boolean) {
+                if (!inProgress && failCleanup) {
+                    failCleanup = false
+                    error("synthetic marker cleanup failure")
+                }
+                store.setLoginInProgress(inProgress)
+            }
+        }
+        server.handler = { request ->
+            if (request.url == XaiAuthClient.DEVICE_CODE_URL) {
+                FakeAuthReply.Http(200, XaiFixtures.deviceCodeBody())
+            } else {
+                FakeAuthReply.Http(200, XaiFixtures.tokenBody())
+            }
+        }
+        val repository = XaiAuthRepository(
+            server.client(), failingStore, StandardTestDispatcher(testScheduler),
+            { testScheduler.currentTime }, server.logger,
+        )
+        repository.initialize()
+        assertTrue(runCatching { repository.signInWithDeviceCode() }.isFailure)
+        repository.signInWithDeviceCode()
+        assertTrue(repository.state.value is XaiAuthState.SignedIn)
+        assertFalse(store.loginMarker)
     }
 
     // ---------------------------------------------------------------- 刷新

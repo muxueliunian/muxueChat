@@ -266,6 +266,19 @@ class XaiResponsesTransportTest {
     }
 
     @Test
+    fun completedWithoutResponseOrStatus_isNotTreatedAsSuccess() {
+        listOf(
+            """data: {"type":"response.completed"}""",
+            """data: {"type":"response.completed","response":{}}""",
+            """data: {"type":"response.completed","response":{"status":null}}""",
+        ).forEach { sse ->
+            val error = collect(sse).exceptionOrNull()
+            assertTrue(error is XaiResponsesTransport.XaiResponsesException)
+            assertEquals("xAI 回复未正常结束，请重试", error?.message)
+        }
+    }
+
+    @Test
     fun nonPinnedAddress_isRejectedBeforeAnyCredentialLeavesTheApp() {
         // 冻结器已经钉死地址，但本类是唯一附加 Authorization 的地方，自己再挡一道。
         val error = runCatching {

@@ -1,6 +1,7 @@
 package com.muxuechat.data.repository
 
 import com.muxuechat.data.remote.RemoteClientLogger
+import com.muxuechat.data.remote.XaiAuthException
 import com.muxuechat.data.remote.XaiResponsesTransport
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
@@ -17,12 +18,13 @@ import java.util.concurrent.CopyOnWriteArrayList
 class XaiModelCatalogTest {
     private val sentTokens = CopyOnWriteArrayList<String>()
 
-    private fun transport(vararg codes: Int): XaiResponsesTransport {
+    private fun transport(vararg codes: Int, onResponse: () -> Unit = {}): XaiResponsesTransport {
         var index = 0
         val client = OkHttpClient.Builder()
             .addInterceptor { chain ->
                 sentTokens += chain.request().header("Authorization").orEmpty().removePrefix("Bearer ")
                 val code = codes[minOf(index++, codes.lastIndex)]
+                onResponse()
                 Response.Builder()
                     .request(chain.request())
                     .protocol(Protocol.HTTP_1_1)
@@ -62,6 +64,40 @@ class XaiModelCatalogTest {
 
         assertTrue(error is XaiResponsesTransport.XaiUnauthorizedException)
         assertEquals(2, sentTokens.size)
+    }
+
+    private class SessionTokens : XaiAccessTokenSource {
+        @Volatile var generation = 1L
+        override suspend fun getValidAccessToken(rejectedAccessToken: String?): String = "new-account-token"
+        override suspend fun acquireAccessToken(): XaiAccessTokenLease = XaiAccessTokenLease("old-account-token", generation)
+        override suspend fun validateSession(lease: XaiAccessTokenLease) {
+            if (lease.sessionGeneration != generation) throw XaiAuthException.NotSignedIn()
+        }
+        override suspend fun refreshAccessToken(lease: XaiAccessTokenLease): XaiAccessTokenLease {
+            validateSession(lease)
+            return XaiAccessTokenLease("refreshed-token", generation)
+        }
+    }
+
+    @Test
+    fun unauthorizedAfterAccountSwitchDoesNotRequestNewAccountCatalog() = runBlocking {
+        val tokens = SessionTokens()
+        val catalog = XaiModelCatalog(transport(401, 200, onResponse = { tokens.generation = 2L }), tokens)
+        assertTrue(runCatching { catalog.listModels() }.exceptionOrNull() is XaiAuthException.NotSignedIn)
+        assertEquals(listOf("old-account-token"), sentTokens)
+    }
+
+    @Test
+    fun responseFromOldSessionDoesNotInvokeCatalogWriteback() = runBlocking {
+        val tokens = SessionTokens()
+        val catalog = XaiModelCatalog(transport(200, onResponse = { tokens.generation = 2L }), tokens)
+        var wroteModels = false
+        val error = runCatching {
+            catalog.withModels { wroteModels = true }
+        }.exceptionOrNull()
+        assertTrue(error is XaiAuthException.NotSignedIn)
+        assertTrue(!wroteModels)
+        assertEquals(listOf("old-account-token"), sentTokens)
     }
 
     private companion object {

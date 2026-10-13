@@ -49,6 +49,20 @@ class ProviderRequestFreezerTest {
         activeCustomProviderId = active.id,
     )
 
+    @Test
+    fun xaiSnapshotRetainsLoginSessionLease() = runBlocking {
+        val tokens = object : XaiAccessTokenSource {
+            override suspend fun getValidAccessToken(rejectedAccessToken: String?): String = error("must acquire a lease")
+            override suspend fun acquireAccessToken(): XaiAccessTokenLease = XaiAccessTokenLease("synthetic-lease-token", 7L)
+        }
+        val snapshot = ProviderRequestFreezer(FakeSettingsRepository(customSettings(xaiProvider), null), tokens).freeze()
+        val credential = snapshot.credential as ProviderCredential.OAuthBearer
+        assertEquals("synthetic-lease-token", credential.accessToken)
+        assertEquals(7L, credential.sessionGeneration)
+        assertFalse(credential.toString().contains("synthetic-lease-token"))
+        assertFalse(credential.lease().toString().contains("synthetic-lease-token"))
+    }
+
     // ---------------------------------------------------------------- 现有两类供应商：行为不变
 
     @Test

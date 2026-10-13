@@ -26,21 +26,32 @@ internal class ChatTransportRouter(
         credential: ProviderCredential,
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
+        conversationHeaderName: String = "",
+        conversationId: String? = null,
     ): Flow<OpenAiCompatibleStreamEvent> = when (credential) {
         is ProviderCredential.ApiKey ->
-            openAiCompatibleClient.streamChat(credential.value, baseUrl, requestDto)
+            openAiCompatibleClient.streamChat(credential.value, baseUrl, requestDto, conversationHeaderName, conversationId)
 
         is ProviderCredential.OAuthBearer -> flow {
+            var lease = credential.lease()
+            xaiAccessTokens.validateSession(lease)
             var emitted = false
             try {
-                xaiResponsesTransport.streamChat(credential.accessToken, baseUrl, requestDto)
-                    .collect { emitted = true; emit(it) }
+                xaiResponsesTransport.streamChat(lease.accessToken, baseUrl, requestDto)
+                    .collect {
+                        xaiAccessTokens.validateSession(lease)
+                        emitted = true
+                        emit(it)
+                    }
             } catch (error: XaiResponsesTransport.XaiUnauthorizedException) {
                 // 已经吐过内容就不能重试：重试会让同一轮出现两段正文。
                 if (emitted) throw error
-                val refreshed = refreshRejected(credential.accessToken)
-                xaiResponsesTransport.streamChat(refreshed, baseUrl, requestDto)
-                    .collect { emit(it) }
+                lease = xaiAccessTokens.refreshAccessToken(lease)
+                xaiResponsesTransport.streamChat(lease.accessToken, baseUrl, requestDto)
+                    .collect {
+                        xaiAccessTokens.validateSession(lease)
+                        emit(it)
+                    }
             }
         }
     }
@@ -49,30 +60,26 @@ internal class ChatTransportRouter(
         credential: ProviderCredential,
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
+        conversationHeaderName: String = "",
+        conversationId: String? = null,
     ): OpenAiCompatibleChatChunkDto = when (credential) {
         is ProviderCredential.ApiKey ->
-            openAiCompatibleClient.completeChat(credential.value, baseUrl, requestDto)
+            openAiCompatibleClient.completeChat(credential.value, baseUrl, requestDto, conversationHeaderName, conversationId)
 
         // Responses 的非流式响应未采集，适配器内部用流式聚合出同样的结果。
-        is ProviderCredential.OAuthBearer -> try {
-            xaiResponsesTransport.completeChat(credential.accessToken, baseUrl, requestDto)
-        } catch (error: XaiResponsesTransport.XaiUnauthorizedException) {
-            xaiResponsesTransport.completeChat(
-                refreshRejected(credential.accessToken),
-                baseUrl,
-                requestDto,
-            )
+        is ProviderCredential.OAuthBearer -> {
+            var lease = credential.lease()
+            xaiAccessTokens.validateSession(lease)
+            val result = try {
+                xaiResponsesTransport.completeChat(lease.accessToken, baseUrl, requestDto)
+            } catch (error: XaiResponsesTransport.XaiUnauthorizedException) {
+                lease = xaiAccessTokens.refreshAccessToken(lease)
+                xaiResponsesTransport.completeChat(lease.accessToken, baseUrl, requestDto)
+            }
+            xaiAccessTokens.validateSession(lease)
+            result
         }
     }
-
-    /**
-     * 冻结快照持有的 token 被上游拒了，带着它强制刷新一次。
-     *
-     * token 可能在冻结之后、请求发出之前失效——正文结束后才发出的 RP 补写最容易撞上。
-     * 只重试一次：再失败就是真的需要重新登录，不该无限刷新。
-     */
-    private suspend fun refreshRejected(rejected: String): String =
-        xaiAccessTokens.getValidAccessToken(rejectedAccessToken = rejected)
 
     /** 停止生成时两个实现都要取消：用户可能刚切过供应商，在途请求未必只在一边。 */
     fun cancelActiveRequest() {

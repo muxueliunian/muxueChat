@@ -43,13 +43,18 @@ class XaiAuthViewModel(
 
     init {
         viewModelScope.launch {
-            runCatching { repository.initialize() }
-                .onFailure { message.value = "读取 xAI 登录状态失败，请重试" }
+            try {
+                repository.initialize()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                message.value = "读取 xAI 登录状态失败，请重新登录重试"
+            }
         }
     }
 
     fun startLogin() {
-        if (loginJob?.isActive == true) return
+        if (loginJob?.isCompleted == false) return
         message.value = null
         loginJob = viewModelScope.launch {
             try {
@@ -66,17 +71,28 @@ class XaiAuthViewModel(
     }
 
     fun cancelLogin() {
-        loginJob?.cancel()
-        loginJob = null
-        message.value = "已取消登录"
+        val cancelledJob = loginJob ?: return
+        cancelledJob.cancel()
+        viewModelScope.launch {
+            cancelledJob.join()
+            if (loginJob === cancelledJob) {
+                loginJob = null
+                message.value = "已取消登录"
+            }
+        }
     }
 
     fun signOut() {
         loginJob?.cancel()
         viewModelScope.launch {
-            runCatching { repository.signOut() }
-                .onSuccess { message.value = "已退出 xAI 登录" }
-                .onFailure { message.value = "退出登录失败，请重试" }
+            try {
+                repository.signOut()
+                message.value = "已退出 xAI 登录"
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                message.value = "本机登录已停用，凭据清理失败，请重试退出登录"
+            }
         }
     }
 

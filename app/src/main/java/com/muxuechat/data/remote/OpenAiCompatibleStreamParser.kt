@@ -1,6 +1,9 @@
 package com.muxuechat.data.remote
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 
 /**
  * 解析 OpenAI 兼容 SSE 数据行。
@@ -11,7 +14,7 @@ import kotlinx.serialization.json.Json
 class OpenAiCompatibleStreamParser(
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
-    fun parseLine(line: String): OpenAiCompatibleStreamEvent? {
+    fun parseLine(line: String, apiKey: String = ""): OpenAiCompatibleStreamEvent? {
         val trimmed = line.trim()
         if (!trimmed.startsWith("data:")) return null
 
@@ -19,7 +22,12 @@ class OpenAiCompatibleStreamParser(
         if (payload.isEmpty()) return null
         if (payload == "[DONE]") return OpenAiCompatibleStreamEvent.Done
 
-        val chunk = json.decodeFromString<OpenAiCompatibleChatChunkDto>(payload)
+        val root = json.parseToJsonElement(payload)
+        // 部分兼容端点在 HTTP 200 流内沿用通用错误对象；不臆造厂商 event 类型。
+        if (root is JsonObject && root["error"] != null && root["error"] != JsonNull) {
+            throw OpenAiCompatibleErrorDetails.responseError(root["error"] as? JsonObject, apiKey, streaming = true)
+        }
+        val chunk = json.decodeFromJsonElement<OpenAiCompatibleChatChunkDto>(root)
         val choice = chunk.choices.firstOrNull()
         return OpenAiCompatibleStreamEvent.Delta(
             content = choice?.delta?.content,
@@ -27,9 +35,10 @@ class OpenAiCompatibleStreamParser(
             finishReason = choice?.finishReason,
             usage = chunk.usage,
             toolCalls = choice?.delta?.toolCalls,
+            refusal = choice?.delta?.refusal,
         )
     }
 
     fun parseLines(text: String): List<OpenAiCompatibleStreamEvent> =
-        text.lineSequence().mapNotNull(::parseLine).toList()
+        text.lineSequence().mapNotNull { parseLine(it) }.toList()
 }

@@ -2,6 +2,7 @@ package com.muxuechat.data.remote
 
 import com.muxuechat.domain.context.ChatContextPlanner
 import com.muxuechat.domain.model.ChatSettings
+import com.muxuechat.domain.model.OpenAiOutputTokenField
 
 /**
  * 集中构造 供应商的 OpenAI 兼容请求。
@@ -17,6 +18,7 @@ object OpenAiCompatibleRequestFactory {
         RP_METADATA,
         RP_STATE_UPDATE,
         CONTEXT_SUMMARY,
+        CONVERSATION_TITLE,
     }
 
     fun build(
@@ -36,6 +38,9 @@ object OpenAiCompatibleRequestFactory {
         val normalized = settings.normalized()
         val resolvedModel = model.trim()
         val activeProvider = normalized.activeCustomProvider
+        // xAI 的内部适配器仍读取同一个 maxTokens 预算，再翻译成已实测的字段。
+        val useCompletionTokens = activeProvider?.usesXaiOAuth != true &&
+            activeProvider?.outputTokenField == OpenAiOutputTokenField.MAX_COMPLETION_TOKENS
         require(resolvedModel.isNotBlank()) { "请配置供应商模型名" }
 
         return OpenAiCompatibleChatRequest(
@@ -43,9 +48,14 @@ object OpenAiCompatibleRequestFactory {
             messages = messages,
             // stream 不带默认值，false 也必须被实际编码。
             stream = streamOverride ?: (purpose == Purpose.CHAT && normalized.streamEnabled),
-            maxTokens = purpose.maxTokens(normalized),
-            temperature = purpose.temperature(normalized).takeIf { activeProvider?.sendTemperature != false },
-            topP = purpose.topP(normalized).takeIf { activeProvider?.sendTopP != false },
+            maxTokens = purpose.maxTokens(normalized).takeUnless { useCompletionTokens },
+            maxCompletionTokens = purpose.maxTokens(normalized).takeIf { useCompletionTokens },
+            temperature = purpose.temperature(normalized).takeIf {
+                activeProvider?.sendTemperature != false && activeProvider?.usesXaiOAuth != true
+            },
+            topP = purpose.topP(normalized).takeIf {
+                activeProvider?.sendTopP != false && activeProvider?.usesXaiOAuth != true
+            },
             reasoningEffort = purpose.reasoningEffort(reasoningEffort),
             // RP 补写和摘要是内部结构化请求，绝不能被调用点误挂载工具。
             tools = purpose.tools(tools),
@@ -89,6 +99,7 @@ object OpenAiCompatibleRequestFactory {
         Purpose.RP_METADATA -> RP_METADATA_MAX_TOKENS
         Purpose.RP_STATE_UPDATE -> RP_STATE_UPDATE_MAX_TOKENS
         Purpose.CONTEXT_SUMMARY -> CONTEXT_SUMMARY_MAX_TOKENS
+        Purpose.CONVERSATION_TITLE -> CONVERSATION_TITLE_MAX_TOKENS
     }
 
     private fun Purpose.temperature(settings: ChatSettings): Double = when (this) {
@@ -96,6 +107,7 @@ object OpenAiCompatibleRequestFactory {
         Purpose.RP_METADATA -> RP_METADATA_TEMPERATURE
         Purpose.RP_STATE_UPDATE -> RP_STATE_UPDATE_TEMPERATURE
         Purpose.CONTEXT_SUMMARY -> CONTEXT_SUMMARY_TEMPERATURE
+        Purpose.CONVERSATION_TITLE -> CONVERSATION_TITLE_TEMPERATURE
     }
 
     private fun Purpose.topP(settings: ChatSettings): Double = when (this) {
@@ -116,4 +128,11 @@ object OpenAiCompatibleRequestFactory {
     private const val RP_METADATA_TEMPERATURE = 0.35
     private const val RP_STATE_UPDATE_TEMPERATURE = 0.1
     private const val CONTEXT_SUMMARY_TEMPERATURE = 0.2
+
+    /**
+     * 标题只有十几个字。OpenAI 兼容端无法关闭默认思考的模型会把思考也计入这个上限，
+     * 因此比 DeepSeek（思考已显式关闭）留得宽。
+     */
+    const val CONVERSATION_TITLE_MAX_TOKENS = 1024
+    private const val CONVERSATION_TITLE_TEMPERATURE = 0.3
 }

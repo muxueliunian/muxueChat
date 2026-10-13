@@ -62,13 +62,15 @@ class OpenAiCompatibleToolCallAccumulatorTest {
     }
 
     @Test
-    fun dropsCallsThatNeverReceiveIdOrName() {
+    fun rejectsCallsThatNeverReceiveIdOrName() {
         val accumulator = OpenAiCompatibleToolCallAccumulator()
         accumulator.accept(listOf(fragment(0, name = "create_role_card", arguments = "{}")))
         accumulator.accept(listOf(fragment(1, id = "has-id-only", arguments = "{}")))
 
         assertTrue(accumulator.hasCalls())
-        assertTrue(accumulator.build().isEmpty())
+        val error = runCatching { accumulator.build() }.exceptionOrNull()
+        assertTrue(error is OpenAiCompatibleProtocolException)
+        assertEquals("供应商返回的工具调用不完整，缺少调用 ID 或函数名称", error?.message)
     }
 
     @Test

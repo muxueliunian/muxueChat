@@ -1,5 +1,6 @@
 package com.muxuechat.data.remote
 
+import com.muxuechat.domain.model.ConversationHeaderPolicy
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -10,9 +11,9 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.decodeFromJsonElement
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -70,6 +71,8 @@ class OpenAiCompatibleClient private constructor(
         apiKey: String,
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
+        conversationHeaderName: String = "",
+        conversationId: String? = null,
     ): Flow<OpenAiCompatibleStreamEvent> {
         require(requestDto.stream) { "供应商流式请求必须设置 stream=true" }
         val request = buildRequest(
@@ -77,6 +80,8 @@ class OpenAiCompatibleClient private constructor(
             baseUrl = baseUrl,
             requestDto = requestDto,
             acceptsEventStream = true,
+            conversationHeaderName = conversationHeaderName,
+            conversationId = conversationId,
         )
 
         return callbackFlow {
@@ -114,8 +119,9 @@ class OpenAiCompatibleClient private constructor(
                                 while (true) {
                                     val line = readSseLineWithinLimit(source) ?: break
                                     val event = try {
-                                        parser.parseLine(line)
+                                        parser.parseLine(line, apiKey)
                                     } catch (error: Exception) {
+                                        if (error is OpenAiCompatibleProtocolException) throw error
                                         logger.warn(
                                             "OpenAI-compatible stream parsing failed: ${error.javaClass.simpleName}",
                                         )
@@ -138,13 +144,13 @@ class OpenAiCompatibleClient private constructor(
                             if (call.isCanceled()) {
                                 close(CancellationException("供应商请求已取消"))
                             } else {
-                                if (error !is OpenAiCompatibleResponseException) {
+                                if (error !is OpenAiCompatibleUserFacingError) {
                                     logger.warn(
                                         "OpenAI-compatible stream read failed: ${error.javaClass.simpleName}",
                                     )
                                 }
                                 close(
-                                    if (error is OpenAiCompatibleResponseException) {
+                                    if (error is OpenAiCompatibleUserFacingError) {
                                         error
                                     } else {
                                         toUserReadableNetworkError(error)
@@ -178,6 +184,8 @@ class OpenAiCompatibleClient private constructor(
         apiKey: String,
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
+        conversationHeaderName: String = "",
+        conversationId: String? = null,
     ): OpenAiCompatibleChatChunkDto = suspendCancellableCoroutine { continuation ->
         require(!requestDto.stream) { "供应商非流式请求必须设置 stream=false" }
         val request = buildRequest(
@@ -185,6 +193,8 @@ class OpenAiCompatibleClient private constructor(
             baseUrl = baseUrl,
             requestDto = requestDto,
             acceptsEventStream = false,
+            conversationHeaderName = conversationHeaderName,
+            conversationId = conversationId,
         )
         logger.info("Starting OpenAI-compatible non-stream request")
 
@@ -221,10 +231,17 @@ class OpenAiCompatibleClient private constructor(
                                 tooLargeMessage = "供应商响应过大，已停止解析",
                             )
                             try {
-                                json.decodeFromString<OpenAiCompatibleChatChunkDto>(responseBody).also {
+                                val root = json.parseToJsonElement(responseBody)
+                                if (root is JsonObject && root["error"] != null && root["error"] != JsonNull) {
+                                    throw OpenAiCompatibleErrorDetails.responseError(
+                                        root["error"] as? JsonObject, apiKey, streaming = false,
+                                    )
+                                }
+                                json.decodeFromJsonElement<OpenAiCompatibleChatChunkDto>(root).also {
                                     logger.info("OpenAI-compatible non-stream request finished")
                                 }
                             } catch (error: Exception) {
+                                if (error is OpenAiCompatibleProtocolException) throw error
                                 logger.warn(
                                     "OpenAI-compatible non-stream parsing failed: ${error.javaClass.simpleName}",
                                 )
@@ -240,7 +257,7 @@ class OpenAiCompatibleClient private constructor(
                         onFailure = { error ->
                             val terminalError = when {
                                 call.isCanceled() -> CancellationException("供应商请求已取消")
-                                error is OpenAiCompatibleResponseException -> error
+                                error is OpenAiCompatibleUserFacingError -> error
                                 error is IOException -> toUserReadableNetworkError(error)
                                 else -> OpenAiCompatibleResponseException("供应商返回内容无法解析")
                             }
@@ -292,9 +309,19 @@ class OpenAiCompatibleClient private constructor(
         baseUrl: String,
         requestDto: OpenAiCompatibleChatRequest,
         acceptsEventStream: Boolean,
+        conversationHeaderName: String = "",
+        conversationId: String? = null,
     ): Request {
         require(requestDto.model.isNotBlank()) { "请配置供应商模型名" }
         require(requestDto.messages.isNotEmpty()) { "供应商消息不能为空" }
+        val sessionHeader = conversationHeaderName.trim()
+        require(sessionHeader.isEmpty() || ConversationHeaderPolicy.isValid(sessionHeader)) {
+            "供应商会话请求头名称无效，必须是合法的 x- 前缀请求头"
+        }
+        if (sessionHeader.isNotEmpty() && conversationId != null) {
+            require(conversationId.isNotBlank() && conversationId.length <= 128 &&
+                conversationId.all { it in '!'..'~' }) { "供应商会话标识无效" }
+        }
 
         val requestUrl = "${normalizeBaseUrl(baseUrl)}/chat/completions"
         val proxyApiKey = apiKey.trim().also { key ->
@@ -307,7 +334,11 @@ class OpenAiCompatibleClient private constructor(
             .url(requestUrl)
             .header("Authorization", "Bearer $proxyApiKey")
             .header("Content-Type", "application/json")
+            .header("User-Agent", "muxueChat/1.0")
             .apply {
+                if (sessionHeader.isNotEmpty() && conversationId != null) {
+                    header(sessionHeader, conversationId)
+                }
                 if (acceptsEventStream) {
                     header("Accept", "text/event-stream")
                 }
@@ -362,7 +393,7 @@ class OpenAiCompatibleClient private constructor(
         )
     }
 
-    private fun readProviderErrorDetails(response: Response, apiKey: String): ProviderErrorDetails? {
+    private fun readProviderErrorDetails(response: Response, apiKey: String): OpenAiCompatibleErrorDetails.Details? {
         val body = runCatching {
             readBodyWithinLimit(
                 response = response,
@@ -373,37 +404,8 @@ class OpenAiCompatibleClient private constructor(
 
         val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
         val source = (root["error"] as? JsonObject) ?: root
-        val code = (source["code"] as? JsonPrimitive)
-            ?.contentOrNull
-            ?.trim()
-            ?.takeIf { SAFE_ERROR_CODE.matches(it) }
-        val message = (source["message"] as? JsonPrimitive)
-            ?.contentOrNull
-            ?.let { sanitizeProviderErrorMessage(it, apiKey) }
-        return ProviderErrorDetails(code = code, message = message)
-            .takeIf { it.code != null || it.message != null }
+        return OpenAiCompatibleErrorDetails.read(source, apiKey)
     }
-
-    private fun sanitizeProviderErrorMessage(message: String, apiKey: String): String? {
-        var sanitized = message
-        apiKey.trim().takeIf { it.isNotEmpty() }?.let { sanitized = sanitized.replace(it, REDACTED) }
-        sanitized = sanitized
-            .replace(BEARER_CREDENTIAL, "Bearer $REDACTED")
-            .replace(CONTROL_CHARACTERS, " ")
-            .replace(REPEATED_WHITESPACE, " ")
-            .trim()
-        if (sanitized.isEmpty()) return null
-        return if (sanitized.length <= MAX_ERROR_MESSAGE_CHARS) {
-            sanitized
-        } else {
-            sanitized.take(MAX_ERROR_MESSAGE_CHARS) + "…"
-        }
-    }
-
-    private data class ProviderErrorDetails(
-        val code: String?,
-        val message: String?,
-    )
 
     companion object {
         internal const val MAX_SSE_LINE_BYTES = 1_048_576L
@@ -414,12 +416,7 @@ class OpenAiCompatibleClient private constructor(
         internal const val MAX_MODEL_ID_LENGTH = ModelCatalogParser.MAX_MODEL_ID_LENGTH
         internal const val MAX_ERROR_MESSAGE_CHARS = 300
         private const val TAG = "muxueChat.OpenAiCompatible"
-        private const val REDACTED = "<已隐藏>"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-        private val SAFE_ERROR_CODE = Regex("[A-Za-z0-9._-]{1,64}")
-        private val BEARER_CREDENTIAL = Regex("(?i)Bearer\\s+[^\\s,;]+")
-        private val CONTROL_CHARACTERS = Regex("[\\p{Cc}\\p{Cf}]")
-        private val REPEATED_WHITESPACE = Regex("\\s+")
 
         private fun defaultOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
