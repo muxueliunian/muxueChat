@@ -39,6 +39,7 @@ import com.muxuechat.domain.model.ChatProviderId
 import com.muxuechat.domain.model.ChatRole
 import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.Conversation
+import com.muxuechat.domain.model.CustomProvider
 import com.muxuechat.domain.model.ConversationTokenUsage
 import com.muxuechat.domain.model.TokenUsageNormalizer
 import com.muxuechat.domain.model.TokenUsageSnapshot
@@ -111,6 +112,10 @@ class ChatRepositoryImpl(
     xaiResponsesTransport: XaiResponsesTransport,
     /** xAI 订阅登录的 token 来源；生产环境必须是 [XaiAuthRepository.getInstance]，刷新锁依赖该单例。 */
     xaiAccessTokens: XaiAccessTokenSource,
+    /** Google Vertex 登录的 token 来源；未登录/测试用 [GoogleAccessTokenSource.NotSignedIn]。 */
+    googleAccessTokens: GoogleAccessTokenSource = GoogleAccessTokenSource.NotSignedIn,
+    /** Google Vertex 的钉死主机实例；默认即生产配置。 */
+    googleVertexClient: OpenAiCompatibleClient = OpenAiCompatibleClient.pinnedTo(CustomProvider.GOOGLE_VERTEX_HOST),
     private val promptComposer: PromptComposer = PromptComposer(),
     private val chatContextPlanner: ChatContextPlanner = ChatContextPlanner(promptComposer),
     private val settingsToolDraftStore: SettingsToolDraftStore = SettingsToolDraftStore(),
@@ -122,9 +127,11 @@ class ChatRepositoryImpl(
     private val rpMessageMetadataParser: RpMessageMetadataParser = RpMessageMetadataParser(),
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) : ChatRepository {
-    private val providerRequestFreezer = ProviderRequestFreezer(settingsRepository, xaiAccessTokens)
+    private val providerRequestFreezer = ProviderRequestFreezer(settingsRepository, xaiAccessTokens, googleAccessTokens)
     private val chatTransport =
-        ChatTransportRouter(openAiCompatibleClient, xaiResponsesTransport, xaiAccessTokens)
+        ChatTransportRouter(
+            openAiCompatibleClient, xaiResponsesTransport, xaiAccessTokens, googleVertexClient, googleAccessTokens,
+        )
     private val generationSessions = GenerationSessionRegistry()
     private val enrichmentTasks = RpEnrichmentTaskRegistry()
 

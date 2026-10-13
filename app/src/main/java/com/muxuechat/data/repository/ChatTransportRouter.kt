@@ -4,7 +4,9 @@ import com.muxuechat.data.remote.OpenAiCompatibleChatChunkDto
 import com.muxuechat.data.remote.OpenAiCompatibleChatRequest
 import com.muxuechat.data.remote.OpenAiCompatibleClient
 import com.muxuechat.data.remote.OpenAiCompatibleStreamEvent
+import com.muxuechat.data.remote.OpenAiCompatibleUnauthorizedException
 import com.muxuechat.data.remote.XaiResponsesTransport
+import com.muxuechat.domain.model.CustomProvider
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
@@ -21,6 +23,10 @@ internal class ChatTransportRouter(
     private val openAiCompatibleClient: OpenAiCompatibleClient,
     private val xaiResponsesTransport: XaiResponsesTransport,
     private val xaiAccessTokens: XaiAccessTokenSource,
+    /** Google Vertex 的钉死主机实例（https、主机固定、禁止重定向）；与 [openAiCompatibleClient] 同一个类。 */
+    private val googleVertexClient: OpenAiCompatibleClient =
+        OpenAiCompatibleClient.pinnedTo(CustomProvider.GOOGLE_VERTEX_HOST),
+    private val googleAccessTokens: GoogleAccessTokenSource = GoogleAccessTokenSource.NotSignedIn,
 ) {
     fun streamChat(
         credential: ProviderCredential,
@@ -31,6 +37,25 @@ internal class ChatTransportRouter(
     ): Flow<OpenAiCompatibleStreamEvent> = when (credential) {
         is ProviderCredential.ApiKey ->
             openAiCompatibleClient.streamChat(credential.value, baseUrl, requestDto, conversationHeaderName, conversationId)
+
+        is ProviderCredential.GoogleBearer -> flow {
+            var emitted = false
+            try {
+                googleVertexClient.streamChat(credential.accessToken, baseUrl, requestDto).collect {
+                    emitted = true
+                    emit(it)
+                }
+            } catch (error: OpenAiCompatibleUnauthorizedException) {
+                // 已经吐过内容就不能重试：重试会让同一轮出现两段正文。
+                if (emitted) throw GoogleAuthRequiredException.rejected()
+                val refreshed = googleAccessTokens.acquireAccessToken(forceRefresh = true)
+                try {
+                    googleVertexClient.streamChat(refreshed, baseUrl, requestDto).collect { emit(it) }
+                } catch (_: OpenAiCompatibleUnauthorizedException) {
+                    throw GoogleAuthRequiredException.rejected()
+                }
+            }
+        }
 
         is ProviderCredential.OAuthBearer -> flow {
             var lease = credential.lease()
@@ -66,6 +91,17 @@ internal class ChatTransportRouter(
         is ProviderCredential.ApiKey ->
             openAiCompatibleClient.completeChat(credential.value, baseUrl, requestDto, conversationHeaderName, conversationId)
 
+        is ProviderCredential.GoogleBearer -> try {
+            googleVertexClient.completeChat(credential.accessToken, baseUrl, requestDto)
+        } catch (_: OpenAiCompatibleUnauthorizedException) {
+            val refreshed = googleAccessTokens.acquireAccessToken(forceRefresh = true)
+            try {
+                googleVertexClient.completeChat(refreshed, baseUrl, requestDto)
+            } catch (_: OpenAiCompatibleUnauthorizedException) {
+                throw GoogleAuthRequiredException.rejected()
+            }
+        }
+
         // Responses 的非流式响应未采集，适配器内部用流式聚合出同样的结果。
         is ProviderCredential.OAuthBearer -> {
             var lease = credential.lease()
@@ -85,5 +121,6 @@ internal class ChatTransportRouter(
     fun cancelActiveRequest() {
         openAiCompatibleClient.cancelActiveRequest()
         xaiResponsesTransport.cancelActiveRequest()
+        googleVertexClient.cancelActiveRequest()
     }
 }

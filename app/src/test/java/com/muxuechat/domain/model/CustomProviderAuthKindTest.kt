@@ -41,6 +41,62 @@ class CustomProviderAuthKindTest {
     }
 
     @Test
+    fun googleProvider_baseUrlIsDerivedFromProjectIdAndPinned() {
+        listOf("", "http://192.168.1.2/v1", "https://evil.example/v1", "not a url").forEach { input ->
+            val provider = CustomProvider(
+                id = "g",
+                name = "Google",
+                baseUrl = input,
+                selectedModel = "google/gemini-4-argon",
+                authKind = ProviderAuthKind.GOOGLE_OAUTH,
+                googleProjectId = " my-project-123456 ",
+                conversationHeaderName = "x-session",
+            ).normalized()
+
+            assertEquals(
+                input,
+                "https://aiplatform.googleapis.com/v1/projects/my-project-123456/locations/global/endpoints/openapi",
+                provider.baseUrl,
+            )
+            assertEquals("my-project-123456", provider.googleProjectId)
+            // OAuth 供应商不接收用户配置的会话标识头。
+            assertEquals("", provider.conversationHeaderName)
+            assertTrue(provider.usesGoogleOAuth && provider.usesOAuth && !provider.usesXaiOAuth)
+            assertTrue(provider.isConfigured)
+            assertFalse(CustomProvider.isCleartext(provider.baseUrl))
+        }
+    }
+
+    @Test
+    fun googleProvider_invalidProjectIdZeroesAddressSoItIsNotConfigured() {
+        listOf("", "ab", "My-Project-1", "-bad-start-1", "bad-end-1-", "has space 123", "a/b/c/d/e/f", "x".repeat(31)).forEach { id ->
+            val provider = CustomProvider(
+                id = "g",
+                name = "Google",
+                baseUrl = "",
+                selectedModel = "google/gemini-4-argon",
+                authKind = ProviderAuthKind.GOOGLE_OAUTH,
+                googleProjectId = id,
+            ).normalized()
+
+            assertEquals(id, "", provider.baseUrl)
+            assertFalse(id, provider.isConfigured)
+        }
+        assertEquals("", CustomProvider.googleBaseUrl("evil.example/../x"))
+    }
+
+    @Test
+    fun nonGoogleProvider_dropsStrayProjectId() {
+        val provider = CustomProvider(
+            id = "p", name = "n", baseUrl = "https://a.example/v1", selectedModel = "m",
+            googleProjectId = "my-project-123456",
+        ).normalized()
+
+        assertEquals("", provider.googleProjectId)
+        assertEquals("https://a.example/v1", provider.baseUrl)
+    }
+
+    @Test
     fun storageValues_roundTrip() {
         ProviderAuthKind.entries.forEach { assertEquals(it, ProviderAuthKind.fromStorage(it.storageValue)) }
         assertEquals(ProviderAuthKind.API_KEY, ProviderAuthKind.fromStorage(null))

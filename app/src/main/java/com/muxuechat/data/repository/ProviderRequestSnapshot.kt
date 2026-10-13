@@ -23,6 +23,40 @@ internal sealed interface ProviderCredential {
         fun lease(): XaiAccessTokenLease = XaiAccessTokenLease(accessToken, sessionGeneration)
         override fun toString(): String = "ProviderCredential.OAuthBearer"
     }
+
+    /** Google Vertex 的 access token：只存在于这轮请求快照的内存里，App 不保存（AGENT.md §3.2）。 */
+    class GoogleBearer(val accessToken: String) : ProviderCredential {
+        override fun toString(): String = "ProviderCredential.GoogleBearer"
+    }
+}
+
+/**
+ * Google 登录不可用（未登录、授权需要重新同意、401 刷新后仍被拒）。文案完全由 App 生成。
+ */
+internal class GoogleAuthRequiredException(message: String) :
+    IllegalStateException(message),
+    SafeUserFacingError {
+    companion object {
+        fun notSignedIn() = GoogleAuthRequiredException("请先在设置中登录 Google（Google Vertex 登录）")
+        fun reauthorize() = GoogleAuthRequiredException("Google 授权已失效，请到设置页重新登录 Google")
+        fun rejected() = GoogleAuthRequiredException(
+            "Google 拒绝了登录凭据（401），请到设置页重新登录；并确认账号在该项目有 Vertex AI 权限",
+        )
+    }
+}
+
+/**
+ * Google 登录的 access token 来源。没有 refresh token：每次都向 Play 服务静默索取，
+ * 需要用户重新同意时抛 [GoogleAuthRequiredException]，绝不在后台弹窗。
+ */
+interface GoogleAccessTokenSource {
+    suspend fun acquireAccessToken(forceRefresh: Boolean = false): String
+
+    /** 未接入登录的替身（单元测试与旧构造路径），一律视为未登录。 */
+    object NotSignedIn : GoogleAccessTokenSource {
+        override suspend fun acquireAccessToken(forceRefresh: Boolean): String =
+            throw GoogleAuthRequiredException.notSignedIn()
+    }
 }
 
 /** 冻结请求时向 xAI 订阅登录索取一个当前有效的 access token（必要时先刷新）。 */
@@ -84,7 +118,7 @@ internal class ProviderRequestSnapshot(
      */
     fun requireApiKey(): String = when (credential) {
         is ProviderCredential.ApiKey -> credential.value
-        is ProviderCredential.OAuthBearer ->
+        is ProviderCredential.OAuthBearer, is ProviderCredential.GoogleBearer ->
             error("DeepSeek 协议不接受 OAuth 凭据，这是一个路由错误")
     }
 }
@@ -101,6 +135,7 @@ internal class ProviderRequestSnapshot(
 internal class ProviderRequestFreezer(
     private val settingsRepository: SettingsRepository,
     private val xaiAccessTokens: XaiAccessTokenSource,
+    private val googleAccessTokens: GoogleAccessTokenSource = GoogleAccessTokenSource.NotSignedIn,
 ) {
     suspend fun freeze(onProviderSelected: (ChatProviderId) -> Unit = {}): ProviderRequestSnapshot {
         val frozen = settingsRepository.withCurrentProviderCredentials { settings, apiKey ->
@@ -150,6 +185,14 @@ internal class ProviderRequestFreezer(
                             }
                             Frozen.NeedsXaiToken(normalized, activeProvider)
                         }
+
+                        // 同样忽略 apiKey。地址由项目 ID 推导，项目 ID 非法时 baseUrl 为空，这里直接拦截。
+                        ProviderAuthKind.GOOGLE_OAUTH -> {
+                            if (!normalized.isCustomProviderConfigured) {
+                                error("请先为「${activeProvider.displayName}」填写有效的 GCP 项目 ID 和模型名")
+                            }
+                            Frozen.NeedsGoogleToken(normalized, activeProvider)
+                        }
                     }
                 }
             }
@@ -167,6 +210,21 @@ internal class ProviderRequestFreezer(
                     activeProvider = frozen.activeProvider,
                     baseUrl = baseUrl,
                     credential = ProviderCredential.OAuthBearer(lease.accessToken, lease.sessionGeneration),
+                )
+            }
+
+            is Frozen.NeedsGoogleToken -> {
+                // 纵深防御：地址必须正是由项目 ID 推导出的钉死地址，否则绝不取 token。
+                val baseUrl = frozen.settings.activeBaseUrl
+                require(baseUrl == CustomProvider.googleBaseUrl(frozen.activeProvider.googleProjectId)) {
+                    "Google Vertex 地址异常，已拒绝发送"
+                }
+                validateProviderRequest(baseUrl, frozen.settings.activeModel)
+                customProviderSnapshot(
+                    settings = frozen.settings,
+                    activeProvider = frozen.activeProvider,
+                    baseUrl = baseUrl,
+                    credential = ProviderCredential.GoogleBearer(googleAccessTokens.acquireAccessToken()),
                 )
             }
         }
@@ -210,5 +268,7 @@ internal class ProviderRequestFreezer(
         class Complete(val snapshot: ProviderRequestSnapshot) : Frozen
 
         class NeedsXaiToken(val settings: ChatSettings, val activeProvider: CustomProvider) : Frozen
+
+        class NeedsGoogleToken(val settings: ChatSettings, val activeProvider: CustomProvider) : Frozen
     }
 }

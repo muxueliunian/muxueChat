@@ -261,7 +261,104 @@ class ProviderRequestFreezerTest {
         XaiFixtures.SECRETS.forEach { assertFalse("leaked $it", everything.contains(it)) }
     }
 
+    // ---------------------------------------------------------------- Google Vertex OAuth 供应商
+
+    private val googleProvider = CustomProvider(
+        id = "p-google",
+        name = CustomProvider.GOOGLE_DEFAULT_NAME,
+        // 存储里被写进别的地址时，也必须被项目 ID 推导出的钉死地址覆盖。
+        baseUrl = "http://evil.example/v1",
+        models = listOf(CustomProvider.GOOGLE_DEFAULT_MODEL),
+        selectedModel = CustomProvider.GOOGLE_DEFAULT_MODEL,
+        authKind = ProviderAuthKind.GOOGLE_OAUTH,
+        googleProjectId = "my-project-123456",
+    )
+
+    private fun googleSettings(provider: CustomProvider = googleProvider) = ChatSettings(
+        provider = ChatProviderId.CUSTOM_OPENAI,
+        customProviders = listOf(provider),
+        activeCustomProviderId = provider.id,
+    )
+
+    @Test
+    fun googleProvider_signedIn_snapshotHoldsBearerAndPinnedAddress_andNeverTouchesXaiOrKeys() = runBlocking {
+        val xai = RecordingTokenSource()
+        val google = RecordingGoogleTokens(token = "synthetic-google-token")
+        // 同 id 下即使 Keystore 里残留了 API Key，也绝不能被拿来冒充登录态。
+        val freezer = ProviderRequestFreezer(FakeSettingsRepository(googleSettings(), "sk-leftover"), xai, google)
+
+        val snapshot = freezer.freeze()
+
+        assertEquals(
+            "https://aiplatform.googleapis.com/v1/projects/my-project-123456/locations/global/endpoints/openapi",
+            snapshot.baseUrl,
+        )
+        assertEquals(CustomProvider.GOOGLE_DEFAULT_MODEL, snapshot.model)
+        assertEquals(ChatProviderId.CUSTOM_OPENAI, snapshot.provider)
+        val credential = snapshot.credential as ProviderCredential.GoogleBearer
+        assertEquals("synthetic-google-token", credential.accessToken)
+        assertEquals(listOf(false), google.forceRefreshArgs)
+        assertEquals(0, xai.calls)
+        // token 不得经 toString 泄露；DeepSeek 协议也不能拿到它。
+        assertFalse(credential.toString().contains("synthetic-google-token"))
+        assertFalse(snapshot.toString().contains("synthetic-google-token"))
+        assertTrue(runCatching { snapshot.requireApiKey() }.exceptionOrNull() is IllegalStateException)
+    }
+
+    @Test
+    fun googleProvider_notSignedIn_reportsLoginRequired_withSafeMessage() = runBlocking {
+        val freezer = ProviderRequestFreezer(FakeSettingsRepository(googleSettings(), "sk-leftover"), RecordingTokenSource())
+
+        val error = runCatching { freezer.freeze() }.exceptionOrNull()
+
+        assertTrue(error is GoogleAuthRequiredException)
+        assertTrue(error is SafeUserFacingError)
+        assertEquals("请先在设置中登录 Google（Google Vertex 登录）", error?.message)
+    }
+
+    @Test
+    fun googleProvider_invalidProjectIdOrMissingModel_failsLocallyWithoutFetchingToken() = runBlocking {
+        listOf(
+            googleProvider.copy(googleProjectId = "Bad ID"),
+            googleProvider.copy(googleProjectId = ""),
+            googleProvider.copy(selectedModel = "", models = emptyList()),
+        ).forEach { provider ->
+            val google = RecordingGoogleTokens()
+            val error = runCatching {
+                ProviderRequestFreezer(FakeSettingsRepository(googleSettings(provider), null), RecordingTokenSource(), google).freeze()
+            }.exceptionOrNull()
+
+            assertEquals("请先为「Google Vertex」填写有效的 GCP 项目 ID 和模型名", error?.message)
+            assertEquals(0, google.calls)
+        }
+    }
+
+    @Test
+    fun googleProvider_tokenSourceFailureIsPropagatedAsIs() = runBlocking {
+        val google = RecordingGoogleTokens(failure = GoogleAuthRequiredException.reauthorize())
+
+        val error = runCatching {
+            ProviderRequestFreezer(FakeSettingsRepository(googleSettings(), null), RecordingTokenSource(), google).freeze()
+        }.exceptionOrNull()
+
+        assertEquals("Google 授权已失效，请到设置页重新登录 Google", error?.message)
+    }
+
     // ---------------------------------------------------------------- 测试替身
+
+    private class RecordingGoogleTokens(
+        private val token: String = "unused",
+        private val failure: Exception? = null,
+    ) : GoogleAccessTokenSource {
+        val forceRefreshArgs = mutableListOf<Boolean>()
+        val calls: Int get() = forceRefreshArgs.size
+
+        override suspend fun acquireAccessToken(forceRefresh: Boolean): String {
+            forceRefreshArgs += forceRefresh
+            failure?.let { throw it }
+            return token
+        }
+    }
 
     private class RecordingTokenSource(
         private val token: String = "unused",

@@ -107,6 +107,46 @@ class SettingsDataStoreProviderAuthKindTest {
         assertEquals(CustomProvider.XAI_SUBSCRIPTION_BASE_URL, provider.normalized().baseUrl)
     }
 
+    @Test
+    fun googleProvider_roundTripsProjectIdAndStaysPinned() = runBlocking {
+        store.updateSettings {
+            it.copy(
+                provider = ChatProviderId.CUSTOM_OPENAI,
+                customProviders = listOf(
+                    CustomProvider(
+                        id = "g1",
+                        name = CustomProvider.GOOGLE_DEFAULT_NAME,
+                        baseUrl = "http://evil.example/v1",
+                        selectedModel = CustomProvider.GOOGLE_DEFAULT_MODEL,
+                        authKind = ProviderAuthKind.GOOGLE_OAUTH,
+                        googleProjectId = "my-project-123456",
+                    ),
+                ),
+            )
+        }
+
+        val raw = dataStore.data.first()[CUSTOM_PROVIDERS].orEmpty()
+        assertTrue(raw, raw.contains("\"authKind\":\"google_oauth\""))
+        assertTrue(raw, raw.contains("\"googleProjectId\":\"my-project-123456\""))
+        assertFalse(raw, raw.contains("evil.example"))
+        val provider = store.settings.first().customProviders.single()
+        assertEquals(ProviderAuthKind.GOOGLE_OAUTH, provider.authKind)
+        assertEquals(CustomProvider.googleBaseUrl("my-project-123456"), provider.normalized().baseUrl)
+    }
+
+    @Test
+    fun providerWithoutProjectId_isStoredWithoutTheField_soExistingDataIsByteIdentical() = runBlocking {
+        store.updateSettings {
+            it.copy(
+                provider = ChatProviderId.CUSTOM_OPENAI,
+                customProviders = listOf(CustomProvider(id = "p1", name = "Old", baseUrl = "https://a.example/v1", selectedModel = "m")),
+            )
+        }
+
+        val raw = dataStore.data.first()[CUSTOM_PROVIDERS].orEmpty()
+        assertFalse(raw, raw.contains("googleProjectId"))
+    }
+
     private companion object {
         val CUSTOM_PROVIDERS = stringPreferencesKey("custom_providers")
     }

@@ -264,6 +264,8 @@ class SettingsRepositoryImpl(
                 ?: error("供应商不存在，请重新添加")
             // xAI 订阅走 refreshXaiProviderModels；这里是 API Key 通道，绝不能拿 Key 去请求 models-v2。
             check(!provider.usesXaiOAuth) { "xAI 模型列表不走 API Key 通道" }
+            // Vertex 的 openapi 端点没有 /models（实测 404），也没有 API Key：只能手填模型名。
+            check(!provider.usesGoogleOAuth) { "Google Vertex 不支持获取模型列表，请手动填写模型名" }
             require(provider.baseUrl.isNotBlank()) { "请先填写该供应商的 Base URL" }
             val apiKey = withContext(Dispatchers.IO) {
                 providerKeyStore.getApiKey(providerId)?.takeIf { it.isNotBlank() }

@@ -8,10 +8,14 @@ import java.net.URI
  *
  * [XAI_OAUTH] 是 AGENT.md §2 批准的唯一 OAuth 例外：凭据来自 xAI 订阅登录，
  * 不使用、也不读取任何 API Key；服务地址由 App 钉死为 [CustomProvider.XAI_SUBSCRIPTION_BASE_URL]。
+ *
+ * [GOOGLE_OAUTH] 是 AGENT.md §2 批准的第二个 OAuth 例外：凭据来自 Google 登录（用户自己 GCP 项目里的
+ * Android OAuth 客户端），App 不保存任何 token；服务地址由项目 ID 推导并钉死在 aiplatform.googleapis.com。
  */
 enum class ProviderAuthKind(val storageValue: String) {
     API_KEY("api_key"),
     XAI_OAUTH("xai_oauth"),
+    GOOGLE_OAUTH("google_oauth"),
     ;
 
     companion object {
@@ -79,9 +83,18 @@ data class CustomProvider(
     val outputTokenField: OpenAiOutputTokenField = OpenAiOutputTokenField.MAX_TOKENS,
     /** 可选的每会话标识扩展头；值由 App 填稳定会话 ID，不保存任何凭据。 */
     val conversationHeaderName: String = "",
+    /** 仅 [ProviderAuthKind.GOOGLE_OAUTH] 使用：用户填写的 GCP 项目 ID，区域固定 global。 */
+    val googleProjectId: String = "",
 ) {
     val usesXaiOAuth: Boolean
         get() = authKind == ProviderAuthKind.XAI_OAUTH
+
+    val usesGoogleOAuth: Boolean
+        get() = authKind == ProviderAuthKind.GOOGLE_OAUTH
+
+    /** 走 OAuth 登录、没有 API Key 的供应商。 */
+    val usesOAuth: Boolean
+        get() = usesXaiOAuth || usesGoogleOAuth
 
     /** 名称、地址、模型三者齐备才可发起请求。 */
     val isConfigured: Boolean
@@ -99,10 +112,17 @@ data class CustomProvider(
             .filter { it.isNotEmpty() }
             .distinct()
         val normalizedSelected = selectedModel.trim()
+        val normalizedProjectId = googleProjectId.trim()
         return copy(
             name = name.trim().take(MAX_NAME_LENGTH),
             // OAuth token 绝不能跟随用户填写的地址走，xAI 供应商的地址每次归一化都重新钉死。
-            baseUrl = if (usesXaiOAuth) XAI_SUBSCRIPTION_BASE_URL else normalizeBaseUrl(baseUrl),
+            baseUrl = when {
+                usesXaiOAuth -> XAI_SUBSCRIPTION_BASE_URL
+                // Google 的地址只由项目 ID 推导；项目 ID 非法则归零，由 isConfigured 拦截。
+                usesGoogleOAuth -> googleBaseUrl(normalizedProjectId)
+                else -> normalizeBaseUrl(baseUrl)
+            },
+            googleProjectId = if (usesGoogleOAuth) normalizedProjectId else "",
             models = normalizedModels,
             // 选中的模型未必在列表里（用户手填、或服务端未列出），这是允许的。
             selectedModel = normalizedSelected.ifBlank { normalizedModels.firstOrNull().orEmpty() },
@@ -110,7 +130,7 @@ data class CustomProvider(
             // 刻意不按 models 裁剪：`/models` 刷新时上游临时不列出某个模型，
             // 不应把用户手填过的窗口悄悄删掉。只有设置页显式移除模型才删对应项。
             modelContextWindows = ChatSettings.normalizeContextWindows(modelContextWindows),
-            conversationHeaderName = if (usesXaiOAuth) "" else ConversationHeaderPolicy.normalize(conversationHeaderName),
+            conversationHeaderName = if (usesOAuth) "" else ConversationHeaderPolicy.normalize(conversationHeaderName),
         )
     }
 
@@ -122,6 +142,27 @@ data class CustomProvider(
         const val XAI_SUBSCRIPTION_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
         const val XAI_DEFAULT_NAME = "xAI 订阅"
+
+        /** Google Vertex 的 OpenAI 兼容端点主机（AGENT.md §2），不接受用户编辑。 */
+        const val GOOGLE_VERTEX_HOST = "aiplatform.googleapis.com"
+
+        const val GOOGLE_DEFAULT_NAME = "Google Vertex"
+
+        /** 新建 Google 供应商时预填的模型（实测可用）；`GET /models` 在 Vertex 上 404，只能手填。 */
+        const val GOOGLE_DEFAULT_MODEL = "google/gemini-4-argon"
+
+        /** GCP 项目 ID：6~30 位小写字母、数字、连字符，字母开头，不以连字符结尾。 */
+        private val GOOGLE_PROJECT_ID_REGEX = Regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+
+        fun isValidGoogleProjectId(value: String): Boolean = GOOGLE_PROJECT_ID_REGEX.matches(value)
+
+        /** 非法项目 ID 返回空串（调用方据 [isConfigured] 拦截），绝不拼出带用户任意字符的地址。 */
+        fun googleBaseUrl(projectId: String): String =
+            if (isValidGoogleProjectId(projectId)) {
+                "https://$GOOGLE_VERTEX_HOST/v1/projects/$projectId/locations/global/endpoints/openapi"
+            } else {
+                ""
+            }
 
         /** UI 快捷填充用，不是取值白名单。 */
         val REASONING_EFFORT_PRESETS = listOf("low", "medium", "high")

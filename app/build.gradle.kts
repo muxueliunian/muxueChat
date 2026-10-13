@@ -70,6 +70,9 @@ dependencies {
     // 固定 0.37.0：它基于 Kotlin 2.2.20 / Compose 1.9，与本项目工具链一致；更新版本要求 Kotlin 2.3+。
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.37.0")
 
+    // Google Vertex 登录：仅用于 AuthorizationClient 获取 cloud-platform access token（AGENT.md §8，2026-10-14 批准）。
+    implementation("com.google.android.gms:play-services-auth:22.0.0")
+
     implementation("com.squareup.okhttp3:okhttp:5.3.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")

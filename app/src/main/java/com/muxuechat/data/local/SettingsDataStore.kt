@@ -68,6 +68,8 @@ private data class CustomProviderDto(
     val authKind: String = "api_key",
     val outputTokenField: String = "max_tokens",
     val conversationHeaderName: String = "",
+    /** 仅 google_oauth 供应商使用；项目 ID 不是凭据，可以进 DataStore。 */
+    val googleProjectId: String = "",
 )
 
 /**
@@ -289,6 +291,7 @@ class SettingsDataStore internal constructor(
                     authKind = ProviderAuthKind.fromStorage(dto.authKind),
                     outputTokenField = OpenAiOutputTokenField.fromStorage(dto.outputTokenField),
                     conversationHeaderName = dto.conversationHeaderName,
+                    googleProjectId = dto.googleProjectId,
                 )
             }
         }.onFailure { error ->
@@ -411,6 +414,7 @@ class SettingsDataStore internal constructor(
                         authKind = provider.authKind.storageValue,
                         outputTokenField = provider.outputTokenField.storageValue,
                         conversationHeaderName = provider.conversationHeaderName,
+                        googleProjectId = provider.googleProjectId,
                     )
                 },
             )
