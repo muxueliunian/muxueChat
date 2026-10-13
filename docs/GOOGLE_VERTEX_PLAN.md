@@ -1,6 +1,6 @@
 # muxueChat Google Vertex AI 接入计划
 
-状态：代码完成，JVM 测试与构建见「进度记录」；**真机验收未执行**（需要你先完成第 3 节的 GCP 控制台配置）。
+状态：代码完成，JVM 测试 573 项全绿、构建成功；**真机验收未执行**（需要你先完成第 3 节的 GCP 控制台配置）。
 建立日期：2026-10-14
 范围：用手机上的 Google 账号登录，通过 Vertex AI 的 OpenAI 兼容端点使用 `google/gemini-4-argon`
 线上格式依据：`docs/GOOGLE_VERTEX_WIRE_FORMAT.md`（2026-10-14 实测）
@@ -53,7 +53,7 @@
 | --- | --- |
 | 规则（AGENT.md）与实测记录（`GOOGLE_VERTEX_WIRE_FORMAT.md`） | 完成 |
 | 认证模块、路由、透传、设置页 | 代码完成 |
-| JVM 测试 | 见提交记录 / 下方「验证」 |
+| JVM 测试 | 完成：`:app:testDebugUnitTest` 573 项 0 失败（新增 26 项：夹具 9、路由 6、认证仓库 11，另扩充冻结 / 归一化 / DataStore 用例）；`:app:assembleDebug`、`:app:compileDebugAndroidTestKotlin` 成功（2026-10-14） |
 | 真机验收 | **未执行**（阻塞于第 3 节） |
 
 ## 5. 真机验收清单
