@@ -1,5 +1,7 @@
 package com.muxuechat.data.remote
 
+import kotlinx.serialization.json.JsonElement
+
 /**
  * 把 OpenAI 兼容 SSE 中的 tool_call 分片拼回完整调用。
  *
@@ -29,6 +31,8 @@ class OpenAiCompatibleToolCallAccumulator {
                 builder.name = it
             }
             fragment.function?.arguments?.let { builder.arguments.append(it) }
+            // 不透明回传字段：保留先出现的非 null 值，原样带到回放。
+            if (builder.extraContent == null) builder.extraContent = fragment.extraContent
         }
     }
 
@@ -43,6 +47,7 @@ class OpenAiCompatibleToolCallAccumulator {
                     arguments = builder.arguments.toString(),
                 ),
                 index = index,
+                extraContent = builder.extraContent,
             )
         },
     )
@@ -52,6 +57,7 @@ class OpenAiCompatibleToolCallAccumulator {
     private class Builder {
         var id: String? = null
         var name: String? = null
+        var extraContent: JsonElement? = null
         val arguments = StringBuilder()
     }
 }

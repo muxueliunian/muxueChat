@@ -11,12 +11,14 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -35,6 +37,15 @@ import javax.net.ssl.SSLException
 internal interface OpenAiCompatibleUserFacingError
 
 /**
+ * HTTP 401。文案与其他鉴权失败完全一致，只是带上类型，让 OAuth 链路（Google Vertex）
+ * 能在上层强制刷新 token 后重试一次；API Key 链路不受影响。
+ */
+internal class OpenAiCompatibleUnauthorizedException(message: String) :
+    IOException(message),
+    OpenAiCompatibleUserFacingError,
+    ModelCatalogUserFacingError
+
+/**
  * 所有自定义供应商共用的 OpenAI 兼容客户端。
  *
  * 它只发送标准的 `POST {base}/chat/completions` 与 `GET {base}/models`；
@@ -46,19 +57,24 @@ class OpenAiCompatibleClient private constructor(
     private val json: Json,
     private val parser: OpenAiCompatibleStreamParser,
     private val logger: RemoteClientLogger,
+    /**
+     * 非 null 时这是 OAuth 链路的**钉死主机实例**（AGENT.md §2「Google Vertex 链路」）：
+     * 只允许 https 与该主机，且调用方应传入禁止重定向的 OkHttp。普通实例恒为 null，行为不变。
+     */
+    private val pinnedHost: String?,
 ) {
     constructor(
         okHttpClient: OkHttpClient = defaultOkHttpClient(),
         json: Json = defaultJson(),
         parser: OpenAiCompatibleStreamParser = OpenAiCompatibleStreamParser(json),
-    ) : this(okHttpClient, json, parser, AndroidRemoteClientLogger(TAG))
+    ) : this(okHttpClient, json, parser, AndroidRemoteClientLogger(TAG), null)
 
     internal constructor(
         okHttpClient: OkHttpClient,
         logger: RemoteClientLogger,
         json: Json = defaultJson(),
         parser: OpenAiCompatibleStreamParser = OpenAiCompatibleStreamParser(json),
-    ) : this(okHttpClient, json, parser, logger)
+    ) : this(okHttpClient, json, parser, logger, null)
 
     /**
      * RP 正文完成后可能还会后台补写元数据；这些请求与下一条正文请求可以短暂重叠。
@@ -282,7 +298,13 @@ class OpenAiCompatibleClient private constructor(
      * 因此这里失败就抛可读异常，由上层降级到手填，绝不能影响聊天本身。
      * 请求不进 [activeCalls]：它与生成无关，"停止生成"不应该把它一起取消。
      */
-    suspend fun listModels(apiKey: String, baseUrl: String): List<String> =
+    suspend fun listModels(apiKey: String, baseUrl: String): List<String> {
+        // 钉死实例的 OkHttp 与校验只覆盖聊天请求；Vertex 本就没有 /models（实测 404），这里直接拒绝。
+        check(pinnedHost == null) { "该供应商不支持获取模型列表，请手动填写模型名" }
+        return fetchModels(apiKey, baseUrl)
+    }
+
+    private suspend fun fetchModels(apiKey: String, baseUrl: String): List<String> =
         modelCatalogRequester.listModels(
             apiKey = apiKey,
             baseUrl = baseUrl,
@@ -324,6 +346,12 @@ class OpenAiCompatibleClient private constructor(
         }
 
         val requestUrl = "${normalizeBaseUrl(baseUrl)}/chat/completions"
+        pinnedHost?.let { host ->
+            val url = requestUrl.toHttpUrlOrNull()
+            require(url != null && url.isHttps && url.host.equals(host, ignoreCase = true) && url.port == 443) {
+                "该供应商只允许 https://$host，已拒绝发送凭据"
+            }
+        }
         val proxyApiKey = apiKey.trim().also { key ->
             require(key.isNotEmpty()) { "请先在设置中保存供应商 API Key" }
             require(key.none { it == '\r' || it == '\n' }) { "供应商 API Key 格式无效" }
@@ -360,6 +388,15 @@ class OpenAiCompatibleClient private constructor(
      * 并清除当前 API Key、Bearer 凭据及控制字符。完整正文绝不进入日志或异常。
      */
     private fun httpError(response: Response, apiKey: String): IOException {
+        val error = buildHttpError(response, apiKey)
+        return if (response.code == 401) {
+            OpenAiCompatibleUnauthorizedException(error.message.orEmpty())
+        } else {
+            error
+        }
+    }
+
+    private fun buildHttpError(response: Response, apiKey: String): IOException {
         val details = readProviderErrorDetails(response, apiKey)
         if (details == null) return httpError(response.code)
 
@@ -402,7 +439,13 @@ class OpenAiCompatibleClient private constructor(
             )
         }.getOrNull()?.takeIf { it.isNotBlank() } ?: return null
 
-        val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
+        // 结构兼容：Vertex 的错误体是单元素数组 `[{"error":{...}}]`，不兼容就会误报成 API Key 问题。
+        val parsed = runCatching { json.parseToJsonElement(body) }.getOrNull()
+        val root = when (parsed) {
+            is JsonObject -> parsed
+            is JsonArray -> parsed.singleOrNull() as? JsonObject
+            else -> null
+        } ?: return null
         val source = (root["error"] as? JsonObject) ?: root
         return OpenAiCompatibleErrorDetails.read(source, apiKey)
     }
@@ -423,6 +466,25 @@ class OpenAiCompatibleClient private constructor(
             .writeTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
+
+        /**
+         * OAuth 链路的钉死主机实例：强制 https 与指定主机，并且**禁止任何重定向**，
+         * 避免 Authorization 头跟着 3xx 去往其他主机。
+         */
+        internal fun pinnedOkHttpClient(): OkHttpClient = defaultOkHttpClient().newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+
+        internal fun pinnedTo(
+            host: String,
+            okHttpClient: OkHttpClient = pinnedOkHttpClient(),
+        ): OpenAiCompatibleClient {
+            val json = defaultJson()
+            return OpenAiCompatibleClient(
+                okHttpClient, json, OpenAiCompatibleStreamParser(json), AndroidRemoteClientLogger(TAG), host,
+            )
+        }
 
         private fun defaultJson(): Json = Json {
             ignoreUnknownKeys = true

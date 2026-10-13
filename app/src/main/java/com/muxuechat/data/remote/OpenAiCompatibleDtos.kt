@@ -4,6 +4,7 @@ import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 
 /**
@@ -98,6 +99,11 @@ data class OpenAiCompatibleToolCallDto(
     val function: OpenAiCompatibleFunctionCallDto? = null,
     /** 只用于流式分片归并，回传 assistant 消息前必须清掉。 */
     val index: Int? = null,
+    /**
+     * 服务端随工具调用返回的不透明扩展对象。AGENT.md §2「不透明字段回传」：同一请求链的后续工具轮
+     * 必须原样放回，不解析、不修改、不持久化、不记日志；服务端没返回时为 null，不进入请求体。
+     */
+    @SerialName("extra_content") val extraContent: JsonElement? = null,
 )
 
 @Serializable

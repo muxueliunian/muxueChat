@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"content":"2","role":"assistant"},"index":0,"logprobs":null}],"created":1791908476,"id":"fFrOavj9C5afvdAPtLKY8AY","model":"google/gemini-4-argon","object":"chat.completion.chunk","system_fingerprint":""}
+
+data: {"choices":[{"delta":{"content":"","extra_content":{"google":{"thought_signature":"TEST_SIG_1"}},"role":"assistant"},"finish_reason":"stop","index":0,"logprobs":null}],"created":1791908476,"id":"fFrOavj9C5afvdAPtLKY8AY","model":"google/gemini-4-argon","object":"chat.completion.chunk","system_fingerprint":"","usage":{"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":78},"extra_properties":{"google":{"traffic_type":"ON_DEMAND"}},"prompt_tokens":39,"total_tokens":122}}
+
+data: [DONE]
+
