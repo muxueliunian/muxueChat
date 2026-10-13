@@ -7,8 +7,12 @@ import com.muxuechat.domain.model.ProtagonistProfileDraft
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpMarkerMode
+import com.muxuechat.domain.model.RpEntryOwner
+import com.muxuechat.domain.model.RpMetricSnapshot
 import com.muxuechat.domain.model.RpNarrativePerspective
 import com.muxuechat.domain.model.RpPlotSuggestionPerspective
+import com.muxuechat.domain.model.RpSettingKind
+import com.muxuechat.domain.model.RpSettingRef
 import com.muxuechat.domain.model.RpStatusPanel
 import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.model.SupportingCharacterDraft
@@ -16,6 +20,7 @@ import com.muxuechat.domain.model.WorldSetting
 import com.muxuechat.domain.model.WorldSettingDraft
 import com.muxuechat.domain.model.WritingStyleProfile
 import com.muxuechat.domain.model.WritingStyleProfileDraft
+import com.muxuechat.domain.tool.SettingsUpdateTarget
 import kotlinx.coroutines.flow.Flow
 
 /** 一次草稿保存的结果，供 UI 提示与后续绑定。 */
@@ -25,6 +30,7 @@ data class SavedGeneratedSettings(
     val writingStyle: WritingStyleProfile? = null,
     /** 工具生成的主角：保存为独立档案并绑定到会话。 */
     val protagonistProfile: ProtagonistProfile? = null,
+    val supportingCharacter: SupportingCharacter? = null,
     val boundToConversation: Boolean = false,
 )
 
@@ -74,6 +80,9 @@ interface RpRepository {
     suspend fun deleteSupportingCharacter(characterId: String)
     fun observeConversationSupportingCharacters(conversationId: String): Flow<List<SupportingCharacter>>
 
+    /** 配角 id → 勾选它的会话数；没有会话勾选的配角不在表里。 */
+    fun observeSupportingCharacterUsage(): Flow<Map<String, Int>>
+
     /** 整体替换会话勾选的配角，顺序即列表顺序。配角不进状态面板，不涉及数值。 */
     suspend fun setConversationSupportingCharacters(conversationId: String, characterIds: List<String>)
 
@@ -83,7 +92,17 @@ interface RpRepository {
      *
      * @return 定义确实有变化并已同步时为 true；本来就一致时为 false，不写库。
      */
-    suspend fun syncMetricDefinitionsFromProfiles(conversationId: String): Boolean
+    suspend fun syncMetricDefinitionsFromProfiles(
+        conversationId: String,
+        owners: Set<RpEntryOwner> = setOf(RpEntryOwner.ROLE_CARD, RpEntryOwner.PROTAGONIST),
+    ): Boolean
+
+    /** 修正当前数值；定义过期或输入越界时拒绝，不覆盖其它项，并维护最近有效回复的历史检查点。 */
+    suspend fun updateMetricValue(
+        conversationId: String,
+        expectedDefinition: RpMetricSnapshot,
+        value: Int,
+    ): RpStatusPanel
 
     fun observeWritingStyleProfiles(): Flow<List<WritingStyleProfile>>
     suspend fun saveWritingStyleProfile(id: String?, draft: WritingStyleProfileDraft): WritingStyleProfile
@@ -102,8 +121,37 @@ interface RpRepository {
         worldSetting: WorldSettingDraft?,
         writingStyle: WritingStyleProfileDraft?,
         protagonist: ProtagonistDraft? = null,
+        /** 绑定时追加到会话已勾选配角的末尾。 */
+        supportingCharacter: SupportingCharacterDraft? = null,
         bindToConversationId: String?,
     ): SavedGeneratedSettings
+
+    /**
+     * 删除设定工具请求、并经用户确认的若干项（全部在一个事务里，任一失败整体回滚）。
+     * 每类走各自的删除入口，绑定变化按第 4 节的转换规则处理。已不存在的项跳过。
+     *
+     * @return 实际删除的项数。
+     */
+    suspend fun deleteSettings(refs: List<RpSettingRef>): Int
+
+    /**
+     * 用户确认 AI 的修改请求（`update_rp_setting`）后覆盖原设定。只用与 [target] 类型对应的那份草稿。
+     *
+     * - 生成请求后这项设定又被改过（`updatedAtMillis` 变了）或已删除时抛异常，不覆盖别处的修改。
+     * - 角色卡 / 主角的状态条定义变了时，**所有**绑定它的会话立即对齐到新定义（用户 2026-09-25 选定，
+     *   是 R6「改档案不影响会话」的例外）：定义被改动的状态条回到新的初始值，并从历史快照里移除；
+     *   新增的用初始值，删掉的移除，没动的保留原值。
+     *
+     * @return 状态条被重置的会话数。
+     */
+    suspend fun applySettingsUpdate(
+        target: SettingsUpdateTarget,
+        roleCard: RoleCardDraft?,
+        worldSetting: WorldSettingDraft?,
+        writingStyle: WritingStyleProfileDraft?,
+        protagonistProfile: ProtagonistProfileDraft?,
+        supportingCharacter: SupportingCharacterDraft?,
+    ): Int
 
     /**
      * [writingStyleId]、[protagonistProfileId] 与 [roleCardId]、[worldSettingId] 一样是**必填**的：

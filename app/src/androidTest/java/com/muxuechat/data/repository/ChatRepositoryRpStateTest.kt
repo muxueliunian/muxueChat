@@ -289,7 +289,6 @@ class ChatRepositoryRpStateTest {
                 persona = "",
                 speakingStyle = "",
                 userIdentity = "",
-                openingMessage = "",
                 boundaries = "",
                 entries = RpEntryCodec.decodeEntries(entriesJson).entries,
                 createdAtMillis = 1,
@@ -450,6 +449,69 @@ class ChatRepositoryRpStateTest {
         dao.getMessages(CONVERSATION_ID).last { it.role == ChatRole.ASSISTANT }
 
     /** 绑定时的定义快照由 Repository 生成；这里按同一入口拍快照，名字是带前缀的 wireName。 */
+    /**
+     * 按草稿估算（RP-3c，§6.2）：勾选的配角计入 RP 固定成本，而且估算不写库——
+     * 会话仍然没有勾选任何配角，也不产生网络请求。
+     */
+    @Test
+    fun draftPlan_countsSelectedSupportingCharactersWithoutWriting() = runBlocking {
+        seedRpConversation(withMetrics = true)
+        dao.insertSupportingCharacter(
+            SupportingCharacterEntity(
+                id = "support",
+                name = "配角老周",
+                description = "咖啡店的熟客，".repeat(200),
+                entriesJson = "[]",
+                createdAtMillis = 1,
+                updatedAtMillis = 1,
+            ),
+        )
+        val repository = repository(Interceptor { error("估算不应发请求") })
+        val base = RpBindingDraft(
+            isRpEnabled = true,
+            roleCardId = ROLE_CARD_ID,
+            worldSettingId = null,
+            writingStyleId = null,
+            protagonistProfileId = null,
+            supportingCharacterIds = emptyList(),
+        )
+
+        val without = repository.planContextWindowForRpDraft(CONVERSATION_ID, base)
+        val withSupporting = repository.planContextWindowForRpDraft(CONVERSATION_ID, base.copy(supportingCharacterIds = listOf("support")))
+        val paused = repository.planContextWindowForRpDraft(
+            CONVERSATION_ID,
+            base.copy(isRpEnabled = false, supportingCharacterIds = listOf("support")),
+        )
+
+        val rpWithout = without.tokensOf(com.muxuechat.domain.context.ContextSectionKind.RP_SETTINGS)
+        val rpWith = withSupporting.tokensOf(com.muxuechat.domain.context.ContextSectionKind.RP_SETTINGS)
+        assertTrue("配角应计入 RP 固定成本：$rpWithout → $rpWith", rpWith > rpWithout + 500)
+        assertTrue(withSupporting.requestMessages.first().content.contains("#### 配角老周"))
+        assertFalse(paused.requestMessages.any { it.content.contains("配角老周") })
+        assertTrue(dao.getConversationSupportingCharacters(CONVERSATION_ID).isEmpty())
+    }
+
+    /** 还没有会话时（新会话第一次打开 RP 设置）也能估算，历史为空。 */
+    @Test
+    fun draftPlan_withoutConversation_usesEmptyHistory() = runBlocking {
+        val repository = repository(Interceptor { error("估算不应发请求") })
+
+        val plan = repository.planContextWindowForRpDraft(
+            null,
+            RpBindingDraft(
+                isRpEnabled = true,
+                roleCardId = null,
+                worldSettingId = null,
+                writingStyleId = null,
+                protagonistProfileId = null,
+                supportingCharacterIds = emptyList(),
+            ),
+        )
+
+        assertEquals(0, plan.totalHistoryMessageCount)
+        assertNull(plan.overflowError)
+    }
+
     private suspend fun seedRpConversation(withMetrics: Boolean) {
         dao.upsertConversation(ConversationEntity(CONVERSATION_ID, "会话", 1, 1))
         val entries = if (withMetrics) {
@@ -465,7 +527,6 @@ class ChatRepositoryRpStateTest {
                 persona = "",
                 speakingStyle = "",
                 userIdentity = "",
-                openingMessage = "",
                 boundaries = "",
                 entries = entries,
                 createdAtMillis = 1,

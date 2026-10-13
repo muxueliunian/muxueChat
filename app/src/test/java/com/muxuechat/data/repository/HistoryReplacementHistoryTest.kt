@@ -57,6 +57,55 @@ class HistoryReplacementHistoryTest {
         assertEquals(listOf("可用问题", "已编辑"), history.map { it.content })
     }
 
+    @Test
+    fun `regeneration hides the replaced reply while staging streams`() {
+        val messages = listOf(
+            message("u1", ChatRole.USER, "问题", createdAt = 1),
+            message("a1", ChatRole.ASSISTANT, "旧回复", createdAt = 2),
+            message(
+                id = "history-replacement:new",
+                role = ChatRole.ASSISTANT,
+                content = "新回复进行中",
+                createdAt = 3,
+                status = MessageStatus.STREAMING,
+            ),
+        )
+
+        val visible = HistoryReplacementHistory.visibleDuringReplacement(
+            messages = messages,
+            obsoleteMessageIds = listOf("a1"),
+            editedUserMessage = null,
+        )
+
+        assertEquals(listOf("u1", "history-replacement:new"), visible.map { it.id })
+    }
+
+    @Test
+    fun `edit replacement shows edited user content and hides old branch`() {
+        val messages = listOf(
+            message("u1", ChatRole.USER, "旧问题", createdAt = 1),
+            message("a1", ChatRole.ASSISTANT, "旧回复", createdAt = 2),
+            message("u2", ChatRole.USER, "后续问题", createdAt = 3),
+            message("a2", ChatRole.ASSISTANT, "后续回复", createdAt = 4),
+            message(
+                id = "history-replacement:new",
+                role = ChatRole.ASSISTANT,
+                content = "",
+                createdAt = 5,
+                status = MessageStatus.PENDING,
+            ),
+        )
+
+        val visible = HistoryReplacementHistory.visibleDuringReplacement(
+            messages = messages,
+            obsoleteMessageIds = listOf("a1", "u2", "a2"),
+            editedUserMessage = messages[0].copy(content = "新问题"),
+        )
+
+        assertEquals(listOf("u1", "history-replacement:new"), visible.map { it.id })
+        assertEquals("新问题", visible[0].content)
+    }
+
     private fun message(
         id: String,
         role: ChatRole,

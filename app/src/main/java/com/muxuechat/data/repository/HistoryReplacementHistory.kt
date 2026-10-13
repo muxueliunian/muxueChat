@@ -37,6 +37,23 @@ internal object HistoryReplacementHistory {
         return editedMessages.toPromptMessages()
     }
 
+    /**
+     * 替换进行期间界面应看到的消息：旧分支仍在库里（失败/取消时要原样保留），
+     * 但不能和正在流式输出的临时回复同时出现；编辑过的玩家消息提前显示新内容。
+     */
+    fun visibleDuringReplacement(
+        messages: List<MessageEntity>,
+        obsoleteMessageIds: Collection<String>,
+        editedUserMessage: MessageEntity?,
+    ): List<MessageEntity> {
+        val hidden = obsoleteMessageIds.toSet()
+        return messages
+            .filterNot { it.id in hidden }
+            .map { message ->
+                if (editedUserMessage != null && message.id == editedUserMessage.id) editedUserMessage else message
+            }
+    }
+
     private fun List<MessageEntity>.toPromptMessages(): List<PromptMessage> =
         asSequence()
             .filter { it.status == MessageStatus.COMPLETED }

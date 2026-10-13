@@ -612,10 +612,10 @@ class RpDerivedDataIntegrityTest {
         assertEquals(currentPanel, dao.getRpStatusPanel(CONVERSATION_ID))
     }
 
-    /** RP 暂停时重新生成没有 RP 状态可写，面板必须原样保留，而不是被当成「清空」。 */
+    /** 暂停不影响历史切点：重生成成功后回到切点，不能留下原回复对应的未来状态。 */
     @Test
-    fun historyReplacement_withoutRpState_keepsPausedPanel() = runBlocking {
-        val (rpSettings, _) = seedRpConversation()
+    fun historyReplacement_whilePaused_rollsBackToCutPoint() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
         val paused = rpSettings.copy(isRpEnabled = false, updatedAtMillis = 5)
         dao.upsertConversationRpSettings(paused)
         val pausedPanel = panel("暂停前", 5)
@@ -627,6 +627,7 @@ class RpDerivedDataIntegrityTest {
             status = MessageStatus.STREAMING,
         )
         dao.upsertMessage(staging)
+        val rollback = panel("切点之前", 30)
 
         val result = dao.commitHistoryReplacement(
             conversationId = CONVERSATION_ID,
@@ -634,41 +635,105 @@ class RpDerivedDataIntegrityTest {
             obsoleteMessageIds = listOf(oldAssistant.id),
             editedUserMessage = null,
             completedAssistant = staging.copy(status = MessageStatus.COMPLETED, updatedAtMillis = 30),
-            rpStatusPanel = null,
+            rpStatusPanel = rollback,
             updatedAtMillis = 30,
             expectedRpSettings = paused,
-            expectedRoleCard = null,
+            expectedRoleCard = roleCard,
             expectedStatusPanel = pausedPanel,
         )
 
         assertEquals(RpStateCommitResult.APPLIED, result)
-        assertEquals(pausedPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        assertEquals(rollback, dao.getRpStatusPanel(CONVERSATION_ID))
     }
 
     @Test
-    fun assistantEdit_withoutRollbackPanel_keepsPausedPanel() = runBlocking {
-        val (rpSettings, _) = seedRpConversation()
+    fun assistantEdit_whilePaused_rollsBackToCutPoint() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
         val paused = rpSettings.copy(isRpEnabled = false, updatedAtMillis = 5)
         dao.upsertConversationRpSettings(paused)
         val pausedPanel = panel("暂停前", 5)
         dao.upsertRpStatusPanel(pausedPanel)
         val assistant = message("assistant", ChatRole.ASSISTANT, "待编辑", 10)
         dao.upsertMessage(assistant)
+        val rollback = panel("切点之前", 20)
 
         val committed = dao.editAssistantAndInvalidateDerivedData(
             expectedMessages = dao.getMessages(CONVERSATION_ID),
             editedMessage = assistant.copy(content = "人工改写", updatedAtMillis = 20),
             expectedRpSettings = paused,
-            expectedRoleCard = null,
+            expectedRoleCard = roleCard,
             affectedAssistantMessageIds = listOf(assistant.id),
             downstreamCompletedAssistantIds = emptyList(),
-            rollbackStatusPanel = null,
+            rollbackStatusPanel = rollback,
             downstreamNotice = "派生信息已失效",
             updatedAtMillis = 20,
         )
 
         assertTrue(committed)
-        assertEquals(pausedPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        assertEquals(rollback, dao.getRpStatusPanel(CONVERSATION_ID))
+    }
+
+    @Test
+    fun turnSnapshot_canReadPausedBindingsForHistoryCutWithoutActivatingRp() = runBlocking {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val paused = rpSettings.copy(isRpEnabled = false, updatedAtMillis = 5)
+        dao.upsertConversationRpSettings(paused)
+        val persisted = panel("暂停前", 5)
+        dao.upsertRpStatusPanel(persisted)
+
+        assertNull(dao.getRpTurnConfigurationSnapshot(CONVERSATION_ID).roleCard)
+        val cut = dao.getRpTurnConfigurationSnapshot(CONVERSATION_ID, includePausedBindings = true)
+        assertEquals(roleCard, cut.roleCard)
+        assertEquals(persisted, cut.statusPanel)
+        assertEquals(paused, cut.settings)
+        assertEquals(paused, dao.getConversationRpSettings(CONVERSATION_ID))
+    }
+
+    @Test
+    fun firstReplyWithLocalState_initialCheckpointDoesNotBlockNormalEnrichment() = runBlocking {
+        assertFirstReplyAllowsEnrichment(hasLocalState = true)
+    }
+
+    @Test
+    fun firstReplyWithoutLocalState_missingPanelDoesNotBlockNormalEnrichment() = runBlocking {
+        assertFirstReplyAllowsEnrichment(hasLocalState = false)
+    }
+
+    private suspend fun assertFirstReplyAllowsEnrichment(hasLocalState: Boolean) {
+        val (rpSettings, roleCard) = seedRpConversation()
+        val streaming = message("assistant", ChatRole.ASSISTANT, "正文", 10).copy(status = MessageStatus.STREAMING)
+        dao.upsertMessage(streaming)
+        val completed = streaming.copy(status = MessageStatus.COMPLETED, updatedAtMillis = 20)
+        val localPanel = panel("正文状态", 20).takeIf { hasLocalState }
+        val localMetadata = metadata(completed.id, "", "正文状态", 20).takeIf { hasLocalState }
+        assertEquals(RpStateCommitResult.APPLIED, dao.completeAssistantAndApplyRpState(
+            completedAssistant = completed,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = null,
+            rpStatusPanel = localPanel,
+            rpMetadataSnapshot = localMetadata,
+            tokenUsage = null,
+            updatedAtMillis = 20,
+        ))
+        val expectedMetadata = dao.getMessageRpMetadataForMessage(completed.id)
+        assertEquals(localMetadata, expectedMetadata)
+
+        assertTrue(dao.commitRpEnrichment(
+            expectedMessage = completed,
+            expectedRpSettings = rpSettings,
+            expectedRoleCard = roleCard,
+            expectedStatusPanel = localPanel,
+            metadata = metadata(completed.id, "新内心", "补写状态", 30),
+            statusPanel = panel("补写状态", 30),
+            missingStateMessage = null,
+            updatedAtMillis = 30,
+            expectedMetadata = expectedMetadata,
+        ))
+
+        assertEquals("补写状态", dao.getRpStatusPanel(CONVERSATION_ID)?.scene)
+        assertEquals("补写状态", dao.getMessageRpMetadataForMessage(completed.id)?.scene)
+        assertEquals("新内心", dao.getMessageRpMetadataForMessage(completed.id)?.innerThought)
     }
 
     private suspend fun seedRpConversation(): Pair<ConversationRpSettingsEntity, RoleCardEntity> {
@@ -680,8 +745,7 @@ class RpDerivedDataIntegrityTest {
             persona = "",
             speakingStyle = "",
             userIdentity = "",
-            openingMessage = "",
-            boundaries = "",
+                        boundaries = "",
             entries = listOf(RpMetricDefinition("trust", "信任", minValue = 0, maxValue = 10).toNumericEntry()),
             createdAtMillis = 1,
             updatedAtMillis = 1,

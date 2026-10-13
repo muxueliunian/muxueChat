@@ -701,7 +701,7 @@ class PromptComposerTest {
         assertEquals(2, Regex("(?m)^#### (?!.*状态条)").findAll(system).count())
     }
 
-    /** 角色卡文本词条（RP-3a）在开场白之后、边界之前；名字或内容为空的不输出。元数据补写也带上。 */
+    /** 角色卡文本词条（RP-3a）在用户身份之后、边界之前；名字或内容为空的不输出。元数据补写也带上。 */
     @Test
     fun roleCardTextEntries_renderBeforeBoundariesAndInMetadata() {
         val card = roleCard(texts = listOf("年龄" to "二十七", "备注" to " ", " " to "无名条"))
@@ -717,7 +717,9 @@ class PromptComposerTest {
         ).first().content
 
         val section = system.indexOf("### 角色补充设定\n- 年龄: 二十七")
-        assertTrue(section > system.indexOf("### 开场白"))
+        assertTrue(section > system.indexOf("### 用户身份"))
+        // 开场白已去掉（2026-09-25），不再进 prompt。
+        assertFalse(system.contains("开场白"))
         assertTrue(section < system.indexOf("### 禁止事项与边界"))
         assertFalse(system.contains("- 备注:"))
         assertFalse(system.contains("无名条"))
@@ -829,7 +831,6 @@ class PromptComposerTest {
         persona = "温和，观察力强",
         speakingStyle = "简短、克制",
         userIdentity = "常客",
-        openingMessage = "今天也来了？",
         boundaries = "不要跳出角色",
         entries = texts.mapIndexed { index, (entryName, value) -> RpEntry.Text("rt$index", entryName, value) } +
             metricDefinitions.map { it.toNumericEntry() },

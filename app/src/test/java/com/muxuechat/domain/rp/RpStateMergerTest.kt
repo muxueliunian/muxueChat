@@ -34,6 +34,27 @@ class RpStateMergerTest {
 
     private fun RpStateMergeResult.valueOf(name: String) = panel?.metrics?.single { it.name == name }?.value
 
+    /** 模型照抄示例占位文字时不能覆盖真实的关系与场景。 */
+    @Test
+    fun copiedPlaceholderText_keepsCurrentRelationshipAndScene() {
+        val result = merge(
+            RpMetricDraft("好感度", 70, 0, 100),
+            relationship = "当前关系",
+            scene = RpStateBlockFormat.SCENE_HINT,
+        )
+
+        assertEquals("熟人", result.panel?.relationship)
+        assertEquals("吧台", result.panel?.scene)
+    }
+
+    @Test
+    fun copiedPlaceholderTextOnly_isNotNewText() {
+        val result = merge(relationship = "当前关系", scene = "当前场景")
+
+        assertNull(result.panel)
+        assertNull(result.textOnlyPanel)
+    }
+
     /** 旧实现在这里回落初始值：模型漏写一项，玩家的数值就当场归零。 */
     @Test
     fun missingMetric_keepsCurrentValueInsteadOfInitial() {

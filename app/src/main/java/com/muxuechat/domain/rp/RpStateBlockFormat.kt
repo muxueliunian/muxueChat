@@ -57,6 +57,25 @@ object RpStateBlockFormat {
             """"min":${definition.minValue},"max":${definition.maxValue}}"""
     }
 
+    /**
+     * 示例里 relationship / scene 的说明文字。
+     *
+     * 旧示例直接写「当前关系」「当前场景」，模型会把它当成合法取值原样抄回来，
+     * 面板于是显示「关系：当前关系」；这个值再作为「当前状态」喂回下一轮，形成自我强化。
+     * 现在示例写成明显的填写说明，并由 [meaningfulText] 把抄回来的说明文字当作「没给」。
+     */
+    const val RELATIONSHIP_HINT = "用一句话写本轮结束时双方的具体关系"
+    const val SCENE_HINT = "用一句话写本轮结束时所在的具体地点与情境"
+
+    /** 旧版示例的占位值，历史面板里可能已经存着它们。 */
+    private val PLACEHOLDER_TEXTS = setOf("当前关系", "当前场景", RELATIONSHIP_HINT, SCENE_HINT)
+
+    /** 关系/场景文本去掉首尾空白；抄回来的示例占位文字视为空，让合并逻辑保留上一轮的值。 */
+    fun meaningfulText(value: String?): String {
+        val trimmed = value.orEmpty().trim()
+        return if (trimmed in PLACEHOLDER_TEXTS) "" else trimmed
+    }
+
     /** 完整的 `<muxue_state>{...}</muxue_state>` 示例。 */
     fun stateBlockExample(
         definitions: List<RpMetricDefinition>,
@@ -64,10 +83,56 @@ object RpStateBlockFormat {
         useCurrentValues: Boolean = panel != null,
     ): String {
         val metrics = metricsJson(definitions, panel, useCurrentValues)
-        val relationship = panel?.relationship.orEmpty().ifBlank { "当前关系" }.escapeJson()
-        val scene = panel?.scene.orEmpty().ifBlank { "当前场景" }.escapeJson()
+        val relationship = relationshipExample(panel).escapeJson()
+        val scene = sceneExample(panel).escapeJson()
         return """$TAG_OPEN{"metrics":[$metrics],"relationship":"$relationship","scene":"$scene"}$TAG_CLOSE"""
     }
+
+    fun relationshipExample(panel: RpStatusPanel?): String =
+        meaningfulText(panel?.relationship).ifBlank { RELATIONSHIP_HINT }
+
+    fun sceneExample(panel: RpStatusPanel?): String =
+        meaningfulText(panel?.scene).ifBlank { SCENE_HINT }
+
+    /**
+     * 供界面显示的正文：去掉状态块。
+     *
+     * 状态块只在回复完成时才从正文里剥离，而模型总是把它写在最后，于是流式输出的末尾
+     * 它会原样显示好几秒。这里在显示层提前隐藏：完整的块、尚未闭合的块，
+     * 以及（仅流式中）末尾正在输出的半个起始标签。库里的正文不受影响。
+     */
+    fun stripForDisplay(content: String, isStreaming: Boolean): String {
+        if (content.isEmpty()) return content
+        var text = COMPLETE_BLOCK_REGEX.replace(content, "")
+        val openIndex = text.indexOf(TAG_OPEN_PREFIX, ignoreCase = true)
+        if (openIndex >= 0) {
+            text = text.substring(0, openIndex)
+        } else if (isStreaming) {
+            // 末尾可能是刚输出一半的起始标签（如「<muxue_st」）；至少两个字符才判定，单个「<」不动。
+            val partialLength = (minOf(TAG_OPEN_PREFIX.length - 1, text.length) downTo 2).firstOrNull { length ->
+                TAG_OPEN_PREFIX.startsWith(text.takeLast(length), ignoreCase = true)
+            }
+            if (partialLength != null) text = text.dropLast(partialLength)
+        }
+        text = EMPTY_CODE_FENCE_REGEX.replace(text, "")
+        // 围栏里的状态块被截掉后，只剩一个没有闭合的围栏起始行。围栏数为偶数时末尾的 ``` 是
+        // 正常代码块的结束符，不能动。
+        if (FENCE_REGEX.findAll(text).count() % 2 == 1) {
+            text = DANGLING_FENCE_REGEX.replace(text, "")
+        }
+        return text.trimEnd()
+    }
+
+    private const val TAG_OPEN_PREFIX = "<muxue_state"
+    private val COMPLETE_BLOCK_REGEX = Regex(
+        pattern = """<muxue_state>.*?</muxue_state>""",
+        options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+    )
+
+    /** 模型偶尔把状态块包进代码围栏；块被剥离后剩下的空围栏也一并去掉。 */
+    val EMPTY_CODE_FENCE_REGEX = Regex("""```[A-Za-z]*\s*```""")
+    private val FENCE_REGEX = Regex("```")
+    private val DANGLING_FENCE_REGEX = Regex("""```[A-Za-z]*\s*$""")
 
     /**
      * JSON 字符串转义。

@@ -21,7 +21,9 @@ class RpStateBlockParser(
 ) {
     fun extract(content: String): RpStateExtraction {
         val match = STATE_BLOCK_REGEX.find(content)
-        val cleanContent = content.replace(STATE_BLOCK_REGEX, "").trim()
+        val cleanContent = RpStateBlockFormat.EMPTY_CODE_FENCE_REGEX
+            .replace(content.replace(STATE_BLOCK_REGEX, ""), "")
+            .trim()
         if (match == null) {
             return RpStateExtraction(cleanContent = content, panel = null)
         }

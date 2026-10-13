@@ -200,11 +200,14 @@ class PromptComposer {
         return buildString {
             appendLine("### 当前状态（本轮即时数据，非玩家输入）")
             buildCurrentMetricLines(context).forEach { line -> appendLine(line) }
-            if (panel.relationship.isNotBlank()) {
-                appendLine("- 当前关系: ${panel.relationship}")
+            // 历史面板里可能存着旧示例的占位文字，不能再喂回给模型强化它。
+            val relationship = RpStateBlockFormat.meaningfulText(panel.relationship)
+            val scene = RpStateBlockFormat.meaningfulText(panel.scene)
+            if (relationship.isNotBlank()) {
+                appendLine("- 当前关系: $relationship")
             }
-            if (panel.scene.isNotBlank()) {
-                appendLine("- 当前场景: ${panel.scene}")
+            if (scene.isNotBlank()) {
+                appendLine("- 当前场景: $scene")
             }
         }.trim()
     }
@@ -324,10 +327,14 @@ class PromptComposer {
         if (hasUserPrompt) {
             appendLine(DEFERENCE_NOTICE)
         }
-        appendLine("你附带了 create_role_card、create_world_setting、create_writing_style、create_protagonist 四个工具，")
-        appendLine("仅在用户明确要求创建角色卡、世界观、文风或主角设定时才调用，其余情况当它们不存在。")
+        appendLine("你附带了管理角色扮演设定的工具：create_role_card、create_supporting_character、create_protagonist、")
+        appendLine("create_world_setting、create_writing_style 用于创建；list_rp_settings、get_rp_setting 用于查看已有设定；")
+        appendLine("update_rp_setting 用于修改；delete_rp_settings 用于删除。")
+        appendLine("仅在用户明确要求创建、查看、修改或删除这些设定时才调用，其余情况当它们不存在。")
+        appendLine("角色卡是剧情的主角色，配角是其他出场人物，主角是玩家本人：用户要配角时用 create_supporting_character，不要用角色卡代替。")
+        appendLine("修改或删除前先用 list_rp_settings 拿到 id，只动用户明确点名的项；修改只给要改的部分。")
         appendLine("它们只是可用功能，不是你的身份或用途，不要主动提及或把话题往这上面引。")
-        appendLine("工具产出的是草稿，由用户在界面上确认；调用后一句话说明即可，不要复述草稿内容。")
+        appendLine("创建、修改与删除都只产出待确认的草稿或请求，由用户在界面上确认；调用后一句话说明即可，不要复述内容，也不要声称已经修改或删除。")
     }.trim()
 
     private fun buildRpInstructions(context: PromptContext): String = buildString {
@@ -370,7 +377,6 @@ class PromptComposer {
             appendSection("人设描述", roleCard.persona)
             appendSection("说话风格", roleCard.speakingStyle)
             appendSection("用户身份", roleCard.userIdentity)
-            appendSection("开场白", roleCard.openingMessage)
             // 文本词条（RP-3a）：静态补充设定，放在边界之前，让边界仍是角色卡的最后一段。
             val cardEntries = roleCard.textEntries.filter { it.name.isNotBlank() && it.value.isNotBlank() }
             if (cardEntries.isNotEmpty()) {
@@ -408,6 +414,10 @@ class PromptComposer {
         appendLine("<muxue_state> 必须放在最终回复正文的最后，不要放进思考过程、推理内容或 Markdown 代码块。")
         appendLine("JSON 不要添加 Markdown 代码围栏；metrics 必须只包含下方定义过的状态条，不要新增、改名或遗漏。")
         appendLine("模型可以根据剧情自动调整状态数值，但必须遵守每个状态条的范围、含义和变化规则。")
+        appendLine(
+            "relationship 与 scene 必须按本轮剧情写出具体内容（人物关系的实际状态、具体地点与情境），" +
+                "示例中的说明文字只是填写要求，不得原样照抄；没有变化时沿用「当前状态」里的值。",
+        )
         appendMetricDefinitions(context)
         appendLine("JSON 格式固定如下：")
         appendLine(buildStateBlockExample(context))
@@ -524,12 +534,8 @@ class PromptComposer {
         currentPanel: RpStatusPanel?,
     ): String {
         val metrics = RpStateBlockFormat.metricsJson(definitions, currentPanel, useCurrentValues = true)
-        val relationship = with(RpStateBlockFormat) {
-            currentPanel?.relationship.orEmpty().ifBlank { "当前关系" }.escapeJson()
-        }
-        val scene = with(RpStateBlockFormat) {
-            currentPanel?.scene.orEmpty().ifBlank { "当前场景" }.escapeJson()
-        }
+        val relationship = with(RpStateBlockFormat) { relationshipExample(currentPanel).escapeJson() }
+        val scene = with(RpStateBlockFormat) { sceneExample(currentPanel).escapeJson() }
         return """{"inner_thought":"角色此刻的真实想法","options":["靠近她，低声回应刚才的问题。","先观察周围，再追问她的目的。","短暂停顿，把话题转向窗外的雨声。"],"state":{"metrics":[$metrics],"relationship":"$relationship","scene":"$scene"}}"""
     }
 
@@ -540,18 +546,15 @@ class PromptComposer {
      * 模型若给配角编状态条，会被当成未知键丢弃并计数，白白浪费输出。
      */
     private fun StringBuilder.appendSupportingCharacters(characters: List<SupportingCharacter>) {
-        val present = characters.filter { it.hasPromptContent() }
-        if (present.isEmpty()) return
+        val blocks = characters.mapNotNull(SupportingCharacterPrompt::block)
+        if (blocks.isEmpty()) return
         appendLine()
         appendLine("### 配角")
         appendLine("以下配角会在剧情中出现，由你按设定描写他们的言行。他们不是玩家，也不是角色卡的主角色；")
         appendLine("状态栏只记录下方定义过的状态条，不要为配角新增状态条。")
-        present.forEach { character ->
+        blocks.forEach { block ->
             appendLine()
-            appendLine("#### ${character.name.trim()}")
-            val description = character.description.trim()
-            if (description.isNotBlank()) appendLine(description)
-            character.entries.forEach { entry -> appendProfileLine(entry.name, entry.value) }
+            append(block)
         }
     }
 
@@ -640,11 +643,6 @@ class PromptComposer {
         if (trimmed.isBlank()) return
         appendLine("- $label: $trimmed")
     }
-
-    private fun SupportingCharacter.hasPromptContent(): Boolean =
-        name.isNotBlank() ||
-            description.isNotBlank() ||
-            entries.any { it.value.isNotBlank() }
 
     private fun ProtagonistProfile.hasPromptContent(): Boolean =
         name.isNotBlank() ||

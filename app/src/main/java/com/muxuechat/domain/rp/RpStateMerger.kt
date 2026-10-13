@@ -51,8 +51,11 @@ object RpStateMerger {
         draft: RpStatusPanelDraft,
         now: Long,
     ): RpStateMergeResult {
-        val relationship = draft.relationship.ifBlank { current?.relationship.orEmpty() }
-        val scene = draft.scene.ifBlank { current?.scene.orEmpty() }
+        // 抄回来的示例占位文字等同于没给，保留上一轮的关系与场景。
+        val draftRelationship = RpStateBlockFormat.meaningfulText(draft.relationship)
+        val draftScene = RpStateBlockFormat.meaningfulText(draft.scene)
+        val relationship = draftRelationship.ifBlank { current?.relationship.orEmpty() }
+        val scene = draftScene.ifBlank { current?.scene.orEmpty() }
 
         if (definitions.isEmpty()) {
             // 角色卡没定义状态条时，面板只承载关系与场景；模型自带的状态条原样保留（现有行为）。
@@ -93,7 +96,7 @@ object RpStateMerger {
             rawJson = draft.rawJson,
             updatedAtMillis = now,
         )
-        val hasNewText = draft.relationship.isNotBlank() || draft.scene.isNotBlank()
+        val hasNewText = draftRelationship.isNotBlank() || draftScene.isNotBlank()
 
         return RpStateMergeResult(
             panel = merged.takeIf { matched > 0 },

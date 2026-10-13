@@ -4,7 +4,7 @@ package com.muxuechat.domain.model
  * 主角档案：从 v9 的三个字符串（姓名 / 描述 / 初始状态）升格而来的独立实体。
  *
  * 与角色卡的区别见 RP_ACTOR_PLAN §3.2：主角不需要 `persona`、`speakingStyle`、
- * `userIdentity`、`openingMessage`、`boundaries`——这些要么是角色卡视角的概念，
+ * `userIdentity`、`boundaries`——这些要么是角色卡视角的概念，
  * 要么用文本词条表达即可。
  */
 data class ProtagonistProfile(

@@ -50,9 +50,10 @@ class SettingsToolArgumentParserTest {
         assertEquals("林澈", card.name)
         assertEquals("旧城区咖啡店店主", card.description)
         assertEquals("简短、克制", card.speakingStyle)
+        // 开场白已去掉：模型仍给出 opening_message 时直接忽略，不报错也不提示。
         assertEquals(1, card.metricDefinitions.size)
         assertEquals(-10, card.metricDefinitions.first().minValue)
-        assertEquals("角色卡", draft.typeLabel)
+        assertEquals("角色卡草稿", draft.pendingLabel)
         assertTrue(draft.warnings.isEmpty())
     }
 
@@ -63,14 +64,14 @@ class SettingsToolArgumentParserTest {
             """{"title":"雨城","content":"常年下雨的港口城市"}""",
         )
         assertEquals("雨城", world.worldSetting!!.title)
-        assertEquals("世界观", world.typeLabel)
+        assertEquals("世界观草稿", world.pendingLabel)
 
         val style = success(
             SettingsTool.CREATE_WRITING_STYLE,
             """{"name":"冷峻第三人称","content":"短句，克制，少用形容词"}""",
         )
         assertEquals("冷峻第三人称", style.writingStyle!!.name)
-        assertEquals("文风", style.typeLabel)
+        assertEquals("文风草稿", style.pendingLabel)
     }
 
     @Test
@@ -84,7 +85,7 @@ class SettingsToolArgumentParserTest {
         assertEquals("沈昭", hero.name)
         assertEquals("外地来的记者", hero.description)
         assertEquals("刚下火车，只带了一个背包", hero.initialState)
-        assertEquals("主角", draft.typeLabel)
+        assertEquals("主角草稿", draft.pendingLabel)
         assertEquals("沈昭", draft.displayName)
         assertNull(draft.roleCard)
         assertTrue(draft.warnings.isEmpty())

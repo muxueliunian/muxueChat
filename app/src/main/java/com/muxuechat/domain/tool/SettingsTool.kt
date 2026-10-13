@@ -10,8 +10,21 @@ enum class SettingsTool(val apiName: String) {
     CREATE_WORLD_SETTING("create_world_setting"),
     CREATE_WRITING_STYLE("create_writing_style"),
 
-    /** 主角还不是独立实体，草稿只能保存进某个会话的 RP 设置，见 [com.muxuechat.domain.model.ProtagonistDraft]。 */
+    /** 主角档案保存后必须绑定到发起调用的会话，见 [com.muxuechat.domain.model.ProtagonistDraft]。 */
     CREATE_PROTAGONIST("create_protagonist"),
+    CREATE_SUPPORTING_CHARACTER("create_supporting_character"),
+
+    /** 只读：列出已有设定的完整内容与 id，供模型定位要删除的项。不产生草稿。 */
+    LIST_RP_SETTINGS("list_rp_settings"),
+
+    /** 只读：按 type + id 取单项完整内容。不产生草稿。 */
+    GET_RP_SETTING("get_rp_setting"),
+
+    /** 只产生「修改请求」草稿（只含要改的部分，与原内容合并），用户确认后才覆盖原设定。 */
+    UPDATE_RP_SETTING("update_rp_setting"),
+
+    /** 只产生「删除请求」草稿，用户确认后才删除。 */
+    DELETE_RP_SETTINGS("delete_rp_settings"),
     ;
 
     companion object {

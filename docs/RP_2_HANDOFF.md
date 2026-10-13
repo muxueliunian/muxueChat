@@ -9,8 +9,8 @@
 
 - 基线提交：`270e669`（RP-0 + 主角设定工具 + RP-1）。其后 `d1a5c10` / `1cf884b` 是 xAI 工具调用，
   没碰 RP 文件。
-- 2026-09-23 追加（未提交）：RP-2a、2b、2c 已完成，JVM 415/415，androidTest 编译通过，未上真机。
-- 2026-09-23 再追加（未提交）：2c 遗留问题（空名字主角）、2d、2e、2f、2g 与 2b 的端到端用例已完成。
+- 2026-09-23 追加（当时未提交，后随 `6aa4648` 提交）：RP-2a、2b、2c 已完成，JVM 415/415，androidTest 编译通过，未上真机。
+- 2026-09-23 再追加（当时未提交，后随 `6aa4648` 提交）：2c 遗留问题（空名字主角）、2d、2e、2f、2g 与 2b 的端到端用例已完成。
   JVM **424/424**，androidTest 编译通过。
 - 2026-09-23 真机 instrumented（用户同意，带 `leaveApksInstalledAfterRun=true`，App 未被卸载）：
   第一轮 81 项跑完后进程被 ColorOS 息屏杀掉（`OsenseKillAction`，发生在卡住两分钟的
@@ -40,7 +40,7 @@
 
 每个任务的**基本验证**：`./gradlew :app:testDebugUnitTest :app:compileDebugAndroidTestKotlin` 全绿。
 
-### [x] RP-2a 状态面板显示名（已完成，未提交）
+### [x] RP-2a 状态面板显示名（已完成，已提交 `6aa4648`）
 
 **已做**：`RpEffectiveDefinitions.displayLabelsOf(wireNames, snapshot)`，面板
 （`RpStatusPanelCard` 新增 `metricSnapshot` 参数，`ChatScreen` 传 `activeRpSettings.metricSnapshot`）
@@ -55,7 +55,7 @@
   （如上下文窗口、消息元数据展示），同样处理。
 - 验收：面板显示「好感度」，不显示 `角色::`。
 
-### [x] RP-2b 部分失败保留关系与场景（已完成，未提交）
+### [x] RP-2b 部分失败保留关系与场景（已完成，已提交 `6aa4648`）
 
 **已做**：
 - `RpStateMergeResult` 新增 `textOnlyPanel`：`panel == null`（数值全没对上）且模型给了关系或场景时非空，
@@ -86,7 +86,7 @@
 - 兜底请求回来后再合并一次：兜底也失败时，关系与场景保持第一次的新值。
 - 测试：`RpStateMergerTest` 补用例；`ChatRepositoryRpStateTest`（instrumented）补端到端用例。
 
-### [x] RP-2c 主角改读档案（已完成，未提交）
+### [x] RP-2c 主角改读档案（已完成，已提交 `6aa4648`）
 
 **已做**：
 - `PromptContext`、`RpMetadataPromptContext`、`ChatContextInput` 新增 `protagonistProfile`
@@ -119,7 +119,7 @@
 - 旧三字段 `protagonistName/Description/InitialState` 之后只作取证材料，prompt 不再读。
 - 测试：`PromptComposerTest` 覆盖有档案 / 无档案 / 档案只有文本词条。
 
-### [x] RP-2d RP 设置界面的主角三个输入框（已完成，未提交）
+### [x] RP-2d RP 设置界面的主角三个输入框（已完成，已提交 `6aa4648`）
 
 **用户 2026-09-23 选定建议方案。已做**：
 - `updateConversationRpSettings` 的 `protagonistName/Description/InitialState` 改为编辑
@@ -154,7 +154,7 @@ RP-3 才做档案选择器，所以 RP-2 必须有过渡方案。我建议的方
 - 注意：多个会话可能绑定同一档案（工具建的档案可以复用），在这里改档案会影响所有会话的
   文本部分（数值部分有快照保护，不受影响）。要在输入框下方写明。
 
-### [x] RP-2e 数值按组输出与配角进正文（已完成，未提交）
+### [x] RP-2e 数值按组输出与配角进正文（已完成，已提交 `6aa4648`）
 
 **已做**：
 - 前缀规则集中为 `RpStateBlockFormat.PREFIX_RULE`（「name 带归属前缀，必须原样照抄，不去掉也不另加」），
@@ -193,7 +193,7 @@ RP-3 才做档案选择器，所以 RP-2 必须有过渡方案。我建议的方
 - 上下文规划：新加的段落要计入 `ComposedPrompt` 的分项原文，否则占用统计不准（§6.2）。
 - 数据来源：配角的增删和会话关联在 RP-2 没有 UI（RP-3 做），测试直接用 DAO 插数据。
 
-### [x] RP-2f 无角色卡路径（§11.1）（已完成，未提交）
+### [x] RP-2f 无角色卡路径（§11.1）（已完成，已提交 `6aa4648`）
 
 **判据**：状态链路生效 = RP 开启 **且绑了角色卡或主角**（`stateActive`）。只新增「无角色卡、有主角」
 这一种情况；**两者都没绑的 RP 仍然不记状态**，与之前一致（否则回滚会给这类会话写出空面板，UI 冒出一张空卡）。
@@ -230,7 +230,7 @@ RP-3 才做档案选择器，所以 RP-2 必须有过渡方案。我建议的方
 - RP-1 实施记录第 5 条：删角色卡目前仍会关闭 RP，放开后要重新决定（建议：还有主角就不关）。
 - 这条改动面最大，放在最后做；如果时间不够，可以和用户商量挪到 RP-3。
 
-### [x] RP-2g 设定生成工具的数值适配（§11.2）（已完成，未提交）
+### [x] RP-2g 设定生成工具的数值适配（§11.2）（已完成，已提交 `6aa4648`）
 
 **核实结果**：已被 RP-1 覆盖。工具协议不变，`SettingsToolArgumentParser` 仍产出旧形状的
 `RoleCardDraft.metricDefinitions`；保存走 `saveRoleCard` → `RoleCardDraft.toEntries()`，

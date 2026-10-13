@@ -17,6 +17,7 @@ import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.ProtagonistProfileDraft
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpEntry
+import com.muxuechat.domain.model.RpEntryOwner
 import com.muxuechat.domain.model.RpMetric
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.RpStatusPanel
@@ -253,6 +254,136 @@ class RpBindingTransitionTest {
 
         assertFalse(repository.syncMetricDefinitionsFromProfiles(CONVERSATION_ID))
         assertEquals(settingsBefore, dao.getConversationRpSettings(CONVERSATION_ID))
+    }
+
+    @Test
+    fun syncRoleOnly_doesNotRefreshFrozenProtagonistDefinitionOrValues() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        val profile = saveProfile("主角", staminaInitial = 20)
+        bind(card, protagonist = profile)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), RpMetric(PROTAGONIST_WIRE, 80, 0, 100), scene = "场景")
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100},{"name":"$PROTAGONIST_WIRE","value":60,"min":0,"max":100}]""")
+        val frozen = settings().metricSnapshot.single { it.ownerType == RpEntryOwner.PROTAGONIST }
+        val oldProfile = dao.getProtagonistProfile(profile)!!.toDomain()
+        repository.saveProtagonistProfile(profile, ProtagonistProfileDraft(
+            name = oldProfile.name,
+            entries = oldProfile.entries.map { if (it is RpEntry.Numeric) it.copy(maxValue = 30) else it },
+        ))
+        repository.saveRoleCard(card, cardDraft("A", metricName = "亲密度", initialValue = 10))
+
+        assertTrue(repository.syncMetricDefinitionsFromProfiles(CONVERSATION_ID, setOf(RpEntryOwner.ROLE_CARD)))
+
+        assertEquals(frozen, settings().metricSnapshot.single { it.ownerType == RpEntryOwner.PROTAGONIST })
+        assertEquals(RpMetric(PROTAGONIST_WIRE, 80, 0, 100), panel()!!.metrics.single { it.name == PROTAGONIST_WIRE })
+        val history = dao.getMessageRpMetadataForMessage("assistant")!!.toDomain().statusPanelSnapshot!!
+        assertEquals(RpMetric(PROTAGONIST_WIRE, 60, 0, 100), history.metrics.single { it.name == PROTAGONIST_WIRE })
+        assertEquals(50, history.metrics.single { it.name == "角色::亲密度" }.value)
+    }
+
+    @Test
+    fun manualCorrection_changesOnlyTargetAndCreatesLatestAssistantCheckpoint() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        val profile = saveProfile("主角", staminaInitial = 20)
+        bind(card, protagonist = profile)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), RpMetric(PROTAGONIST_WIRE, 80, 0, 100), scene = "场景")
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]""")
+        val before = dao.getMessageRpMetadataForMessage("assistant")!!
+        val definition = settings().metricSnapshot.single { it.ownerType == RpEntryOwner.ROLE_CARD }
+
+        val corrected = repository.updateMetricValue(CONVERSATION_ID, definition, 3)
+
+        assertEquals(listOf(RpMetric(ROLE_WIRE, 3, 0, 100), RpMetric(PROTAGONIST_WIRE, 80, 0, 100)), corrected.metrics)
+        assertEquals("场景", corrected.scene)
+        val checkpoint = dao.getMessageRpMetadataForMessage("assistant")!!
+        assertEquals(corrected.metrics, checkpoint.toDomain().statusPanelSnapshot!!.metrics)
+        assertEquals(before.innerThought, checkpoint.innerThought)
+        assertEquals(before.optionsJson, checkpoint.optionsJson)
+    }
+
+    @Test
+    fun manualCorrection_withoutMetadata_createsCheckpointAndLeavesOlderHistoryUntouched() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]""")
+        val older = dao.getMessageRpMetadataForMessage("assistant")!!
+        val latest = dao.getMessage("assistant")!!.copy(id = "latest-assistant", createdAtMillis = 20, updatedAtMillis = 20)
+        dao.upsertMessage(latest)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+
+        repository.updateMetricValue(CONVERSATION_ID, settings().metricSnapshot.single(), 3)
+
+        assertEquals(older, dao.getMessageRpMetadataForMessage("assistant"))
+        val checkpoint = dao.getMessageRpMetadataForMessage(latest.id)!!
+        assertEquals(3, checkpoint.toDomain().statusPanelSnapshot!!.metrics.single().value)
+        assertEquals("[]", checkpoint.optionsJson)
+        assertEquals("", checkpoint.innerThought)
+    }
+
+    @Test
+    fun manualCorrection_rejectsStaleDefinitionAndOutOfRangeWithoutPartialWrites() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        val stale = settings().metricSnapshot.single()
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        val originalPanel = dao.getRpStatusPanel(CONVERSATION_ID)
+        assertTrue(runCatching { repository.updateMetricValue(CONVERSATION_ID, stale, 101) }.isFailure)
+        assertEquals(originalPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        repository.saveRoleCard(card, cardDraft("A", metricName = "亲密度", initialValue = 10))
+        repository.syncMetricDefinitionsFromProfiles(CONVERSATION_ID, setOf(RpEntryOwner.ROLE_CARD))
+        val syncedPanel = dao.getRpStatusPanel(CONVERSATION_ID)
+        assertTrue(runCatching { repository.updateMetricValue(CONVERSATION_ID, stale, 3) }.isFailure)
+        assertEquals(syncedPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        assertTrue(dao.getMessageRpMetadata(CONVERSATION_ID).isEmpty())
+    }
+
+    @Test
+    fun lateEnrichment_afterCorrectionAndNextReply_keepsOwnCorrectedCheckpoint() = runBlocking {
+        assertLateEnrichmentProtection(captureAfterCorrection = false)
+    }
+
+    @Test
+    fun lateEnrichment_correctionBeforeSchedulingSnapshotAndThenNextReply_keepsCorrection() = runBlocking {
+        assertLateEnrichmentProtection(captureAfterCorrection = true)
+    }
+
+    private suspend fun assertLateEnrichmentProtection(captureAfterCorrection: Boolean) {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        bind(card)
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]""")
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        val expectedMessage = dao.getMessage("assistant")!!
+        val expectedSettings = dao.getConversationRpSettings(CONVERSATION_ID)
+        val expectedRole = dao.getRoleCard(card)
+        val expectedPanel = dao.getRpStatusPanel(CONVERSATION_ID)
+        val originalMetadata = dao.getMessageRpMetadataForMessage("assistant")!!
+        repository.updateMetricValue(CONVERSATION_ID, settings().metricSnapshot.single(), 3)
+        val expectedMetadata = if (captureAfterCorrection) dao.getMessageRpMetadataForMessage("assistant")!! else originalMetadata
+        dao.upsertMessage(expectedMessage.copy(id = "next-assistant", createdAtMillis = 30, updatedAtMillis = 30))
+        setPanel(RpMetric(ROLE_WIRE, 90, 0, 100), scene = "下一轮场景")
+        val newerPanel = dao.getRpStatusPanel(CONVERSATION_ID)
+
+        assertTrue(dao.commitRpEnrichment(
+            expectedMessage = expectedMessage,
+            expectedRpSettings = expectedSettings,
+            expectedRoleCard = expectedRole,
+            expectedStatusPanel = expectedPanel,
+            metadata = originalMetadata.copy(innerThought = "迟到内心", scene = "旧补写场景", updatedAtMillis = 50),
+            statusPanel = expectedPanel,
+            missingStateMessage = null,
+            updatedAtMillis = 50,
+            expectedMetadata = expectedMetadata,
+        ))
+
+        assertEquals(newerPanel, dao.getRpStatusPanel(CONVERSATION_ID))
+        val checkpoint = dao.getMessageRpMetadataForMessage("assistant")!!
+        assertEquals(3, checkpoint.toDomain().statusPanelSnapshot!!.metrics.single().value)
+        assertEquals("场景", checkpoint.scene)
+        assertEquals("迟到内心", checkpoint.innerThought)
     }
 
     // ---------- 主角组 ----------
@@ -564,7 +695,146 @@ class RpBindingTransitionTest {
         assertTrue(repository.observeConversationSupportingCharacters(CONVERSATION_ID).first().isEmpty())
     }
 
+    /** 配角共用数按勾选的会话计；删除配角后关联随外键一起消失，共用数归零。 */
+    @Test
+    fun supportingUsage_countsSelectingConversations() = runBlocking {
+        seedConversation()
+        dao.upsertConversation(ConversationEntity(OTHER_CONVERSATION_ID, "另一个会话", 1, 1))
+        val shared = repository.saveSupportingCharacter(null, supporting("老周")).id
+        val single = repository.saveSupportingCharacter(null, supporting("阿绿")).id
+        repository.setConversationSupportingCharacters(CONVERSATION_ID, listOf(shared, single))
+        repository.setConversationSupportingCharacters(OTHER_CONVERSATION_ID, listOf(shared))
+
+        assertEquals(mapOf(shared to 2, single to 1), repository.observeSupportingCharacterUsage().first())
+
+        repository.deleteSupportingCharacter(shared)
+        assertEquals(mapOf(single to 1), repository.observeSupportingCharacterUsage().first())
+    }
+
+    // ---------- 设定工具：删除与配角草稿 ----------
+
+    /** 一次删多类：各走自己的转换规则（删主角只清主角组），已不存在的项跳过并如实计数。 */
+    @Test
+    fun deleteSettings_deletesEachKindAndSkipsMissing() = runBlocking {
+        seedConversation()
+        val card = saveCard("A", initialValue = 10)
+        val profile = saveProfile("沈昭", staminaInitial = 60)
+        val character = repository.saveSupportingCharacter(null, supporting("老周")).id
+        bind(card, protagonist = profile)
+        repository.setConversationSupportingCharacters(CONVERSATION_ID, listOf(character))
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), RpMetric(PROTAGONIST_WIRE, 20, 0, 100), scene = "场景")
+
+        val deleted = repository.deleteSettings(
+            listOf(
+                com.muxuechat.domain.model.RpSettingRef(com.muxuechat.domain.model.RpSettingKind.PROTAGONIST, profile),
+                com.muxuechat.domain.model.RpSettingRef(com.muxuechat.domain.model.RpSettingKind.SUPPORTING_CHARACTER, character),
+                com.muxuechat.domain.model.RpSettingRef(com.muxuechat.domain.model.RpSettingKind.WORLD_SETTING, "missing"),
+            ),
+        )
+
+        assertEquals(2, deleted)
+        assertNull(dao.getProtagonistProfile(profile))
+        assertNull(dao.getSupportingCharacter(character))
+        assertNull(settings().protagonistProfileId)
+        assertEquals(card, settings().roleCardId)
+        assertEquals(listOf(RpMetric(ROLE_WIRE, 77, 0, 100)), panel()?.metrics)
+        assertTrue(dao.getConversationSupportingCharacters(CONVERSATION_ID).isEmpty())
+    }
+
+    /** 工具生成的配角：勾选时追加到已选末尾，不打乱已有顺序。 */
+    @Test
+    fun savingGeneratedSupportingCharacter_appendsToSelection() = runBlocking {
+        seedConversation()
+        val existing = repository.saveSupportingCharacter(null, supporting("阿绿")).id
+        repository.setConversationSupportingCharacters(CONVERSATION_ID, listOf(existing))
+
+        val saved = repository.saveGeneratedSettings(
+            roleCard = null,
+            worldSetting = null,
+            writingStyle = null,
+            supportingCharacter = supporting("老周"),
+            bindToConversationId = CONVERSATION_ID,
+        )
+
+        assertTrue(saved.boundToConversation)
+        assertEquals(
+            listOf(existing, saved.supportingCharacter!!.id),
+            dao.getConversationSupportingCharacters(CONVERSATION_ID).map { it.id },
+        )
+    }
+
     // ---------- 辅助 ----------
+
+    // ---------- AI 修改请求（update_rp_setting） ----------
+
+    /** 状态条定义被 AI 修改：绑定它的会话回到新初始值，历史快照里的旧值移除。 */
+    @Test
+    fun applyingUpdate_resetsChangedMetricToNewInitialValue() = runBlocking {
+        seedConversation()
+        val cardId = saveCard("A", initialValue = 10)
+        bind(cardId)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "场景")
+        seedAssistantWithSnapshot("""[{"name":"$ROLE_WIRE","value":50,"min":0,"max":100}]""")
+        val card = dao.getRoleCard(cardId)!!.toDomain()
+
+        val reset = repository.applySettingsUpdate(
+            target = updateTarget(cardId, card.updatedAtMillis),
+            roleCard = cardDraft("A", initialValue = 30),
+            worldSetting = null,
+            writingStyle = null,
+            protagonistProfile = null,
+            supportingCharacter = null,
+        )
+
+        assertEquals(1, reset)
+        assertEquals(listOf(RpMetric(ROLE_WIRE, 30, 0, 100)), panel()?.metrics)
+        assertEquals("场景", panel()?.scene)
+        assertEquals(30, settings().metricSnapshot.single().initialValue)
+        assertEquals("[]", dao.observeMessageRpMetadata(CONVERSATION_ID).first().single().metricsJson)
+    }
+
+    /** 只改文字不动数值；生成请求后设定又被改过时拒绝覆盖。 */
+    @Test
+    fun applyingUpdate_textOnlyKeepsValuesAndStaleRequestIsRejected() = runBlocking {
+        seedConversation()
+        val cardId = saveCard("A", initialValue = 10)
+        bind(cardId)
+        setPanel(RpMetric(ROLE_WIRE, 77, 0, 100), scene = "")
+        val base = dao.getRoleCard(cardId)!!.updatedAtMillis
+
+        val reset = repository.applySettingsUpdate(
+            target = updateTarget(cardId, base),
+            roleCard = cardDraft("A", description = "新简介", initialValue = 10),
+            worldSetting = null,
+            writingStyle = null,
+            protagonistProfile = null,
+            supportingCharacter = null,
+        )
+        assertEquals(0, reset)
+        assertEquals(77, panel()?.metrics?.single()?.value)
+        assertEquals("新简介", dao.getRoleCard(cardId)!!.description)
+
+        val stale = runCatching {
+            repository.applySettingsUpdate(
+                target = updateTarget(cardId, base),
+                roleCard = cardDraft("A", description = "再改", initialValue = 10),
+                worldSetting = null,
+                writingStyle = null,
+                protagonistProfile = null,
+                supportingCharacter = null,
+            )
+        }
+        assertTrue(stale.isFailure)
+        assertEquals("新简介", dao.getRoleCard(cardId)!!.description)
+    }
+
+    private fun updateTarget(cardId: String, baseUpdatedAt: Long) = com.muxuechat.domain.tool.SettingsUpdateTarget(
+        ref = com.muxuechat.domain.model.RpSettingRef(com.muxuechat.domain.model.RpSettingKind.ROLE_CARD, cardId),
+        name = "A",
+        usageCount = 1,
+        baseUpdatedAtMillis = baseUpdatedAt,
+        changes = listOf("简介"),
+    )
 
     private suspend fun seedConversation() {
         dao.upsertConversation(ConversationEntity(CONVERSATION_ID, "会话", 1, 1))

@@ -4,6 +4,7 @@ import androidx.room.withTransaction
 import com.muxuechat.data.local.ChatDao
 import com.muxuechat.data.local.ChatDatabase
 import com.muxuechat.data.local.ConversationRpSettingsEntity
+import com.muxuechat.data.local.MessageRpMetadataEntity
 import com.muxuechat.data.local.ProtagonistProfileEntity
 import com.muxuechat.data.local.RoleCardEntity
 import com.muxuechat.data.local.SupportingCharacterEntity
@@ -11,12 +12,16 @@ import com.muxuechat.data.local.WorldSettingEntity
 import com.muxuechat.data.local.WritingStyleProfileEntity
 import com.muxuechat.data.local.toEntity
 import com.muxuechat.domain.model.ConversationRpSettings
+import com.muxuechat.domain.model.ChatRole
+import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.ProtagonistDraft
 import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.ProtagonistProfileDraft
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.RoleCardDraft
 import com.muxuechat.domain.model.RpEntry
+import com.muxuechat.domain.model.RpSettingRef
+import com.muxuechat.domain.model.RpSettingKind
 import com.muxuechat.domain.model.RpEntryOwner
 import com.muxuechat.domain.model.RpMarkerMode
 import com.muxuechat.domain.model.RpMetricDefinition
@@ -34,8 +39,10 @@ import com.muxuechat.domain.model.toMetricDefinition
 import com.muxuechat.domain.rp.RpEffectiveDefinitions
 import com.muxuechat.domain.rp.RpEntryCodec
 import com.muxuechat.domain.rp.RpEntryRules
+import com.muxuechat.domain.rp.RpMetricStateUpdates
 import com.muxuechat.domain.rp.RpStateBlockFormat
 import com.muxuechat.domain.rp.RpStateMerger
+import com.muxuechat.domain.tool.SettingsUpdateTarget
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
@@ -79,7 +86,6 @@ class RpRepositoryImpl(
                 persona = draft.persona.trim(),
                 speakingStyle = draft.speakingStyle.trim(),
                 userIdentity = draft.userIdentity.trim(),
-                openingMessage = draft.openingMessage.trim(),
                 boundaries = draft.boundaries.trim(),
                 // entriesJson 是唯一读源；metricDefinitionsJson 同步写入，
                 // 作为 entriesJson 万一被写坏时的就地恢复材料（见 RoleCardEntity 注释）。
@@ -259,6 +265,11 @@ class RpRepositoryImpl(
     override fun observeConversationSupportingCharacters(conversationId: String): Flow<List<SupportingCharacter>> =
         chatDao.observeConversationSupportingCharacters(conversationId).map { rows -> rows.map { it.toDomain() } }
 
+    override fun observeSupportingCharacterUsage(): Flow<Map<String, Int>> =
+        chatDao.observeSupportingCharacterUsage().map { rows ->
+            rows.associate { it.characterId to it.conversationCount }
+        }
+
     override suspend fun setConversationSupportingCharacters(conversationId: String, characterIds: List<String>) {
         database.withTransaction {
             require(chatDao.getConversation(conversationId) != null) { "会话不存在" }
@@ -305,6 +316,137 @@ class RpRepositoryImpl(
         chatDao.deleteWritingStyleProfile(writingStyleId)
     }
 
+    override suspend fun deleteSettings(refs: List<RpSettingRef>): Int = database.withTransaction {
+        var deleted = 0
+        refs.distinct().forEach { ref ->
+            val exists = when (ref.kind) {
+                RpSettingKind.ROLE_CARD -> chatDao.getRoleCard(ref.id) != null
+                RpSettingKind.SUPPORTING_CHARACTER -> chatDao.getSupportingCharacter(ref.id) != null
+                RpSettingKind.PROTAGONIST -> chatDao.getProtagonistProfile(ref.id) != null
+                RpSettingKind.WORLD_SETTING -> chatDao.getWorldSetting(ref.id) != null
+                RpSettingKind.WRITING_STYLE -> chatDao.getWritingStyleProfile(ref.id) != null
+            }
+            if (!exists) return@forEach
+            when (ref.kind) {
+                RpSettingKind.ROLE_CARD -> deleteRoleCard(ref.id)
+                RpSettingKind.SUPPORTING_CHARACTER -> deleteSupportingCharacter(ref.id)
+                RpSettingKind.PROTAGONIST -> deleteProtagonistProfile(ref.id)
+                RpSettingKind.WORLD_SETTING -> deleteWorldSetting(ref.id)
+                RpSettingKind.WRITING_STYLE -> deleteWritingStyleProfile(ref.id)
+            }
+            deleted++
+        }
+        deleted
+    }
+
+    override suspend fun applySettingsUpdate(
+        target: SettingsUpdateTarget,
+        roleCard: RoleCardDraft?,
+        worldSetting: WorldSettingDraft?,
+        writingStyle: WritingStyleProfileDraft?,
+        protagonistProfile: ProtagonistProfileDraft?,
+        supportingCharacter: SupportingCharacterDraft?,
+    ): Int = database.withTransaction {
+        val id = target.ref.id
+        val currentUpdatedAt = when (target.ref.kind) {
+            RpSettingKind.ROLE_CARD -> chatDao.getRoleCard(id)?.updatedAtMillis
+            RpSettingKind.SUPPORTING_CHARACTER -> chatDao.getSupportingCharacter(id)?.updatedAtMillis
+            RpSettingKind.PROTAGONIST -> chatDao.getProtagonistProfile(id)?.updatedAtMillis
+            RpSettingKind.WORLD_SETTING -> chatDao.getWorldSetting(id)?.updatedAtMillis
+            RpSettingKind.WRITING_STYLE -> chatDao.getWritingStyleProfile(id)?.updatedAtMillis
+        }
+        requireNotNull(currentUpdatedAt) { "这项${target.ref.kind.label}已被删除，无法修改" }
+        require(currentUpdatedAt == target.baseUpdatedAtMillis) {
+            "这项${target.ref.kind.label}在 AI 提出修改之后又被改过，为避免覆盖，请让 AI 重新生成修改请求"
+        }
+        fun <T : Any> draftOf(value: T?): T = requireNotNull(value) { "修改请求缺少${target.ref.kind.label}内容" }
+
+        when (target.ref.kind) {
+            RpSettingKind.ROLE_CARD -> {
+                val before = chatDao.getRoleCard(id)!!.toDomain().entries
+                val saved = saveRoleCard(id, draftOf(roleCard))
+                resetChangedMetrics(
+                    RpEntryOwner.ROLE_CARD,
+                    before,
+                    saved.entries,
+                    chatDao.getConversationRpSettingsByRoleCard(id),
+                )
+            }
+            RpSettingKind.PROTAGONIST -> {
+                val before = chatDao.getProtagonistProfile(id)!!.toDomain().entries
+                val saved = saveProtagonistProfile(id, draftOf(protagonistProfile))
+                resetChangedMetrics(
+                    RpEntryOwner.PROTAGONIST,
+                    before,
+                    saved.entries,
+                    chatDao.getConversationRpSettingsByProtagonist(id),
+                )
+            }
+            RpSettingKind.SUPPORTING_CHARACTER -> {
+                saveSupportingCharacter(id, draftOf(supportingCharacter))
+                0
+            }
+            RpSettingKind.WORLD_SETTING -> {
+                saveWorldSetting(id, draftOf(worldSetting))
+                0
+            }
+            RpSettingKind.WRITING_STYLE -> {
+                saveWritingStyleProfile(id, draftOf(writingStyle))
+                0
+            }
+        }
+    }
+
+    /**
+     * 档案的数值定义被修改后，让绑定它的每个会话对齐到新定义（见 [applySettingsUpdate]）。
+     * 必须在事务内调用。
+     *
+     * 先按 entryId 保值同步（与 [syncMetricDefinitionsFromProfiles] 同一规则），
+     * 再把**定义被改动**的状态条从面板与历史快照里移除、按新定义补回初始值。
+     * 顺序不能反：先重置再同步会把旧定义的初始值当成现值保留下来。
+     *
+     * @return 有状态条被重置的会话数。
+     */
+    private suspend fun resetChangedMetrics(
+        owner: RpEntryOwner,
+        before: List<RpEntry>,
+        after: List<RpEntry>,
+        bindings: List<ConversationRpSettingsEntity>,
+    ): Int {
+        val beforeNumeric = before.filterIsInstance<RpEntry.Numeric>()
+        val afterNumeric = after.filterIsInstance<RpEntry.Numeric>()
+        if (beforeNumeric == afterNumeric) return 0
+        val beforeById = beforeNumeric.associateBy { it.id }
+        val changedIds = afterNumeric.filter { entry -> beforeById[entry.id]?.let { it != entry } == true }
+            .map { it.id }
+            .toSet()
+
+        var resetCount = 0
+        bindings.forEach { previous ->
+            val conversationId = previous.conversationId
+            resyncMetricGroups(previous, setOf(owner))
+            if (changedIds.isEmpty()) return@forEach
+            val snapshot = chatDao.getConversationRpSettings(conversationId)?.toDomain()?.metricSnapshot.orEmpty()
+            val resetNames = snapshot.filter { it.ownerType == owner && it.entryId in changedIds }
+                .map { it.wireName }
+                .toSet()
+            if (resetNames.isEmpty()) return@forEach
+            val now = clock()
+            val keep: (String) -> Boolean = { it !in resetNames }
+            dropMetricsFromHistory(conversationId, keep, clearStoryState = false, now = now)
+            rebuildStatusPanel(
+                conversationId,
+                keep,
+                clearStoryState = false,
+                definitions = RpEffectiveDefinitions.of(snapshot),
+                now = now,
+            )
+            chatDao.touchConversation(conversationId, now)
+            resetCount++
+        }
+        return resetCount
+    }
+
     // ---------- 设定生成工具 ----------
 
     override suspend fun saveGeneratedSettings(
@@ -312,9 +454,13 @@ class RpRepositoryImpl(
         worldSetting: WorldSettingDraft?,
         writingStyle: WritingStyleProfileDraft?,
         protagonist: ProtagonistDraft?,
+        supportingCharacter: SupportingCharacterDraft?,
         bindToConversationId: String?,
     ): SavedGeneratedSettings {
-        require(roleCard != null || worldSetting != null || writingStyle != null || protagonist != null) {
+        require(
+            roleCard != null || worldSetting != null || writingStyle != null ||
+                protagonist != null || supportingCharacter != null,
+        ) {
             "没有可保存的内容"
         }
         // 工具协议要求主角落到一个会话：它是「为这个故事建的主角」。
@@ -328,6 +474,7 @@ class RpRepositoryImpl(
             val savedWorldSetting = worldSetting?.let { saveWorldSetting(id = null, draft = it) }
             val savedWritingStyle = writingStyle?.let { saveWritingStyleProfile(id = null, draft = it) }
             val savedProtagonist = protagonist?.let { saveProtagonistProfile(id = null, draft = it.toProfileDraft()) }
+            val savedSupporting = supportingCharacter?.let { saveSupportingCharacter(id = null, draft = it) }
 
             var bound = false
             if (bindToConversationId != null && chatDao.getConversation(bindToConversationId) != null) {
@@ -361,6 +508,10 @@ class RpRepositoryImpl(
                 )
                 chatDao.upsertConversationRpSettings(nextEntity)
                 applyBindingTransition(bindToConversationId, previousEntity, nextEntity, now)
+                savedSupporting?.let { saved ->
+                    val selected = chatDao.getConversationSupportingCharacters(bindToConversationId).map { it.id }
+                    chatDao.replaceConversationSupportingCharacters(bindToConversationId, selected + saved.id)
+                }
                 chatDao.touchConversation(bindToConversationId, now)
                 bound = true
             }
@@ -372,6 +523,7 @@ class RpRepositoryImpl(
                 worldSetting = savedWorldSetting,
                 writingStyle = savedWritingStyle,
                 protagonistProfile = savedProtagonist,
+                supportingCharacter = savedSupporting,
                 boundToConversation = bound,
             )
         }
@@ -437,11 +589,66 @@ class RpRepositoryImpl(
         chatDao.touchConversation(conversationId, now)
     }
 
-    override suspend fun syncMetricDefinitionsFromProfiles(conversationId: String): Boolean =
+    override suspend fun syncMetricDefinitionsFromProfiles(
+        conversationId: String,
+        owners: Set<RpEntryOwner>,
+    ): Boolean =
         database.withTransaction {
             val previous = chatDao.getConversationRpSettings(conversationId) ?: return@withTransaction false
-            resyncMetricGroups(previous, setOf(RpEntryOwner.ROLE_CARD, RpEntryOwner.PROTAGONIST))
+            resyncMetricGroups(previous, owners)
         }
+
+    override suspend fun updateMetricValue(
+        conversationId: String,
+        expectedDefinition: RpMetricSnapshot,
+        value: Int,
+    ): RpStatusPanel = database.withTransaction {
+        val settings = chatDao.getConversationRpSettings(conversationId)?.toDomain()
+            ?: error("会话 RP 设置已不存在，请重新打开状态面板")
+        require(expectedDefinition.owner == expectedDefinition.ownerType.storageValue && expectedDefinition.entryId.isNotBlank()) {
+            "状态条身份无效，请重新打开状态面板"
+        }
+        val definition = settings.metricSnapshot.singleOrNull {
+            it.owner == expectedDefinition.owner && it.entryId == expectedDefinition.entryId
+        }
+        require(definition == expectedDefinition) { "状态条定义已变化，请重新打开编辑" }
+        val bound = when (expectedDefinition.ownerType) {
+            RpEntryOwner.ROLE_CARD -> settings.roleCardId?.let { chatDao.getRoleCard(it) } != null
+            RpEntryOwner.PROTAGONIST -> settings.protagonistProfileId?.let { chatDao.getProtagonistProfile(it) } != null
+        }
+        require(bound) { "这项状态条的档案已解绑或删除，请重新打开状态面板" }
+        val current = chatDao.getRpStatusPanel(conversationId)?.toDomain()
+        val metrics = RpMetricStateUpdates.correct(current?.metrics.orEmpty(), expectedDefinition, value)
+        val now = maxOf(clock(), (current?.updatedAtMillis ?: 0L) + 1L)
+        val corrected = RpStatusPanel(
+            conversationId = conversationId,
+            metrics = metrics,
+            relationship = current?.relationship.orEmpty(),
+            scene = current?.scene.orEmpty(),
+            rawJson = "",
+            updatedAtMillis = now,
+        )
+        chatDao.upsertRpStatusPanel(corrected.toEntity())
+        chatDao.getLatestCompletedAssistant(conversationId, ChatRole.ASSISTANT, MessageStatus.COMPLETED)?.let { assistant ->
+            val previous = chatDao.getMessageRpMetadataForMessage(assistant.id)
+            chatDao.upsertMessageRpMetadata(
+                MessageRpMetadataEntity(
+                    messageId = assistant.id,
+                    conversationId = conversationId,
+                    optionsJson = previous?.optionsJson ?: "[]",
+                    innerThought = previous?.innerThought.orEmpty(),
+                    metricsJson = repositoryJson.encodeToString(corrected.metrics),
+                    relationship = corrected.relationship,
+                    scene = corrected.scene,
+                    rawJson = "",
+                    createdAtMillis = previous?.createdAtMillis ?: now,
+                    updatedAtMillis = maxOf(now, (previous?.updatedAtMillis ?: 0L) + 1L),
+                ),
+            )
+        }
+        chatDao.touchConversation(conversationId, now)
+        corrected
+    }
 
     override suspend fun forkProtagonistProfileForConversation(
         conversationId: String,
@@ -497,17 +704,27 @@ class RpRepositoryImpl(
         if (snapshot == oldSnapshot) return false
 
         val now = clock()
-        // entryId → 旧 wireName：档案里改过名的条按身份找回原值，不因改名归零（R14）。
-        val previousNames = oldSnapshot.associate { it.entryId to it.wireName }
-        val definitions = RpEffectiveDefinitions.of(snapshot)
         chatDao.upsertConversationRpSettings(
             previous.copy(
                 metricSnapshotJson = RpEntryCodec.encodeSnapshot(snapshot),
                 updatedAtMillis = now,
             ),
         )
-        migrateStatusSnapshots(conversationId, definitions, previousNames, now)
-        alignStatusPanel(conversationId, definitions, previousNames, now)
+        migrateStatusSnapshots(conversationId, oldSnapshot, snapshot, owners, now)
+        val currentPanel = chatDao.getRpStatusPanel(conversationId)?.toDomain()
+        val metrics = RpMetricStateUpdates.resync(currentPanel?.metrics.orEmpty(), oldSnapshot, snapshot, owners)
+        if (currentPanel?.metrics != metrics) {
+            chatDao.upsertRpStatusPanel(
+                RpStatusPanel(
+                    conversationId = conversationId,
+                    metrics = metrics,
+                    relationship = currentPanel?.relationship.orEmpty(),
+                    scene = currentPanel?.scene.orEmpty(),
+                    rawJson = "",
+                    updatedAtMillis = now,
+                ).toEntity(),
+            )
+        }
         chatDao.touchConversation(conversationId, now)
         return true
     }
@@ -680,18 +897,20 @@ class RpRepositoryImpl(
     /** 历史快照里的状态条按与当前面板相同的规则对齐；关系、场景、剧情建议与内心独白不动。 */
     private suspend fun migrateStatusSnapshots(
         conversationId: String,
-        definitions: List<RpMetricDefinition>,
-        previousNames: Map<String, String>,
+        before: List<RpMetricSnapshot>,
+        after: List<RpMetricSnapshot>,
+        owners: Set<RpEntryOwner>,
         now: Long,
     ) {
         chatDao.getMessageRpMetadata(conversationId).forEach { row ->
             val metrics = row.toDomain().statusPanelSnapshot?.metrics.orEmpty()
             if (metrics.isEmpty()) return@forEach
-            val aligned = RpStateMerger.alignToDefinitions(definitions, metrics, previousNames)
+            val aligned = RpMetricStateUpdates.resync(metrics, before, after, owners)
             if (aligned == metrics) return@forEach
             chatDao.upsertMessageRpMetadata(
                 row.copy(
                     metricsJson = repositoryJson.encodeToString(aligned),
+                    rawJson = "",
                     updatedAtMillis = now,
                 ),
             )

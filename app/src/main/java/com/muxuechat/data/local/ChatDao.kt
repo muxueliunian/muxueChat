@@ -45,6 +45,12 @@ data class ProtagonistProfileUsageRow(
     val conversationCount: Int,
 )
 
+/** 一个配角被多少个会话勾选（RP-3c）。 */
+data class SupportingCharacterUsageRow(
+    val characterId: String,
+    val conversationCount: Int,
+)
+
 @Dao
 interface ChatDao {
     @Query("SELECT * FROM conversations ORDER BY updatedAtMillis DESC")
@@ -139,15 +145,16 @@ interface ChatDao {
     suspend fun getRpTurnConfigurationSnapshot(
         conversationId: String,
         statusBeforeMessageId: String? = null,
+        includePausedBindings: Boolean = false,
     ): RpTurnConfigurationSnapshot {
         val settings = getConversationRpSettings(conversationId)
         val roleCard = settings
-            ?.takeIf { it.isRpEnabled }
+            ?.takeIf { it.isRpEnabled || includePausedBindings }
             ?.roleCardId
             ?.let { getRoleCard(it) }
         val persistedStatusPanel = getRpStatusPanel(conversationId)
         val protagonistProfile = settings
-            ?.takeIf { it.isRpEnabled }
+            ?.takeIf { it.isRpEnabled || includePausedBindings }
             ?.protagonistProfileId
             ?.let { getProtagonistProfile(it) }
         return RpTurnConfigurationSnapshot(
@@ -215,6 +222,9 @@ interface ChatDao {
 
     @Query("SELECT * FROM message_rp_metadata WHERE conversationId = :conversationId")
     suspend fun getMessageRpMetadata(conversationId: String): List<MessageRpMetadataEntity>
+
+    @Query("SELECT * FROM message_rp_metadata WHERE messageId = :messageId")
+    suspend fun getMessageRpMetadataForMessage(messageId: String): MessageRpMetadataEntity?
 
     @Upsert
     suspend fun upsertConversation(conversation: ConversationEntity)
@@ -337,6 +347,28 @@ interface ChatDao {
     @Query("DELETE FROM conversation_supporting_characters WHERE conversationId = :conversationId")
     suspend fun clearConversationSupportingCharacters(conversationId: String)
 
+    @Query(
+        """
+        SELECT supportingCharacterId AS characterId, COUNT(*) AS conversationCount
+        FROM conversation_supporting_characters
+        GROUP BY supportingCharacterId
+        """,
+    )
+    fun observeSupportingCharacterUsage(): Flow<List<SupportingCharacterUsageRow>>
+
+    @Query(
+        """
+        SELECT supportingCharacterId AS characterId, COUNT(*) AS conversationCount
+        FROM conversation_supporting_characters
+        GROUP BY supportingCharacterId
+        """,
+    )
+    suspend fun getSupportingCharacterUsageRows(): List<SupportingCharacterUsageRow>
+
+    /** 设定工具统计每项被几个会话使用（`list_rp_settings`）。 */
+    @Query("SELECT * FROM conversation_rp_settings")
+    suspend fun getAllConversationRpSettings(): List<ConversationRpSettingsEntity>
+
     @Insert
     suspend fun insertConversationSupportingCharacters(links: List<ConversationSupportingCharacterEntity>)
 
@@ -368,6 +400,21 @@ interface ChatDao {
 
     @Query("UPDATE conversations SET title = :title, updatedAtMillis = :updatedAtMillis WHERE id = :conversationId")
     suspend fun updateConversationTitle(conversationId: String, title: String, updatedAtMillis: Long)
+
+    /** 迟到的 AI 标题不得覆盖请求期间的会话修改；检查与写入必须在同一条 SQL 内完成。 */
+    @Query(
+        """
+        UPDATE conversations SET title = :title, updatedAtMillis = :updatedAtMillis
+        WHERE id = :conversationId AND title = :expectedTitle AND updatedAtMillis = :expectedUpdatedAtMillis
+        """,
+    )
+    suspend fun updateConversationTitleIfUnchanged(
+        conversationId: String,
+        expectedTitle: String,
+        expectedUpdatedAtMillis: Long,
+        title: String,
+        updatedAtMillis: Long,
+    ): Int
 
     @Query("UPDATE conversations SET updatedAtMillis = :updatedAtMillis WHERE id = :conversationId")
     suspend fun touchConversation(conversationId: String, updatedAtMillis: Long)
@@ -581,6 +628,7 @@ interface ChatDao {
         statusPanel: RpStatusPanelEntity?,
         missingStateMessage: String?,
         updatedAtMillis: Long,
+        expectedMetadata: MessageRpMetadataEntity? = null,
     ): Boolean {
         if (getConversation(expectedMessage.conversationId) == null) return false
         if (getMessage(expectedMessage.id) != expectedMessage) return false
@@ -620,15 +668,30 @@ interface ChatDao {
             }
         val currentPanel = getRpStatusPanel(expectedMessage.conversationId)
         val panelUnchanged = currentPanel == expectedStatusPanel
+        val ownMetadata = getMessageRpMetadataForMessage(expectedMessage.id)
+        val ownSnapshotChanged = ownMetadata != expectedMetadata
+        // 调度补写前的读库也可能与手动修正交错：期望 metadata 已读到修正，冻结面板却仍是旧的。
+        // 这种情况下自身检查点是更晚的事实；即使随后一轮已完成，也不得重新用旧请求计算的状态替换。
+        val ownSnapshotAlreadyCorrected = expectedMetadata != null && !expectedMetadata.hasStatusOf(expectedStatusPanel)
         if (metadata != null) {
-            // 面板被别处改过（例如手动修正）且之后没有新回复时，这条回复之后的真实状态就是库里那份，
-            // 快照必须跟它一致，否则以后从这里回滚会悄悄撤销那次修改。与本条是否仍是最新对话消息无关：
-            // 用户改完值又发了下一句，下一句还没完成时同样适用。剧情建议与内心独白照常保存。
+            // 手动修正更新的是这条回复自己的检查点；即使后一轮已经完成，也必须保留它。
+            // 不能从当前面板反推这条历史回复的状态，否则会把未来一轮写进过去。
+            val snapshot = when {
+                ownSnapshotChanged || ownSnapshotAlreadyCorrected -> metadata.copy(
+                    metricsJson = ownMetadata?.metricsJson ?: EMPTY_METRICS_JSON,
+                    relationship = ownMetadata?.relationship.orEmpty(),
+                    scene = ownMetadata?.scene.orEmpty(),
+                    rawJson = ownMetadata?.rawJson.orEmpty(),
+                )
+                !panelUnchanged && !laterReplyCommitted -> metadata.withStatusOf(currentPanel)
+                else -> metadata
+            }
             upsertMessageRpMetadata(
-                if (!panelUnchanged && !laterReplyCommitted) metadata.withStatusOf(currentPanel) else metadata,
+                snapshot,
             )
         }
-        val panelWritten = statusPanel != null && panelUnchanged && !laterReplyCommitted && !laterTurnInFlight
+        val panelWritten = statusPanel != null && panelUnchanged && !ownSnapshotChanged && !ownSnapshotAlreadyCorrected &&
+            !laterReplyCommitted && !laterTurnInFlight
         if (statusPanel != null && panelWritten) {
             upsertRpStatusPanel(statusPanel)
         }
@@ -679,8 +742,8 @@ interface ChatDao {
                 )
             }
         }
-        // null 只表示 RP 未启用（暂停或未绑卡），面板保持原样——暂停不等于重置。
-        // RP 启用时调用方总会传切点状态，角色卡没有状态条也一样。
+        // 暂停仅改变生成方式；人工改写历史仍传入切点状态，不能保留已失效的未来状态。
+        // 没有任何绑定档案时才可能没有切点面板。
         rollbackStatusPanel?.let { upsertRpStatusPanel(it) }
         deleteConversationContext(conversationId)
         touchConversation(conversationId, updatedAtMillis)
@@ -704,7 +767,7 @@ interface ChatDao {
  * 最新一条回复的 RP 派生数据的唯一写入规则，普通完成与历史替换共用。
  *
  * [rpStatusPanel] 为 null 表示本轮不改面板：普通完成时是正文没带状态（等补写），
- * 历史替换时是 RP 未启用——暂停 RP 不等于重置状态。RP 启用时历史替换总会传入切点状态，
+ * 历史替换时是没有可用绑定——暂停 RP 本身不重置，但暂停期间历史变更仍传入切点状态，
  * 角色卡没有状态条也一样（关系与场景要回滚）。
  */
 private suspend fun ChatDao.applyRpStateOfLatestReply(
@@ -737,6 +800,11 @@ private fun MessageRpMetadataEntity.withStatusOf(panel: RpStatusPanelEntity?): M
     rawJson = panel?.rawJson.orEmpty(),
 )
 
+private fun MessageRpMetadataEntity.hasStatusOf(panel: RpStatusPanelEntity?): Boolean =
+    metricsJson == (panel?.metricsJson ?: EMPTY_METRICS_JSON) &&
+        relationship == panel?.relationship.orEmpty() && scene == panel?.scene.orEmpty() &&
+        rawJson == panel?.rawJson.orEmpty()
+
 private const val EMPTY_METRICS_JSON = "[]"
 
 private suspend fun ChatDao.matchesRpConfiguration(
@@ -747,7 +815,7 @@ private suspend fun ChatDao.matchesRpConfiguration(
     val currentRpSettings = getConversationRpSettings(conversationId)
     if (currentRpSettings != expectedRpSettings) return false
     val activeRoleCardId = currentRpSettings
-        ?.takeIf { it.isRpEnabled }
+        ?.takeIf { it.isRpEnabled || expectedRoleCard != null }
         ?.roleCardId
     return activeRoleCardId?.let { getRoleCard(it) } == expectedRoleCard
 }

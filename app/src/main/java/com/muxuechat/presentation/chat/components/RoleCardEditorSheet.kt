@@ -45,7 +45,6 @@ fun RoleCardEditorSheet(
     var persona by remember(initialDraft) { mutableStateOf(initialDraft.persona) }
     var speakingStyle by remember(initialDraft) { mutableStateOf(initialDraft.speakingStyle) }
     var userIdentity by remember(initialDraft) { mutableStateOf(initialDraft.userIdentity) }
-    var openingMessage by remember(initialDraft) { mutableStateOf(initialDraft.openingMessage) }
     var boundaries by remember(initialDraft) { mutableStateOf(initialDraft.boundaries) }
     val initialTextEntries = remember(initialDraft) { initialDraft.textEntries.map(RpEntryDrafts::textFrom) }
     val initialNumericEntries = remember(initialDraft) {
@@ -67,7 +66,6 @@ fun RoleCardEditorSheet(
         persona != initialDraft.persona ||
         speakingStyle != initialDraft.speakingStyle ||
         userIdentity != initialDraft.userIdentity ||
-        openingMessage != initialDraft.openingMessage ||
         boundaries != initialDraft.boundaries ||
         textEntries != initialTextEntries ||
         numericEntries != initialNumericEntries
@@ -100,7 +98,6 @@ fun RoleCardEditorSheet(
                                 persona = persona.trim(),
                                 speakingStyle = speakingStyle.trim(),
                                 userIdentity = userIdentity.trim(),
-                                openingMessage = openingMessage.trim(),
                                 boundaries = boundaries.trim(),
                                 metricDefinitions = RpEntryDrafts.toMetricDefinitions(numericEntries),
                                 textEntries = RpEntryDrafts.toTextEntries(textEntries),
@@ -164,15 +161,6 @@ fun RoleCardEditorSheet(
                 minLines = 2,
                 maxLines = 6,
                 placeholder = "角色眼中你是谁（身份、关系、昵称）",
-            )
-
-            FormField(
-                label = "开场白",
-                value = openingMessage,
-                onValueChange = { openingMessage = it },
-                minLines = 2,
-                maxLines = 8,
-                placeholder = "角色第一次出场的话",
             )
 
             FormField(

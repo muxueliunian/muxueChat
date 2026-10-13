@@ -2,6 +2,10 @@ package com.muxuechat.domain.tool
 
 import com.muxuechat.domain.model.ProtagonistDraft
 import com.muxuechat.domain.model.RoleCardDraft
+import com.muxuechat.domain.model.RpEntry
+import com.muxuechat.domain.model.RpSettingKind
+import com.muxuechat.domain.model.RpSettingRef
+import com.muxuechat.domain.model.SupportingCharacterDraft
 import com.muxuechat.domain.model.RpMetricDefinition
 import com.muxuechat.domain.model.WorldSettingDraft
 import com.muxuechat.domain.model.WritingStyleProfileDraft
@@ -19,6 +23,28 @@ import java.util.UUID
 sealed interface SettingsToolParseResult {
     data class Success(val draft: SettingsToolDraft) : SettingsToolParseResult
     data class Failure(val reason: String) : SettingsToolParseResult
+
+    /** [SettingsTool.LIST_RP_SETTINGS]：要列出的类型，空集合表示全部。 */
+    data class ListRequest(val kinds: Set<RpSettingKind>) : SettingsToolParseResult
+
+    /**
+     * [SettingsTool.DELETE_RP_SETTINGS]：解析出的删除目标（已去重）。
+     * id 是否存在要查库，由调用方解析后再生成删除请求草稿。
+     */
+    data class DeleteRequest(val refs: List<RpSettingRef>, val warnings: List<String>) : SettingsToolParseResult
+
+    /** [SettingsTool.GET_RP_SETTING]：要读取的一项。 */
+    data class GetRequest(val ref: RpSettingRef) : SettingsToolParseResult
+
+    /**
+     * [SettingsTool.UPDATE_RP_SETTING]：目标与修改内容。字段是否适用于该类型、
+     * 修改后是否真的有变化，要读出原设定后由 [RpSettingPatcher] 判断。
+     */
+    data class UpdateRequest(
+        val ref: RpSettingRef,
+        val patch: RpSettingPatch,
+        val warnings: List<String>,
+    ) : SettingsToolParseResult
 }
 
 /**
@@ -39,11 +65,40 @@ class SettingsToolArgumentParser(
         argumentsJson: String,
         conversationId: String?,
     ): SettingsToolParseResult {
+        // 列表工具没有必填参数，模型常常只给空串。
+        if (tool == SettingsTool.LIST_RP_SETTINGS && argumentsJson.isBlank()) {
+            return SettingsToolParseResult.ListRequest(emptySet())
+        }
         val root = parseObject(argumentsJson)
             ?: return SettingsToolParseResult.Failure("模型返回的${toolLabel(tool)}参数不是合法 JSON。")
 
         val warnings = mutableListOf<String>()
         val draft = when (tool) {
+            SettingsTool.LIST_RP_SETTINGS -> return parseListRequest(root)
+            SettingsTool.DELETE_RP_SETTINGS -> return parseDeleteRequest(root)
+            SettingsTool.GET_RP_SETTING ->
+                return parseTarget(root)?.let(SettingsToolParseResult::GetRequest) ?: targetFailure()
+            SettingsTool.UPDATE_RP_SETTING -> return parseUpdateRequest(root)
+
+            SettingsTool.CREATE_SUPPORTING_CHARACTER -> {
+                val name = root.string("name").normalizeName(MAX_NAME_LENGTH, warnings, "配角名称")
+                if (name.isBlank()) {
+                    return SettingsToolParseResult.Failure("模型没有给出配角名称，无法创建配角。")
+                }
+                SettingsToolDraft(
+                    id = idGenerator(),
+                    tool = tool,
+                    conversationId = conversationId,
+                    supportingCharacter = SupportingCharacterDraft(
+                        name = name,
+                        description = root.string("description").limit(MAX_TEXT_LENGTH, warnings, "配角简介"),
+                        entries = parseTextEntries(root["entries"], warnings),
+                    ),
+                    warnings = warnings,
+                    createdAtMillis = clock(),
+                )
+            }
+
             SettingsTool.CREATE_ROLE_CARD -> {
                 val name = root.string("name").normalizeName(MAX_NAME_LENGTH, warnings, "角色名称")
                 if (name.isBlank()) {
@@ -59,7 +114,6 @@ class SettingsToolArgumentParser(
                         persona = root.string("persona").limit(MAX_LONG_TEXT_LENGTH, warnings, "人设描述"),
                         speakingStyle = root.string("speaking_style").limit(MAX_TEXT_LENGTH, warnings, "说话风格"),
                         userIdentity = root.string("user_identity").limit(MAX_TEXT_LENGTH, warnings, "用户身份"),
-                        openingMessage = root.string("opening_message").limit(MAX_TEXT_LENGTH, warnings, "开场白"),
                         boundaries = root.string("boundaries").limit(MAX_TEXT_LENGTH, warnings, "边界"),
                         metricDefinitions = parseMetricDefinitions(root["metric_definitions"], warnings),
                     ),
@@ -132,6 +186,124 @@ class SettingsToolArgumentParser(
         }
 
         return SettingsToolParseResult.Success(draft)
+    }
+
+    private fun parseListRequest(root: JsonObject): SettingsToolParseResult {
+        val types = root["types"] as? JsonArray ?: return SettingsToolParseResult.ListRequest(emptySet())
+        val names = types.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+        val kinds = names.mapNotNull(RpSettingKind::fromApiName).toSet()
+        val unknown = names.filter { RpSettingKind.fromApiName(it) == null }
+        if (unknown.isNotEmpty()) {
+            return SettingsToolParseResult.Failure(
+                "不认识的类型：${unknown.joinToString("、")}。可用类型：${RpSettingKind.entries.joinToString("、") { it.apiName }}。",
+            )
+        }
+        return SettingsToolParseResult.ListRequest(kinds)
+    }
+
+    private fun parseDeleteRequest(root: JsonObject): SettingsToolParseResult {
+        val targets = root["targets"] as? JsonArray
+        if (targets.isNullOrEmpty()) {
+            return SettingsToolParseResult.Failure("没有给出要删除的设定（targets 为空）。")
+        }
+        val warnings = mutableListOf<String>()
+        if (targets.size > MAX_DELETE_TARGETS) {
+            return SettingsToolParseResult.Failure("一次最多删除 $MAX_DELETE_TARGETS 项，请分批请求。")
+        }
+        val refs = mutableListOf<RpSettingRef>()
+        targets.forEachIndexed { index, item ->
+            val obj = item as? JsonObject
+            val kind = RpSettingKind.fromApiName(obj?.string("type"))
+            val id = obj?.string("id")?.trim().orEmpty()
+            if (kind == null || id.isBlank()) {
+                return SettingsToolParseResult.Failure(
+                    "第 ${index + 1} 项缺少合法的 type 或 id。type 可用：" +
+                        RpSettingKind.entries.joinToString("、") { it.apiName } + "。",
+                )
+            }
+            val ref = RpSettingRef(kind, id)
+            if (ref in refs) warnings += "重复的删除目标已合并：${kind.label} $id。" else refs += ref
+        }
+        return SettingsToolParseResult.DeleteRequest(refs, warnings)
+    }
+
+    private fun parseTarget(root: JsonObject): RpSettingRef? {
+        val kind = RpSettingKind.fromApiName(root.string("type")) ?: return null
+        val id = root.string("id").trim().takeIf { it.isNotEmpty() } ?: return null
+        return RpSettingRef(kind, id)
+    }
+
+    private fun targetFailure() = SettingsToolParseResult.Failure(
+        "缺少合法的 type 或 id。type 可用：${RpSettingKind.entries.joinToString("、") { it.apiName }}；" +
+            "id 请用 list_rp_settings 查询。",
+    )
+
+    private fun parseUpdateRequest(root: JsonObject): SettingsToolParseResult {
+        val ref = parseTarget(root) ?: return targetFailure()
+        val warnings = mutableListOf<String>()
+        val fields = buildMap {
+            UPDATE_FIELD_KEYS.forEach { key ->
+                val raw = (root[key] as? JsonPrimitive)?.contentOrNull ?: return@forEach
+                val isName = key == "name" || key == "title"
+                val limit = when {
+                    isName -> MAX_NAME_LENGTH
+                    key == "persona" || key == "content" -> MAX_LONG_TEXT_LENGTH
+                    else -> MAX_TEXT_LENGTH
+                }
+                put(key, if (isName) raw.normalizeName(limit, warnings, key) else raw.limit(limit, warnings, key))
+            }
+        }
+        val textEntries = (root["set_text_entries"] as? JsonArray).orEmpty().mapNotNull { item ->
+            val obj = item as? JsonObject ?: return@mapNotNull null
+            val name = obj.string("name").trim().replace(NEWLINE_REGEX, " ").take(MAX_NAME_LENGTH)
+            val value = obj.string("value").trim().take(MAX_TEXT_LENGTH)
+            when {
+                name.isBlank() -> null
+                value.isBlank() -> {
+                    warnings += "词条「$name」内容为空，已忽略；要删除词条请用 remove_entries。"
+                    null
+                }
+                else -> name to value
+            }
+        }.distinctBy { it.first }
+        val metrics = (root["set_metrics"] as? JsonArray).orEmpty().mapNotNull { item ->
+            val obj = item as? JsonObject ?: return@mapNotNull null
+            val name = obj.string("name").trim().replace(NEWLINE_REGEX, " ").take(MAX_NAME_LENGTH)
+            if (name.isBlank()) return@mapNotNull null
+            MetricPatch(
+                name = name,
+                minValue = obj.int("min_value"),
+                maxValue = obj.int("max_value"),
+                initialValue = obj.int("initial_value"),
+                description = obj.optionalString("description")?.trim()?.take(MAX_TEXT_LENGTH),
+                progressRule = obj.optionalString("progress_rule")?.trim()?.take(MAX_TEXT_LENGTH),
+            )
+        }.distinctBy { it.name }
+        val removals = (root["remove_entries"] as? JsonArray).orEmpty()
+            .mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotEmpty) }
+            .distinct()
+        val patch = RpSettingPatch(fields, textEntries, metrics, removals)
+        if (patch.isEmpty) {
+            return SettingsToolParseResult.Failure("没有给出任何要修改的内容。只需给出要改的字段或词条。")
+        }
+        return SettingsToolParseResult.UpdateRequest(ref, patch, warnings)
+    }
+
+    private fun parseTextEntries(
+        element: kotlinx.serialization.json.JsonElement?,
+        warnings: MutableList<String>,
+    ): List<RpEntry.Text> {
+        val array = element as? JsonArray ?: return emptyList()
+        if (array.size > MAX_TEXT_ENTRIES) {
+            warnings += "模型给出了 ${array.size} 条词条，已保留前 $MAX_TEXT_ENTRIES 条。"
+        }
+        return array.take(MAX_TEXT_ENTRIES).mapNotNull { item ->
+            val obj = item as? JsonObject ?: return@mapNotNull null
+            val name = obj.string("name").trim().replace(NEWLINE_REGEX, " ").take(MAX_NAME_LENGTH)
+            val value = obj.string("value").trim().take(MAX_TEXT_LENGTH)
+            if (name.isBlank() || value.isBlank()) return@mapNotNull null
+            RpEntry.Text(id = idGenerator(), name = name, value = value)
+        }
     }
 
     /** 兼容模型偶尔把参数包在 Markdown 代码围栏里的情况。 */
@@ -208,6 +380,8 @@ class SettingsToolArgumentParser(
     private fun JsonObject.string(key: String): String =
         (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
 
+    private fun JsonObject.optionalString(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
+
     private fun JsonObject.int(key: String): Int? {
         val primitive = this[key] as? JsonPrimitive ?: return null
         return primitive.intOrNull ?: primitive.contentOrNull?.trim()?.toIntOrNull()
@@ -235,6 +409,11 @@ class SettingsToolArgumentParser(
         SettingsTool.CREATE_WORLD_SETTING -> "世界观"
         SettingsTool.CREATE_WRITING_STYLE -> "文风"
         SettingsTool.CREATE_PROTAGONIST -> "主角"
+        SettingsTool.CREATE_SUPPORTING_CHARACTER -> "配角"
+        SettingsTool.LIST_RP_SETTINGS -> "设定列表"
+        SettingsTool.GET_RP_SETTING -> "设定详情"
+        SettingsTool.UPDATE_RP_SETTING -> "修改请求"
+        SettingsTool.DELETE_RP_SETTINGS -> "删除请求"
     }
 
     private companion object {
@@ -248,6 +427,12 @@ class SettingsToolArgumentParser(
         const val MAX_TEXT_LENGTH = 4_000
         const val MAX_LONG_TEXT_LENGTH = 20_000
         const val MAX_METRIC_DEFINITIONS = 12
+        const val MAX_TEXT_ENTRIES = 30
+        const val MAX_DELETE_TARGETS = 50
+        val UPDATE_FIELD_KEYS = listOf(
+            "name", "title", "description", "persona", "speaking_style",
+            "user_identity", "boundaries", "content",
+        )
         const val DEFAULT_METRIC_MIN = 0
         const val DEFAULT_METRIC_MAX = 100
     }

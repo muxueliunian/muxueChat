@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
@@ -83,13 +84,13 @@ class ChatRepositoryTokenUsageTest {
 
     // ---------- 发送内容 ----------
 
-    /** 规划结果就是请求体：历史逐条按序出现，一条不多一条不少。 */
+    /** 关闭工具时，规划结果就是请求体：历史逐条按序出现，一条不多一条不少。 */
     @Test
     fun sentMessages_matchThePlannedContext() = runBlocking {
         seedHistory()
         val recorder = RequestRecorder()
         val repository = repository(
-            settings = ChatSettings(streamEnabled = false),
+            settings = ChatSettings(streamEnabled = false, settingsToolsEnabled = false),
             interceptor = recorder.respondingWith(CHAT_RESPONSE_WITH_USAGE),
         )
 
@@ -104,6 +105,7 @@ class ChatRepositoryTokenUsageTest {
             ),
             sent,
         )
+        assertFalse(recorder.request().containsKey("tools"))
     }
 
     /** system prompt 也来自同一份规划，不再由请求层单独拼。 */
@@ -112,7 +114,11 @@ class ChatRepositoryTokenUsageTest {
         seedHistory()
         val recorder = RequestRecorder()
         val repository = repository(
-            settings = ChatSettings(streamEnabled = false, systemPrompt = "你是助手"),
+            settings = ChatSettings(
+                streamEnabled = false,
+                systemPrompt = "你是助手",
+                settingsToolsEnabled = false,
+            ),
             interceptor = recorder.respondingWith(CHAT_RESPONSE_WITH_USAGE),
         )
 
@@ -121,14 +127,43 @@ class ChatRepositoryTokenUsageTest {
         assertEquals("system" to "你是助手", recorder.messages().first())
     }
 
+    /** 工具开启时，说明补在同一条 system 消息里，用户提示词和历史仍完整保留。 */
+    @Test
+    fun settingsToolsEnabled_preservesSystemPromptAndHistory() = runBlocking {
+        seedHistory()
+        val recorder = RequestRecorder()
+        val repository = repository(
+            settings = ChatSettings(
+                streamEnabled = false,
+                systemPrompt = "你是助手",
+                settingsToolsEnabled = true,
+            ),
+            interceptor = recorder.respondingWith(CHAT_RESPONSE_WITH_USAGE),
+        )
+
+        repository.sendMessage(CONVERSATION_ID, "新问题").toList()
+
+        val sent = recorder.messages()
+        assertEquals(listOf("system", "user", "assistant", "user"), sent.map { it.first })
+        assertTrue(sent.first().second.startsWith("你是助手\n\n"))
+        assertTrue(sent.first().second.contains("## 可用工具"))
+        assertEquals(
+            listOf("user" to "原问题", "assistant" to "原回复", "user" to "新问题"),
+            sent.drop(1),
+        )
+        assertTrue(recorder.request().getValue("tools").jsonArray.isNotEmpty())
+    }
+
     // ---------- 用量采集 ----------
 
     @Test
     fun nonStreamingResponse_persistsUsageWithProviderAndModel() = runBlocking {
         seedHistory()
+        val settings = ChatSettings(streamEnabled = false)
+        val recorder = RequestRecorder()
         val repository = repository(
-            settings = ChatSettings(streamEnabled = false),
-            interceptor = RequestRecorder().respondingWith(CHAT_RESPONSE_WITH_USAGE),
+            settings = settings,
+            interceptor = recorder.respondingWith(CHAT_RESPONSE_WITH_USAGE),
         )
 
         repository.sendMessage(CONVERSATION_ID, "新问题").toList()
@@ -139,7 +174,8 @@ class ChatRepositoryTokenUsageTest {
         assertEquals(816, usage?.completionTokens)
         assertEquals(13_918, usage?.totalTokens)
         assertEquals(ChatProviderId.DEEPSEEK.storageValue, usage?.providerKey)
-        assertEquals("deepseek-v4-flash", usage?.model)
+        assertEquals(settings.activeModel, recorder.request().getValue("model").jsonPrimitive.content)
+        assertEquals(settings.activeModel, usage?.model)
         assertEquals(950_000L, usage?.effectiveContextTokens)
     }
 
@@ -256,11 +292,33 @@ class ChatRepositoryTokenUsageTest {
         seedHistory()
         val repository = repository(settings = ChatSettings(), interceptor = null)
 
-        val plan = repository.observeContextWindow(CONVERSATION_ID).first()
+        val plan = withTimeout(CONTEXT_FLOW_TIMEOUT_MILLIS) {
+            repository.observeContextWindow(CONVERSATION_ID).first()
+        }
 
         assertEquals(945_904L, plan.inputBudgetTokens)
         assertEquals(2, plan.totalHistoryMessageCount)
         assertNull(plan.overflowError)
+    }
+
+    /** 新会话可选记录缺失时，Room 也必须发出 null，不能让组合 Flow 一直等首值。 */
+    @Test
+    fun contextSources_emitNullWhenOptionalRowsAreMissing() = runBlocking {
+        seedHistory()
+        val dao = database.chatDao()
+
+        assertNull(withTimeout(CONTEXT_FLOW_TIMEOUT_MILLIS) {
+            dao.observeConversationContext(CONVERSATION_ID).first()
+        })
+        assertNull(withTimeout(CONTEXT_FLOW_TIMEOUT_MILLIS) {
+            dao.observeConversationRpSettings(CONVERSATION_ID).first()
+        })
+        assertNull(withTimeout(CONTEXT_FLOW_TIMEOUT_MILLIS) {
+            dao.observeRpStatusPanel(CONVERSATION_ID).first()
+        })
+        assertNull(withTimeout(CONTEXT_FLOW_TIMEOUT_MILLIS) {
+            dao.observeConversationTokenUsage(CONVERSATION_ID).first()
+        })
     }
 
     // ---------- 测试脚手架 ----------
@@ -284,9 +342,11 @@ class ChatRepositoryTokenUsageTest {
 
         fun lastBody(): String = bodies.last()
 
+        fun request(): JsonObject = Json.parseToJsonElement(lastBody()).jsonObject
+
         /** 请求体里的 messages，按 (role, content) 展开，便于逐条比对。 */
         fun messages(): List<Pair<String, String>> {
-            val root = Json.parseToJsonElement(lastBody()).jsonObject
+            val root = request()
             return root.getValue("messages").jsonArray.map { element ->
                 val message = element.jsonObject
                 message.getValue("role").jsonPrimitive.content to
@@ -431,6 +491,7 @@ class ChatRepositoryTokenUsageTest {
 
     private companion object {
         const val CONVERSATION_ID = "conversation"
+        const val CONTEXT_FLOW_TIMEOUT_MILLIS = 5_000L
 
         const val CHAT_RESPONSE_WITH_USAGE = """
             {"choices":[{"message":{"role":"assistant","content":"新回复"}}],

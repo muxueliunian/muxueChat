@@ -99,7 +99,11 @@ data class RoleCardEntity(
     val persona: String,
     val speakingStyle: String,
     val userIdentity: String,
-    val openingMessage: String,
+    /**
+     * 已废弃（用户 2026-09-25 决定去掉开场白）：不再读取，保存时一律写空串，
+     * 旧内容随之丢弃。列本身等旧列清理的那次迁移一起删除，不为它单独升库版本。
+     */
+    val openingMessage: String = "",
     val boundaries: String,
     /**
      * v9 的数值定义。**已停用为取证材料**：唯一读源是 [entriesJson]。
@@ -120,7 +124,6 @@ data class RoleCardEntity(
         persona = persona,
         speakingStyle = speakingStyle,
         userIdentity = userIdentity,
-        openingMessage = openingMessage,
         boundaries = boundaries,
         entries = RpEntryCodec.decodeEntries(entriesJson).entries,
         createdAtMillis = createdAtMillis,
@@ -419,7 +422,6 @@ fun RoleCard.toEntity() = RoleCardEntity(
     persona = persona,
     speakingStyle = speakingStyle,
     userIdentity = userIdentity,
-    openingMessage = openingMessage,
     boundaries = boundaries,
     metricDefinitionsJson = entityJson.encodeToString(metricDefinitions),
     entriesJson = RpEntryCodec.encodeEntries(entries),

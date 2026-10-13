@@ -7,7 +7,6 @@ data class RoleCard(
     val persona: String,
     val speakingStyle: String,
     val userIdentity: String,
-    val openingMessage: String,
     val boundaries: String,
     /**
      * 文本词条与数值词条的统一存储（RP-1 起是唯一读源）。
@@ -32,7 +31,6 @@ data class RoleCardDraft(
     val persona: String = "",
     val speakingStyle: String = "",
     val userIdentity: String = "",
-    val openingMessage: String = "",
     val boundaries: String = "",
     val metricDefinitions: List<RpMetricDefinition> = emptyList(),
     val textEntries: List<RpEntry.Text> = emptyList(),

@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.Groups
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.outlined.TheaterComedy
@@ -54,6 +55,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
+import com.muxuechat.domain.model.SupportingCharacter
+import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.model.RpMarkerMode
 import com.muxuechat.domain.model.RpNarrativePerspective
 import com.muxuechat.domain.model.RpPlotSuggestionPerspective
@@ -78,6 +81,7 @@ fun RpSettingsSheet(
     initialWorldSettingId: String?,
     initialWritingStyleId: String?,
     initialProtagonistProfileId: String?,
+    initialSupportingCharacterIds: List<String>,
     initialNarrativeMinChars: Int,
     initialNarrativePerspective: RpNarrativePerspective,
     initialPlotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -87,6 +91,7 @@ fun RpSettingsSheet(
     draftWorldSettingId: String?,
     draftWritingStyleId: String?,
     draftProtagonistProfileId: String?,
+    draftSupportingCharacterIds: List<String>,
     draftNarrativeMinCharsText: String,
     draftNarrativePerspective: RpNarrativePerspective,
     draftPlotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -100,11 +105,16 @@ fun RpSettingsSheet(
     protagonistProfiles: List<ProtagonistProfile>,
     /** 档案 id → 绑定它的会话数。 */
     protagonistProfileUsage: Map<String, Int>,
+    supportingCharacters: List<SupportingCharacter>,
+    supportingCharacterUsage: Map<String, Int>,
+    /** 按整份草稿规划的上下文；null 表示还没算出来。 */
+    draftContextPlan: ContextWindowPlan?,
     onDraftRpEnabledChange: (Boolean) -> Unit,
     onDraftRoleCardIdChange: (String?) -> Unit,
     onDraftWorldSettingIdChange: (String?) -> Unit,
     onDraftWritingStyleIdChange: (String?) -> Unit,
     onDraftProtagonistProfileIdChange: (String?) -> Unit,
+    onDraftSupportingCharacterIdsChange: (List<String>) -> Unit,
     onDraftNarrativeMinCharsTextChange: (String) -> Unit,
     onDraftNarrativePerspectiveChange: (RpNarrativePerspective) -> Unit,
     onDraftPlotSuggestionPerspectiveChange: (RpPlotSuggestionPerspective) -> Unit,
@@ -115,6 +125,8 @@ fun RpSettingsSheet(
         worldSettingId: String?,
         writingStyleId: String?,
         protagonistProfileId: String?,
+        // 勾选没变时为 null，保存时不动关联表。
+        supportingCharacterIds: List<String>?,
         narrativeMinChars: Int,
         narrativePerspective: RpNarrativePerspective,
         plotSuggestionPerspective: RpPlotSuggestionPerspective,
@@ -126,6 +138,8 @@ fun RpSettingsSheet(
     onCreateProtagonist: () -> Unit,
     onEditProtagonist: (ProtagonistProfile) -> Unit,
     onDeleteProtagonist: (ProtagonistProfile) -> Unit,
+    onCreateSupportingCharacter: () -> Unit,
+    onEditSupportingCharacter: (SupportingCharacter) -> Unit,
     onCreateWorldSetting: () -> Unit,
     onEditWorldSetting: (WorldSetting) -> Unit,
     onDeleteWorldSetting: (WorldSetting) -> Unit,
@@ -133,6 +147,7 @@ fun RpSettingsSheet(
     onEditWritingStyle: (WritingStyleProfile) -> Unit,
     onDeleteWritingStyle: (WritingStyleProfile) -> Unit,
     onDismiss: () -> Unit,
+    metricSyncContent: @Composable () -> Unit = {},
 ) {
     val effectiveDraftRpMarkerMode = if (showRpMarkerOption && isRpMarkerAvailable) {
         draftRpMarkerMode
@@ -145,6 +160,7 @@ fun RpSettingsSheet(
         draftWorldSettingId != initialWorldSettingId ||
         draftWritingStyleId != initialWritingStyleId ||
         draftProtagonistProfileId != initialProtagonistProfileId ||
+        draftSupportingCharacterIds != initialSupportingCharacterIds ||
         draftNarrativeMinCharsText.toNarrativeMinChars() != initialNarrativeMinChars ||
         draftNarrativePerspective != initialNarrativePerspective ||
         draftPlotSuggestionPerspective != initialPlotSuggestionPerspective ||
@@ -164,6 +180,7 @@ fun RpSettingsSheet(
                         draftWorldSettingId,
                         draftWritingStyleId,
                         draftProtagonistProfileId,
+                        draftSupportingCharacterIds.takeIf { it != initialSupportingCharacterIds },
                         draftNarrativeMinCharsText.toNarrativeMinChars(),
                         draftNarrativePerspective,
                         draftPlotSuggestionPerspective,
@@ -208,6 +225,22 @@ fun RpSettingsSheet(
                 onCreate = onCreateProtagonist,
                 onEdit = onEditProtagonist,
                 onDelete = onDeleteProtagonist,
+            )
+            metricSyncContent()
+
+            SectionTitle(
+                icon = Icons.Outlined.Groups,
+                title = "配角",
+            )
+            RpSupportingCharacterSection(
+                characters = supportingCharacters,
+                usage = supportingCharacterUsage,
+                selectedIds = draftSupportingCharacterIds,
+                isRpEnabled = draftRpEnabled,
+                draftPlan = draftContextPlan,
+                onSelectedIdsChange = onDraftSupportingCharacterIdsChange,
+                onCreate = onCreateSupportingCharacter,
+                onEdit = onEditSupportingCharacter,
             )
 
             SectionTitle(
