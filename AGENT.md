@@ -6,6 +6,8 @@
 
 - 所有交流、总结、注释性文档优先使用中文。
 - 用户系统环境是 Windows 11，常用开发环境是 Android Studio。
+- Windows 命令默认使用 PowerShell 7（`pwsh`）。验证直接比较实际字段或字节；非必要不计算 SHA256 或其他哈希/指纹。交接必须保留这项约束。
+- 当前唯一界面目标机型是用户的 realme Neo7（2026-10-02 确认），不扩展其它机型或分辨率验收矩阵；仍需处理同机显示缩放、系统栏与键盘，不把物理像素当作 Compose 布局尺寸。
 - 本项目是个人使用 App，不做账号系统、云同步、埋点、推送通知、多用户权限或后台服务，且 App 自身不部署、运维或代理后台服务。
 - App 可以作为客户端调用用户自行配置的 OpenAI 兼容 `chat/completions` 端点（自定义供应商，可保存多个，允许 http 或 https）；这些服务本身的部署、账号、OAuth 登录与运维均不在本项目范围内（唯一例外见 §2「xAI 订阅登录例外」）。
 - 本项目只考虑 Android 16 及以上：
@@ -35,6 +37,8 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 - 上游是谁（OpenAI、任意中转）与 App 无关：除上述 xAI 例外外，App 的边界只到 OpenAI 兼容协议本身，不直接适配任何厂商的私有协议、私有字段或 SDK。
 - 自定义供应商下不发送 DeepSeek 的 `thinking` 对象或 RP Marker；只有全局“设定生成工具”开关和当前供应商的“启用标准工具调用”开关都开启时，才在非 RP 正文请求中发送标准 OpenAI `tools` / `tool_choice` 并处理 `tool_calls`。不得按具体厂商写特判。
 - 自定义供应商的思考等级走 OpenAI 系的顶层 `reasoning_effort` 字段，取值由用户自行填写，App 不做枚举校验（各家档位不统一）。留空时**必须完全不发送该字段**——不支持思考的模型收到未知字段可能直接 400。
+- 自定义供应商的输出预算字段由用户选择 `max_tokens` 或 `max_completion_tokens`，每次只发一个；旧配置默认 `max_tokens`。正文与内部请求使用相同字段策略、各自预算。xAI 适配器继续读取内部 `maxTokens` 后翻译为已实测字段。
+- 自定义供应商可显式配置合法的 `x-` 会话标识头，值为本 App 的稳定会话 ID，正文、工具续轮、摘要、标题及 RP 辅助请求一致。默认不发、不按厂商名称或地址启用，不发送到 xAI OAuth 链路；客户端标识使用 `muxueChat/1.0`。
 - `reasoning_effort` 只随正文对话发送；RP 元数据、状态兜底、上下文摘要一律不发。
 - 每个自定义供应商的 API Key 与 DeepSeek API Key 分别保存，各占独立的 Android Keystore alias；删除供应商必须同时删除其 Key。
 - App 默认不实现、发起、保存或复用任何 OAuth：不得包含 OAuth client ID、授权码、access token、refresh token、Cookie 或第三方 CLI 的登录身份，用户只能填写服务已签发的 API Key。**唯一例外是 xAI 订阅登录**（用户 2026-09-22 批准），边界如下：
@@ -162,7 +166,7 @@ com.muxuechat
 - 上层协议严格限于两条：DeepSeek 专属协议与 OpenAI 兼容协议。自定义供应商共用后者的同一套 DTO 与 RequestFactory，不允许按供应商名称新增代码分支；两条协议均可承载标准 function tools，但 DeepSeek 私有 thinking/RP Marker 绝不进入 OpenAI 兼容请求。
 - OpenAI 兼容协议的**传输**由一个接口承载，默认实现是 `OpenAiCompatibleClient`（标准 `POST {base}/chat/completions`）。按 §2 的 xAI 例外，允许存在第二个实现：xAI 订阅链路的 Responses 适配器，入口同样是这个接口，翻译全部封在实现内部。**调用方不得知道自己拿到的是哪个实现**，也不得因此改变请求 DTO 的构造方式。
 - 适配器只做协议翻译，不得引入新的上层概念：它接收同一个 OpenAI 兼容请求 DTO，产出同一套流式事件与用量快照（`input_tokens`/`output_tokens` 必须归一化为 `prompt_tokens`/`completion_tokens`）。
-- 线上格式**只能依据 `docs/XAI_WIRE_FORMAT.md` 的实测记录实现**。该文档 §5.4 列出的未采集场景（截断、错误事件、流中取消、429、无终止事件断流）**不得凭 OpenAI Responses 的经验猜测**：未采集的事件一律走保守兜底（未知事件忽略、缺终止事件按失败处理并给可读文案），不得臆造字段语义。
+- 线上格式**只能依据 `docs/XAI_WIRE_FORMAT.md` 的实测记录实现**。该文档 §3.4 / §5.5 列出的未采集场景（截断、错误事件、流中取消、429、无终止事件断流）**不得凭 OpenAI Responses 的经验猜测**：未采集的事件一律走保守兜底（未知事件忽略、缺终止事件按失败处理并给可读文案），不得臆造字段语义。
 - `OpenAiCompatibleClient` 请求用户配置的 `http(s)://` 端点；除 §2 的 xAI 例外外，不允许 App 内 OAuth。地址仍不得包含 user-info、query 或 fragment。
 - 对自定义 OpenAI 兼容供应商，上游服务的 OAuth、令牌刷新、部署和运维均由该服务自身负责，App 不参与。
 - `GET {base}/models` 只用于填充模型选择列表；服务不支持时必须优雅降级到手填，不能阻断聊天。
