@@ -66,6 +66,10 @@ dependencies {
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
 
+    // 聊天正文的 Markdown 渲染（原生 Compose，不走 WebView/TextView）。
+    // 固定 0.37.0：它基于 Kotlin 2.2.20 / Compose 1.9，与本项目工具链一致；更新版本要求 Kotlin 2.3+。
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.37.0")
+
     implementation("com.squareup.okhttp3:okhttp:5.3.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")

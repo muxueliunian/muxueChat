@@ -136,8 +136,6 @@ fun MessageList(
             autoFollowOutput = true
             hasNewContentWhileAway = false
             listState.scrollToItem(bottomAnchorIndex)
-        } else if (!autoFollowOutput) {
-            hasNewContentWhileAway = true
         }
     }
 
@@ -145,22 +143,22 @@ fun MessageList(
         if (autoFollowOutput) hasNewContentWhileAway = false
     }
 
+    // 只由消息变化触发提示；开始拖动或松手不代表收到了新内容。
+    // 拖动期间也记录真实变化，避免等到松手时漏掉已经到达的回复。
+    LaunchedEffect(bottomAnchorIndex, lastVisibleMessage) {
+        if (lastVisibleMessage != null && !autoFollowOutput) {
+            hasNewContentWhileAway = true
+        }
+    }
+
     LaunchedEffect(
         autoFollowOutput,
         userScrollActive,
         bottomAnchorIndex,
-        lastVisibleMessage?.id,
-        lastVisibleMessage?.content?.length,
-        lastVisibleMessage?.reasoningContent?.length,
-        lastVisibleMessage?.status,
-        lastVisibleMessage?.errorMessage?.length,
-        lastVisibleMessage?.updatedAtMillis,
-        lastVisibleMessage?.rpMetadata?.updatedAtMillis,
+        lastVisibleMessage,
     ) {
         if (autoFollowOutput && !userScrollActive && visible.isNotEmpty()) {
             listState.scrollToItem(bottomAnchorIndex)
-        } else if (!autoFollowOutput && !userScrollActive) {
-            hasNewContentWhileAway = true
         }
     }
 

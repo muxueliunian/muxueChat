@@ -23,9 +23,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.*
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material.icons.outlined.MoreHoriz
+import androidx.compose.material.icons.outlined.Lightbulb
+import androidx.compose.foundation.layout.offset
+import com.muxuechat.presentation.theme.MinIconTouchTarget
+import com.muxuechat.presentation.theme.Spacing
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -37,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.ChatMessage
 import com.muxuechat.domain.model.ChatRole
 import com.muxuechat.domain.model.MessageStatus
+import com.muxuechat.domain.rp.RpStateBlockFormat
 
 @Composable
 fun MessageItem(
@@ -83,7 +85,10 @@ private fun UserMessage(
     onEditUserMessage: (ChatMessage) -> Unit,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            // 左侧固定留白：手机上长消息也保持气泡形态，和整宽的回复正文区分开。
+            .padding(start = Spacing.Section * 2),
         horizontalArrangement = Arrangement.End,
     ) {
         val bubbleShape = com.muxuechat.presentation.theme.Corner.Bubble
@@ -99,7 +104,7 @@ private fun UserMessage(
                         Modifier
                     },
                 )
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = Spacing.Content, vertical = Spacing.Medium),
         ) {
             Text(
                 text = message.content,
@@ -125,12 +130,16 @@ private fun AssistantMessage(
     onEditAssistantMessage: () -> Unit,
 ) {
     val streaming = message.status == MessageStatus.STREAMING || message.status == MessageStatus.PENDING
+    // RP 状态块在回复完成时才从正文剥离；流式期间和被中途停止的回复里，显示层先把它藏掉。
+    val content = remember(message.content, streaming) {
+        RpStateBlockFormat.stripForDisplay(message.content, isStreaming = streaming)
+    }
     val metadata = message.rpMetadata
     val innerThought = metadata?.innerThought?.takeIf { it.isNotBlank() }
     val options = metadata?.options?.filter { it.isNotBlank() }.orEmpty()
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(Spacing.Small),
     ) {
         if (!message.reasoningContent.isNullOrBlank()) {
             ReasoningSection(
@@ -138,17 +147,18 @@ private fun AssistantMessage(
                 messageKey = message.id,
             )
         }
-        if (message.content.isNotBlank()) {
-            SelectionContainer { Text(
-                text = message.content,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.fillMaxWidth(),
-            ) }
+        if (content.isNotBlank()) {
+            SelectionContainer {
+                MarkdownText(
+                    content = content,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
         } else if (streaming) {
             TypingIndicator(modifier = Modifier.padding(vertical = 4.dp))
         }
-        if (streaming && message.content.isNotBlank()) {
+        if (streaming && content.isNotBlank()) {
             TypingIndicator(modifier = Modifier.padding(top = 2.dp))
         }
         if (innerThought != null) {
@@ -190,9 +200,9 @@ private fun AssistantMessage(
         if (!streaming && canRegenerate && (message.status == MessageStatus.FAILED || message.status == MessageStatus.CANCELLED)) {
             TextButton(onClick = onRegenerate, enabled = !isGenerating) { Text("重试这条回复") }
         }
-        if (!streaming && !isGenerating && message.content.isNotBlank()) {
+        if (!streaming && !isGenerating && content.isNotBlank()) {
             MessageActionsRow(
-                onCopy = { onCopy(message.content) },
+                onCopy = { onCopy(content) },
                 onEdit = onEditAssistantMessage,
                 onRegenerate = if (canRegenerate) onRegenerate else null,
                 onRetryRpOptions = if (canRetryRpOptions) onRetryRpOptions else null,
@@ -310,21 +320,38 @@ private fun MessageActionsRow(
     onRetryRpOptions: (() -> Unit)?,
     isRetryingRpOptions: Boolean,
 ) {
-    var expanded by remember { mutableStateOf(false) }
-    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        ActionPill(Icons.Outlined.ContentCopy, "复制", onClick = onCopy)
-        Box {
-            ActionPill(Icons.Outlined.MoreHoriz, "更多", onClick = { expanded = true })
-            DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
-                DropdownMenuItem(text = { Text("编辑正文") }, onClick = { expanded = false; onEdit() })
-                onRegenerate?.let {
-                    DropdownMenuItem(text = { Text("重新生成") }, onClick = { expanded = false; it() })
-                }
-            }
-        }
+    // 图标按钮自带内边距，整行左移同样的量，让第一个图标与正文左缘对齐。
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.offset(x = -Spacing.Medium),
+    ) {
+        ActionIcon(Icons.Outlined.ContentCopy, "复制", onClick = onCopy)
+        ActionIcon(Icons.Outlined.Edit, "编辑正文", onClick = onEdit)
+        onRegenerate?.let { ActionIcon(Icons.Outlined.Refresh, "重新生成", onClick = it) }
         onRetryRpOptions?.let {
-            ActionPill(Icons.Outlined.Refresh, if (isRetryingRpOptions) "建议补写中" else "重试建议", !isRetryingRpOptions, it)
+            ActionPill(
+                icon = Icons.Outlined.Lightbulb,
+                label = if (isRetryingRpOptions) "建议补写中" else "重试建议",
+                enabled = !isRetryingRpOptions,
+                onClick = it,
+            )
         }
+    }
+}
+
+@Composable
+private fun ActionIcon(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    IconButton(onClick = onClick, modifier = Modifier.size(MinIconTouchTarget)) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 
