@@ -1,6 +1,6 @@
 # muxueChat 缺陷修复任务清单
 
-状态：核心修复已实施并通过主机构建/JVM 验证；API 36 设备测试与手工矩阵待完成  
+状态：核心修复通过主机构建/JVM 验证；2026-10-02 已在 realme Neo7 保数据覆盖安装并冷启动；API 36 设备测试与手工业务矩阵待完成
 建立日期：2026-08-10  
 适用基线：当前 main 分支  
 范围：已确认缺陷 + 第二优先级优化
@@ -14,6 +14,44 @@
 - `[ ]`：尚未实施，或只完成了其中一部分。
 
 ## 0. 本轮实施与验证结果
+
+### 2026-10-02：OAuth、RP 收尾与标准供应商兼容
+
+本轮以当前工作区为基线保留原有未提交修改，未提交 Git。用户确认 RP 沿用既定规划；暂停期间改写历史须回滚状态。界面唯一目标机型为 realme Neo7。Command Code GOAT / OpenCode Go、Go Plus 只覆盖其 Chat Completions 模型，用户尚未订阅并明确接受代码及模拟验收，不以真实连通性作为本轮完成条件。
+
+| 要求 | 实现及验证证据 |
+| --- | --- |
+| xAI 旧请求不跨登录账号重试 | `ProviderRequestSnapshot` / `ChatTransportRouter` / `XaiAuthRepository` 使用登录世代租约；认证、冻结、路由、目录 5 类 JVM 测试覆盖退出换号、401、目录写回、初始化错误/取消、登录与登出竞态 |
+| xAI 终止事件与参数真实生效 | `XaiResponsesTransportTest` 覆盖缺失 response/status 的残缺 completed；工厂测试核对采样字段省略，设置页说明暂不支持；未猜测未采集事件 |
+| RP-3d 同步与默认主角 | `RpMetricDefinitionDiff` / `RpMetricStateUpdates`、DataStore 及 `RpSettingsDraftTest` 覆盖按组/身份保值、两种新会话、已解绑不覆盖、默认档案删除失效；同步按钮和 VM 回调已接线 |
+| RP-3e 文字修正 | 面板按角色/主角分组；`RpMetricEditPolicyTest` 覆盖空串、负号、越界与无身份项只读；`RpBindingTransitionTest` 增加事务修正、定义过期、范围与检查点用例（设备执行待补） |
+| RP 历史与迟到补写一致 | `RpDerivedDataIntegrityTest` 修改暂停回滚预期，覆盖自身快照被修正、下一轮先完成、调度前窗口及两类正常首轮（设备执行待补）；生产捕获/提交已接线；编辑回调携带来源会话 ID，拒绝跨会话混合帧 |
+| 预计上下文及时刷新 | 新 `ChatRepositoryContextWindowTest` 先复现角色正文改动后等待超时，再补角色卡观察信号；修复后三项通过 |
+| OpenAI 请求及响应完整性 | `OpenAiCompatibleProtocolIntegrityTest`、工厂和存储测试覆盖输出预算字段互斥、两目标 URL 前缀/模型目录、客户端标识/稳定会话头、refusal、错误清理、工具校验及 usage-only 尾块 |
+| 真实 Repository 的协议闭环 | `ChatRepositoryOpenAiCompletionTest` 六项含模式矩阵：工具片段 EOF 失败、不执行工具；length/filter 保留正文并失败；refusal 展示；tools→result→正文及用量落库；截断/过滤/拒绝摘要不写入、不推进 coveredMessageCount，正常 stop 对照确实推进 |
+
+主机验证：
+
+- `:app:testDebugUnitTest`：538 项，0 failure、0 error、0 skipped。
+- `:app:compileDebugAndroidTestKotlin`、`:app:assembleDebug`：成功。
+- `:app:lintDebug`：成功；本轮新增的 Compose 提示已清理，最终 0 error、31 warning、0 hint，剩余为依赖更新、旧图标与 SharedPreferences 建议。
+- `git diff --check`：通过；验证比较实际字段/字节，没有计算哈希或指纹。
+- APK：`app/build/outputs/apk/debug/app-debug.apk`。
+
+测试全用合成凭据、消息与 HTTP/SSE 响应，不请求真实计费接口。上述主机验证结束时 ADB 无设备；随后用户连接 RMX5060 并要求准备安装，安装结果见下一节。Room 事务、Keystore 生命周期及 Compose/键盘/显示缩放的专项设备验收仍未执行，不能将 Android 测试编译通过或安装成功当作业务验收通过。后续真机工作继续遵守 `RP_2_HANDOFF.md` 的保留安装与用户数据约束。其它机型/分辨率不在本轮验收范围。
+
+### 2026-10-02：realme Neo7 保数据升级与 UI 规划
+
+- 设备实测：RMX5060（realme Neo7），Android 16 / API 36，物理尺寸 1264×2780、当前密度 560 dpi、系统字体倍率 1.0；逻辑宽度约 361 dp，界面可用高度须扣除系统栏/键盘。
+- 安装前再次执行 `:app:assembleDebug`，38 个任务均 up-to-date，构建成功；本次未修改应用代码，也未重复宣称执行过上一轮的 538 项测试。
+- 备份目录：`C:\Users\atlas\Desktop\LLMChat-db-backup\2026-10-02-160438-before-oauth-rp-upgrade\`。保留旧 `previous-base.apk`，以及 databases/files/shared_prefs 的原始 tar；其中凭据仍为应用保存的密文，未输出内容。备份档案不进入 Git。
+- 升级前数据库：schema v10；17 个会话、174 条消息、5 张角色卡、3 个世界观、4 个主角档案、1 个配角、9 条会话 RP 配置；`quick_check` 正常，外键错误 0。只检查结构和条数，不输出消息/角色正文。
+- `adb install -r` 返回 `Success`；没有卸载、清数据或执行 instrumentation。APK 为 76,834,806 bytes，`versionName=1.0 / versionCode=1` 仍是既有调试版本号；旧、新 APK 直接比较字节确认内容不同，不能仅用版本号或文件大小区分。本次安装时间为 **2026-10-02 16:05:51（Asia/Tokyo）**。
+- 首次启动前重新导出同一批数据：**56 个文件逐字节一致，新增/缺失/变更均为 0**。比较记录在备份目录的 `verification-install.json`；没有计算哈希或指纹。
+- `am start -W` 返回 `Status: ok / LaunchState: COLD`，启动约 793 ms；复查进程仍在，当前进程 crash buffer 未见 `FATAL EXCEPTION`。这只证明本次安装/启动检查，不能替代长时间稳定性、OAuth 或 RP 业务验收。
+- 本轮 UI 仅规划，详见 `ROADMAP.md` 的「realme Neo7 UI 优化规划」。优先状态面板、RP 设定选择和错误重试；真实页面/键盘/显示缩放操作留作 UI-0 基线与后续分阶段验收，不据源码推断设备效果。
+
+下面保留此前各轮的验证记录，数量不代表本轮测试总数。
 
 截至 2026-08-10，本轮已完成 FIX-01～FIX-12 的代码实现，并新增覆盖数据完整性、历史替换、流式压力、生成生命周期、RP 一致性、设置并发、凭据迁移和网络安全边界的回归测试。
 
@@ -35,6 +73,46 @@
 - `:app:mergeDebugAndroidTestAssets`：`8.json`、`9.json` 已进入 androidTest assets。
 - 本次未重跑 `:app:assembleDebug` 与 `:app:lintDebug`；设备侧 instrumentation 仍未执行（本机仍无 API 36 设备或镜像）。
 - 本次修复：`ChatContextPlanner.planCompaction` 在历史条数为奇数、切点达到上限时不再直接放弃压缩，改为退回上一个 user 边界，并补充回归测试。
+
+### 2026-10-02：真机失败记录复核与测试预期修正
+
+- `docs/RP_2_HANDOFF.md` 记录过 `ChatRepositoryTokenUsageTest` 的 3 项失败，以及
+  `observeContextWindow_emitsWithoutOpeningAnyPanel` 等待期间设备息屏杀进程。
+  未找到当时完整的失败明细；后续 65 项通过的真机报告只覆盖 RP 相关的 4 个测试类，不包含此类。
+- 已确认该测试类的三处预期落后于当前行为：默认模型仍断言旧名；两个消息测试使用默认开启的工具，
+  却没有把附加的工具说明计入 system 消息。修正为显式关闭工具的精确消息断言，另补工具开启时
+  保留用户 system prompt、历史顺序并实际发送工具定义的用例；持久化模型同时对照请求模型与本轮设置。
+- 2026-10-02 核对 [DeepSeek 官方更新日志](https://api-docs.deepseek.com/zh-cn/updates/)
+  与 [模型文档](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)：V4.1 Flash 的 API ID 为
+  `deepseek-flash`，项目默认值已正确；旧 Flash 名只作为兼容/迁移输入，不应作为默认模型预期。
+- 上下文观察用例增加 5 秒等待上限，另补 Room 可选行缺失时发出 null 的定位用例。
+  超时保护仅改测试，不代表生产 Flow 的历史等待问题已修复。
+- 新增 `ChatRepositoryContextWindowTest`，用真实 Repository 和可控 DAO 流验证可选记录缺失时的首值、
+  同一订阅收到新消息后的重算；严格测试替身禁止写库及凭据访问。这不替代 Android Room 运行时验收。
+- 验证：全量 `:app:testDebugUnitTest` 通过；去除与行为无关的调用次数断言后，新增 2 项定向复测全部通过；
+  `:app:compileDebugAndroidTestKotlin` 与 `git diff --check` 通过。本轮只修改测试和此进度记录，未改生产代码。
+- 当前 ADB 无设备，**尚未复跑该类的 instrumentation**，历史卡住问题仍待复验。
+  连接 Android 16 设备后应优先只跑此类，并保留 App 安装及数据；具体约束见 `docs/RP_2_HANDOFF.md` 第 3 节。
+
+### 2026-10-02：AI 命名并发保护与消息列表体验
+
+- 新增 `ChatRepositoryConversationTitleTest`，用真实 Repository/API Client 和暂停的模拟响应复现：
+  请求期间手动改名会被迟到的 AI 标题覆盖，删除会话后仍返回命名成功。修复前 3 项测试中 2 项失败，
+  正常命名通过；修复后 3 项全部通过。测试凭据与消息均为合成数据，没有请求真实服务。
+- `ChatRepositoryImpl` 在命名请求前保存会话快照，`ChatDao.updateConversationTitleIfUnchanged`
+  在同一条 SQL 内核对标题和更新时间，再更新标题；会话有改动或已删除时不保存，并返回中文原因。
+  不新增数据表或迁移。`ConversationTitleUpdateTest` 补充实际 Room 的 4 个用例：正常更新、
+  同时间戳改标题、同标题改时间戳、会话删除；当前只完成编译，设备执行待补。
+- `ChatViewModel`、`ChatUiState`、`ConversationDrawer` 贯通 AI 命名中的会话集合，抽屉持续显示
+  “正在生成标题…”，禁用重复点击；请求结束、失败或取消后清理状态。
+- `MessageList` 把新内容提示与滚动动作分开：拖拽开始/松手不再触发“有新内容”，
+  拖拽期间收到实际消息变化仍会记录。`ChatScreen` 按会话 ID 重建列表并过滤切换期间的旧消息，
+  避免继承另一会话的滚动位置和跟随状态；切换会话后从底部开始，本轮不保存逐会话滚动位置。
+- 验证：标题定向 JVM 测试通过；全量 `:app:testDebugUnitTest` 为 488 项，0 failure、0 error、0 skipped；
+  `:app:assembleDebug`、`:app:compileDebugAndroidTestKotlin` 与 `git diff --check` 均通过。
+- 当前 ADB 无设备，Room 条件更新和 Compose 手势尚未在真机运行。待验收：静态历史上滑只显示
+  “回到底部”；离底/拖动期间收到新内容时正确提示；A/B 会话切换；AI 命名期间手动改名或删除会话。
+  上一节记录的历史 instrumentation 卡住问题仍待复验，不因本轮主机测试通过而关闭。
 
 ## 1. 目标
 
@@ -192,6 +270,7 @@
 
 实施要求：
 
+- 以下旧 RP 目标已被 `RP_ACTOR_PLAN.md` 的分组生命周期与冻结定义规则取代，后续实施以该文档最新记录为准，不能再整张清除仍有主角绑定的面板。
 - 在单个 Room 事务内找出所有绑定该角色卡的会话。
 - 对受影响会话清空 roleCardId、关闭 RP，并删除当前 rp_status_panels。
 - 保留历史消息正文；历史 message_rp_metadata 是否保留仅用于历史展示，应在实现中明确且不得继续影响当前状态。
@@ -353,11 +432,14 @@
 优先级：P2  
 主要文件：
 
-- app/src/main/java/com/muxuechat/data/repository/ChatRepositoryImpl.kt:250-269
-- app/src/main/java/com/muxuechat/data/local/ChatDao.kt
+- app/src/main/java/com/muxuechat/data/repository/ChatRepositoryImpl.kt 的 `editAssistantMessage`（原记 250-269 行已过时）
+- app/src/main/java/com/muxuechat/data/local/ChatDao.kt 的 `editAssistantAndInvalidateDerivedData`、`clearConversationAndDerivedData`
 - app/src/main/java/com/muxuechat/domain/context/ContextWindowPlanner.kt:82-100（该文件已于 2026-09 删除，对应逻辑现位于 `ChatContextPlanner.kt`）
 
-确认问题：
+当前状态（2026-10-09 核对）：下列「确认问题」为发现时的旧逻辑，已修复并提交（HEAD 中有上述 DAO 事务及
+`RpDerivedDataIntegrityTest` 的编辑 / 清空失效用例）。保持 `[~]` 是因为设备验收未做；工作区另有未提交的 RP-3d/3e 相关修正。
+
+确认问题（发现时）：
 
 - editAssistantMessage 只更新正文和状态。
 - 旧 message_rp_metadata 会继续拼回 UI。
@@ -442,11 +524,15 @@
 优先级：P2  
 主要文件：
 
-- app/src/main/java/com/muxuechat/data/local/SettingsDataStore.kt:104-136
-- app/src/main/java/com/muxuechat/data/repository/SettingsRepositoryImpl.kt:142-149
+- app/src/main/java/com/muxuechat/data/local/SettingsDataStore.kt 的 `prepareLegacyCliProxyProviderMigration`、`completeLegacyCliProxyProviderMigration`（原记 104-136 行已过时）
+- app/src/main/java/com/muxuechat/data/repository/SettingsRepositoryImpl.kt 中调用上述迁移的启动流程（原记 142-149 行已过时）
 - EncryptedCliProxyApiKeyStore 与 EncryptedProviderKeyStore
 
-确认问题：
+当前状态（2026-10-09 核对）：pending / completed 状态机（`LEGACY_MIGRATION_STATE`）、稳定的 `targetProviderId`、
+写后读回校验均已在 HEAD 中实现，androidTest 有 `SettingsMigrationAndCredentialConcurrencyTest`。下列「确认问题」为发现时的旧逻辑。
+保持 `[~]` 是因为尚未确认测试覆盖了「每个迁移步骤中断」，且设备验收未做。
+
+确认问题（发现时）：
 
 - DataStore 先写 LEGACY_MIGRATED=true 和新 Provider。
 - Key 复制在之后执行。
