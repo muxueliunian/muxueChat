@@ -4,6 +4,7 @@ import com.muxuechat.data.local.ChatDao
 import com.muxuechat.data.local.ConversationEntity
 import com.muxuechat.data.local.ConversationContextEntity
 import com.muxuechat.data.local.ConversationTokenUsageEntity
+import com.muxuechat.data.local.MessageAttachmentEntity
 import com.muxuechat.data.local.MessageEntity
 import com.muxuechat.data.local.RpStateCommitResult
 import com.muxuechat.data.local.RpTurnConfigurationSnapshot
@@ -241,6 +242,8 @@ class ChatRepositoryOpenAiCompletionTest {
                 "getConversation" -> conversation
                 "getMessage" -> messages[args[0] as String]
                 "getMessages" -> messages.values.sortedBy { it.createdAtMillis }
+                // 这些用例都是纯文本会话：没有任何图片附件。
+                "getAttachments" -> emptyList<MessageAttachmentEntity>()
                 "getConversationRpSettings", "getConversationTokenUsage" -> null
                 "getConversationContext" -> context
                 "upsertConversationContext" -> {

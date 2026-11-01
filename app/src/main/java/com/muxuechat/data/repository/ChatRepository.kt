@@ -99,4 +99,11 @@ interface ChatRepository {
     suspend fun deleteConversation(conversationId: String)
     suspend fun renameConversation(conversationId: String, title: String)
     suspend fun clearConversation(conversationId: String)
+
+    /**
+     * 启动孤儿图片扫描（MULTIMODAL_PLAN 3.1）：删除库里不再引用的图片文件与过期的待发送图片。
+     * 每个进程只真正执行一次（重复调用直接返回）；在数据库打开之后、持有附件锁时执行，
+     * 失败只记日志，不影响聊天。
+     */
+    suspend fun removeOrphanImagesOncePerProcess()
 }

@@ -26,9 +26,10 @@ class ChatImageStore(
      * 发送 / 编辑的「移动文件 + 提交事务」与启动孤儿扫描共用的锁。
      *
      * rename 会保留文件原来的修改时间，按时间判断保护不住「刚移入正式目录、事务还没提交」的文件，
-     * 所以扫描期间必须完全排除移动与提交。
+     * 所以扫描期间必须完全排除移动与提交。锁是**进程级**的：Activity 重建会换一个 ViewModel 与
+     * Repository（也就换了一个本类实例），旧实例收尾中的提交仍须与新实例的扫描互斥。
      */
-    val commitLock = Mutex()
+    val commitLock: Mutex get() = PROCESS_COMMIT_LOCK
 
     private val imagesDir: File get() = File(filesDir, IMAGES_DIR)
     private val pendingDir: File get() = File(imagesDir, PENDING_DIR)
@@ -97,6 +98,10 @@ class ChatImageStore(
     /**
      * 删除数据库不再引用的正式图片、过期的待发送图片与残留的临时文件。返回删除的文件数。
      *
+     * 未被引用的正式图片还要超过 [ORPHAN_GRACE_MILLIS] 才删：编辑消息时新图在请求开始前就已移入
+     * 正式目录（[promotePending] 会把修改时间刷新为当前），要等生成成功、提交事务后才被引用。
+     * 只靠 [commitLock] 保护不住这段「已移入、未提交」的窗口——它跨越整次网络请求，不在锁内。
+     *
      * 调用方必须持有 [commitLock]，并在数据库打开之后、按进程只执行一次。
      */
     fun removeOrphans(referencedPaths: Set<String>): Int {
@@ -106,7 +111,8 @@ class ChatImageStore(
             if (!file.isFile) return@forEach
             val relativePath = "$IMAGES_DIR/${file.name}"
             val stale = when {
-                file.name.endsWith(EXTENSION) -> relativePath !in referencedPaths
+                file.name.endsWith(EXTENSION) ->
+                    relativePath !in referencedPaths && now - file.lastModified() > ORPHAN_GRACE_MILLIS
                 file.name.endsWith(TEMP_SUFFIX) -> now - file.lastModified() > PENDING_TTL_MILLIS
                 else -> false
             }
@@ -137,6 +143,11 @@ class ChatImageStore(
 
         /** 超过这个时长的待发送图片视为放弃（例如选完图后进程被杀）。 */
         const val PENDING_TTL_MILLIS = 24L * 60 * 60 * 1000
+
+        /** 未被引用的正式图片的宽限期，覆盖编辑时「已移入正式目录、尚未提交」的整次生成。 */
+        const val ORPHAN_GRACE_MILLIS = 60L * 60 * 1000
+
+        private val PROCESS_COMMIT_LOCK = Mutex()
 
         fun newId(): String = UUID.randomUUID().toString()
     }
