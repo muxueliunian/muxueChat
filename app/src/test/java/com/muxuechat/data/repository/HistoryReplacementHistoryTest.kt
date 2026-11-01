@@ -16,7 +16,7 @@ class HistoryReplacementHistoryTest {
             message("a2", ChatRole.ASSISTANT, "待替换回复", createdAt = 4),
         )
 
-        val history = HistoryReplacementHistory.beforeAssistant(messages, "a2")
+        val history = HistoryReplacementHistory.beforeAssistant(messages, "a2").messages
 
         assertEquals(listOf("user", "assistant", "user"), history.map { it.role })
         assertEquals(listOf("第一问", "第一答", "第二问"), history.map { it.content })
@@ -31,7 +31,7 @@ class HistoryReplacementHistoryTest {
             message("a2", ChatRole.ASSISTANT, "旧分支", createdAt = 4),
         )
 
-        val history = HistoryReplacementHistory.throughEditedUser(messages, "u2", "新内容")
+        val history = HistoryReplacementHistory.throughEditedUser(messages, "u2", "新内容").messages
 
         assertEquals(listOf("第一问", "第一答", "新内容"), history.map { it.content })
         assertEquals("旧内容", messages[2].content)
@@ -52,7 +52,7 @@ class HistoryReplacementHistoryTest {
             message("u2", ChatRole.USER, "待编辑", createdAt = 3),
         )
 
-        val history = HistoryReplacementHistory.throughEditedUser(messages, "u2", "已编辑")
+        val history = HistoryReplacementHistory.throughEditedUser(messages, "u2", "已编辑").messages
 
         assertEquals(listOf("可用问题", "已编辑"), history.map { it.content })
     }

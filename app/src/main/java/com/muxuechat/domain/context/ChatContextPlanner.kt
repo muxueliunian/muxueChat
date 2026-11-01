@@ -85,6 +85,8 @@ data class ChatContextInput(
     val spec: ModelContextSpec,
     val policy: ContextCompressionPolicy = ContextCompressionPolicy(),
     val lastApiUsage: ConversationTokenUsage? = null,
+    /** 映射历史时发现文件已丢失、已换成占位的图片张数（缺失检查在 Repository 做，这里只透传给 UI）。 */
+    val missingImageCount: Int = 0,
 )
 
 /**
@@ -123,6 +125,12 @@ data class ContextWindowPlan(
      * 非 null 时**禁止发起网络请求**——与其让服务端回 400，不如在本地说清楚是哪一部分太长。
      */
     val overflowError: String?,
+    /** 本次请求实际携带的图片张数（含本轮）。 */
+    val imageCount: Int = 0,
+    /** 因请求体积上限换成占位的历史图片张数（D8 后这是唯一的省略原因）。 */
+    val omittedImageCount: Int = 0,
+    /** 文件已丢失、换成占位的图片张数。 */
+    val missingImageCount: Int = 0,
 ) {
     val usagePercent: Int
         get() = if (inputBudgetTokens <= 0L) {
@@ -160,7 +168,7 @@ data class ContextCompactionPlan(
     val newCoveredMessageCount: Int,
 ) {
     val charsToSummarize: Int
-        get() = messagesToSummarize.sumOf { it.content.length }
+        get() = messagesToSummarize.sumOf { it.textWithImageNote().length }
 }
 
 /**
@@ -192,15 +200,18 @@ class ChatContextPlanner(
         val uncovered = input.history.drop(coveredCount)
 
         val fixed = estimateFixedCost(input, summaryMessage)
-        val keepFromIndex = findKeepFromIndex(uncovered, fixed.rawTokens, budget)
-        val kept = uncovered.drop(keepFromIndex)
+        val keepFromIndex = findKeepFromIndex(input, uncovered, fixed.rawTokens, budget)
+        // 规划顺序固定（MULTIMODAL_PLAN 3.3）：缺失检查（Repository 映射时）→ 请求体上限 → 估算与裁剪。
+        // 上限只作用于真正会发出去的保留窗口；换成占位只会让估算变小，裁剪结论不受影响。
+        val payload = ImagePayloadBudget.apply(uncovered.drop(keepFromIndex))
+        val kept = payload.messages
 
         val composed = promptComposer.composeStructured(
             context = buildPromptContext(input, listOfNotNull(summaryMessage) + kept),
             protocol = input.protocol,
         )
 
-        val historyRaw = kept.sumOf { HeuristicTokenEstimator.estimateMessage(it) }
+        val historyRaw = kept.sumOf { input.estimate(it) }
         val totalRaw = fixed.rawTokens + historyRaw
         val estimated = HeuristicTokenEstimator.withSafetyMargin(totalRaw)
 
@@ -218,6 +229,9 @@ class ChatContextPlanner(
             summaryInvalidated = input.summaryState.hasSummary && !useSummary &&
                 policy.mode != ContextCompressionMode.OFF,
             overflowError = overflowErrorOrNull(estimated, budget, input),
+            imageCount = composed.messages.sumOf { it.images.size },
+            omittedImageCount = payload.omittedImageCount,
+            missingImageCount = input.missingImageCount,
         )
     }
 
@@ -250,14 +264,14 @@ class ChatContextPlanner(
                 ?.let(::buildSummaryMessage),
         )
 
-        var remainingRaw = uncovered.sumOf { HeuristicTokenEstimator.estimateMessage(it) }
+        var remainingRaw = uncovered.sumOf { input.estimate(it) }
         var cutIndex = 0
         val maxCut = uncovered.size - MIN_MESSAGES_TO_KEEP_VERBATIM
         while (
             cutIndex < maxCut &&
             HeuristicTokenEstimator.withSafetyMargin(fixed.rawTokens + remainingRaw) > targetTokens
         ) {
-            remainingRaw -= HeuristicTokenEstimator.estimateMessage(uncovered[cutIndex])
+            remainingRaw -= input.estimate(uncovered[cutIndex])
             cutIndex++
         }
 
@@ -408,13 +422,18 @@ class ChatContextPlanner(
      * 1. 保留窗口必须以 user 消息开头，否则模型会看到一条没有对应输入的 assistant 回复。
      * 2. 最少也要留下最近一个完整用户回合，否则这一轮等于什么都没问。
      */
-    private fun findKeepFromIndex(history: List<PromptMessage>, fixedRaw: Long, budget: Long): Int {
+    private fun findKeepFromIndex(
+        input: ChatContextInput,
+        history: List<PromptMessage>,
+        fixedRaw: Long,
+        budget: Long,
+    ): Int {
         if (history.isEmpty()) return 0
 
         var usedRaw = 0L
         var index = history.size
         while (index > 0) {
-            val candidateRaw = HeuristicTokenEstimator.estimateMessage(history[index - 1])
+            val candidateRaw = input.estimate(history[index - 1])
             if (HeuristicTokenEstimator.withSafetyMargin(fixedRaw + usedRaw + candidateRaw) > budget) break
             usedRaw += candidateRaw
             index--
@@ -482,12 +501,12 @@ class ChatContextPlanner(
         val previousSummaryRaw = HeuristicTokenEstimator.estimateText(input.summaryState.summary)
 
         var cut = alignedCutIndex
-        var raw = uncovered.take(cut).sumOf { HeuristicTokenEstimator.estimateMessage(it) }
+        var raw = uncovered.take(cut).sumOf { summaryRequestCost(it) }
         while (cut > 0 && !fitsSummaryRequest(previousSummaryRaw, raw, summaryBudget)) {
             // 整回合地退：退到上一个 user 边界，保证剩余窗口仍以 user 开头。
             do {
                 cut--
-                raw -= HeuristicTokenEstimator.estimateMessage(uncovered[cut])
+                raw -= summaryRequestCost(uncovered[cut])
             } while (cut > 0 && !uncovered[cut].isUser)
         }
         return cut
@@ -524,6 +543,14 @@ class ChatContextPlanner(
             append(summary.trim())
         },
     )
+
+    /** 主请求里一条历史的预计开销：文字 + 按协议计的图片。所有裁剪、压缩判断都必须走它。 */
+    private fun ChatContextInput.estimate(message: PromptMessage): Long =
+        HeuristicTokenEstimator.estimateMessage(message, ImageTokenEstimate.perImage(protocol))
+
+    /** 摘要请求不发图片，只发占位文字（见 [ContextSummaryPrompt]）。 */
+    private fun summaryRequestCost(message: PromptMessage): Long =
+        HeuristicTokenEstimator.estimateMessage(role = message.role, content = message.textWithImageNote())
 
     private val PromptMessage.isUser: Boolean
         get() = role.equals("user", ignoreCase = true)

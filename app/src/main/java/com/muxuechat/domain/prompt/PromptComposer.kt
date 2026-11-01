@@ -23,7 +23,32 @@ import com.muxuechat.domain.rp.RpStateBlockFormat
 data class PromptMessage(
     val role: String,
     val content: String,
-)
+    /** 只有 user 消息会带图片；RP 状态段与 Marker 只追加到 [content]，图片原样保留。 */
+    val images: List<PromptImage> = emptyList(),
+) {
+    /**
+     * 不能发图片的场合（摘要、标题、RP 辅助请求）使用的等价文字：图片换成一句占位。
+     * 这些请求因此只知道「用户发过几张图」，看不到图片内容，这是已知限制（MULTIMODAL_PLAN 3.3）。
+     */
+    fun textWithImageNote(): String = PromptImage.appendNote(content, images.size)
+}
+
+/** 进入 prompt 的一张图片引用。规划器只需要大小来算请求体上限，不读文件。 */
+data class PromptImage(
+    val attachmentId: String,
+    val mimeType: String,
+    val byteSize: Long,
+) {
+    companion object {
+        fun note(count: Int): String = "[用户附带了 $count 张图片]"
+
+        fun appendNote(text: String, imageCount: Int): String = when {
+            imageCount <= 0 -> text
+            text.isBlank() -> note(imageCount)
+            else -> text.trimEnd() + "\n" + note(imageCount)
+        }
+    }
+}
 
 data class PromptContext(
     val settings: ChatSettings,
@@ -173,10 +198,11 @@ class PromptComposer {
         if (lastUserIndex < 0) return messages
 
         return messages.mapIndexed { index, message ->
-            if (index != lastUserIndex) {
-                message
-            } else {
-                message.copy(content = message.content.trimEnd() + "\n\n" + section)
+            when {
+                index != lastUserIndex -> message
+                // 纯图片消息（D6）没有文字，不要拼出一段以空行开头的正文。
+                message.content.isBlank() -> message.copy(content = section)
+                else -> message.copy(content = message.content.trimEnd() + "\n\n" + section)
             }
         }
     }
@@ -186,11 +212,13 @@ class PromptComposer {
         if (firstUserIndex < 0) return messages
 
         return messages.mapIndexed { index, message ->
-            if (index != firstUserIndex) {
-                message
-            } else {
-                val separator = if (message.content.endsWith("\n")) "\n" else "\n\n"
-                message.copy(content = message.content + separator + section)
+            when {
+                index != firstUserIndex -> message
+                message.content.isBlank() -> message.copy(content = section)
+                else -> {
+                    val separator = if (message.content.endsWith("\n")) "\n" else "\n\n"
+                    message.copy(content = message.content + separator + section)
+                }
             }
         }
     }

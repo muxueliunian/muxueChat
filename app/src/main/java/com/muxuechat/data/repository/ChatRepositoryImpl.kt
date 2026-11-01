@@ -2,6 +2,8 @@ package com.muxuechat.data.repository
 
 import android.util.Log
 import com.muxuechat.data.local.ChatDao
+import com.muxuechat.data.local.ChatImageStore
+import com.muxuechat.data.local.MessageAttachmentEntity
 import com.muxuechat.data.local.ConversationEntity
 import com.muxuechat.data.local.ConversationRpSettingsEntity
 import com.muxuechat.data.local.MessageEntity
@@ -27,6 +29,8 @@ import com.muxuechat.data.remote.DeepSeekToolCallDto
 import com.muxuechat.data.remote.SettingsToolCatalog
 import com.muxuechat.data.remote.SafeUserFacingError
 import com.muxuechat.data.remote.XaiResponsesTransport
+import com.muxuechat.data.remote.ImagePayload
+import com.muxuechat.data.remote.httpStatusOrNull
 import com.muxuechat.domain.tool.SettingsTool
 import com.muxuechat.domain.tool.SettingsToolArgumentParser
 import com.muxuechat.domain.tool.SettingsToolDraft
@@ -44,6 +48,9 @@ import com.muxuechat.domain.model.ConversationTokenUsage
 import com.muxuechat.domain.model.TokenUsageNormalizer
 import com.muxuechat.domain.model.TokenUsageSnapshot
 import com.muxuechat.domain.model.MessageStatus
+import com.muxuechat.domain.model.ImageInputSpec
+import com.muxuechat.domain.model.MessageImageEdit
+import com.muxuechat.domain.model.PendingImage
 import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
 import com.muxuechat.domain.model.SupportingCharacter
@@ -64,6 +71,7 @@ import com.muxuechat.domain.context.ModelContextCatalog
 import com.muxuechat.domain.prompt.ConversationTitlePrompt
 import com.muxuechat.domain.prompt.PromptComposer
 import com.muxuechat.domain.prompt.PromptContext
+import com.muxuechat.domain.prompt.PromptImage
 import com.muxuechat.domain.prompt.PromptMessage
 import com.muxuechat.domain.prompt.RpMetadataPromptContext
 import com.muxuechat.domain.rp.RpEffectiveDefinitions
@@ -87,6 +95,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
@@ -100,6 +109,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.update
+import java.io.File
 import java.util.UUID
 
 class ChatRepositoryImpl(
@@ -126,6 +136,12 @@ class ChatRepositoryImpl(
     private val rpStateBlockParser: RpStateBlockParser = RpStateBlockParser(),
     private val rpMessageMetadataParser: RpMessageMetadataParser = RpMessageMetadataParser(),
     private val clock: () -> Long = { System.currentTimeMillis() },
+    /**
+     * 聊天图片的私有目录。生产环境必须传 `filesDir` 下的实例（见 ChatViewModel.Factory）；
+     * 默认值只给不涉及图片的测试用，路径都在本类内生成，不会读写这里以外的位置。
+     */
+    private val imageStore: ChatImageStore =
+        ChatImageStore(File(System.getProperty("java.io.tmpdir").orEmpty(), "muxuechat-test-images")),
 ) : ChatRepository {
     private val providerRequestFreezer = ProviderRequestFreezer(settingsRepository, xaiAccessTokens, googleAccessTokens)
     private val chatTransport =
@@ -150,8 +166,14 @@ class ChatRepositoryImpl(
         val expectedMessages: List<MessageEntity>,
         val obsoleteMessageIds: List<String>,
         val editedUserMessage: MessageEntity?,
-        val promptHistory: List<PromptMessage>,
+        val promptHistory: HistoryReplacementHistory.MappedHistory,
         val rpTurnSnapshot: RpTurnSnapshot,
+        /** 开始生成时会话的全部附件；提交时与库里比对，消息快照覆盖不到附件表。 */
+        val expectedAttachments: List<MessageAttachmentEntity>,
+        /** 编辑后被编辑消息的完整图片集合；只用于替换期间的展示，null 表示图片不变。 */
+        val editedAttachments: List<MessageAttachmentEntity>? = null,
+        val removedAttachmentIds: List<String> = emptyList(),
+        val addedAttachments: List<MessageAttachmentEntity> = emptyList(),
     )
 
     private data class PreparedAssistant(
@@ -235,10 +257,16 @@ class ChatRepositoryImpl(
     override fun observeMessages(conversationId: String): Flow<List<ChatMessage>> = combine(
         chatDao.observeMessages(conversationId),
         chatDao.observeMessageRpMetadata(conversationId),
+        chatDao.observeAttachments(conversationId),
         historyReplacementOverlays,
-    ) { messages, metadataRows, overlays ->
+    ) { messages, metadataRows, attachmentRows, overlays ->
         val metadataByMessageId = metadataRows.associate { it.messageId to it.toDomain() }
         val overlay = overlays[conversationId]
+        val attachmentsByMessageId = attachmentRows.groupBy { it.messageId }.let { grouped ->
+            val edited = overlay?.editedUserMessage
+            val editedAttachments = overlay?.editedAttachments
+            if (edited != null && editedAttachments != null) grouped + (edited.id to editedAttachments) else grouped
+        }
         val visible = if (overlay == null) {
             messages
         } else {
@@ -248,7 +276,14 @@ class ChatRepositoryImpl(
                 editedUserMessage = overlay.editedUserMessage,
             )
         }
-        visible.map { message -> message.toDomain(metadataByMessageId[message.id]) }
+        visible.map { message ->
+            message.toDomain(
+                rpMetadata = metadataByMessageId[message.id],
+                attachments = attachmentsByMessageId[message.id].orEmpty()
+                    .sortedBy { it.orderIndex }
+                    .map { it.toDomain() },
+            )
+        }
     }
 
     /** 替换期间的展示遮罩；只清理自己登记的那一份，避免误清后来者。 */
@@ -279,13 +314,21 @@ class ChatRepositoryImpl(
         return conversation.toDomain()
     }
 
-    override fun sendMessage(conversationId: String?, content: String): Flow<ChatMessage> = flow {
+    override fun sendMessage(
+        conversationId: String?,
+        content: String,
+        images: List<PendingImage>,
+    ): Flow<ChatMessage> = flow {
         val trimmed = content.trim()
-        require(trimmed.isNotEmpty()) { "Message content is empty" }
+        // D6：允许只发图片不写文字。
+        require(trimmed.isNotEmpty() || images.isNotEmpty()) { "Message content is empty" }
+        require(images.size <= ImageInputSpec.MAX_IMAGES_PER_MESSAGE) {
+            "每条消息最多 ${ImageInputSpec.MAX_IMAGES_PER_MESSAGE} 张图片"
+        }
 
         val targetConversationId = conversationId ?: UUID.randomUUID().toString()
         val now = clock()
-        ensureConversation(targetConversationId, trimmed, now)
+        ensureConversation(targetConversationId, trimmed.ifBlank { IMAGE_ONLY_TITLE }, now)
         val userMessage = MessageEntity(
             id = UUID.randomUUID().toString(),
             conversationId = targetConversationId,
@@ -297,8 +340,8 @@ class ChatRepositoryImpl(
             createdAtMillis = now,
             updatedAtMillis = now,
         )
-        chatDao.upsertMessage(userMessage)
-        chatDao.touchConversation(targetConversationId, now)
+        // 不做图片能力预检（D8）：先照常写入用户消息，模型不接受图片时由上游报错，走普通失败路径。
+        persistUserMessage(userMessage, images, now)
 
         var selectedProvider = ChatProviderId.DEEPSEEK
         val requestSnapshot = try {
@@ -340,6 +383,69 @@ class ChatRepositoryImpl(
             )
         } finally {
             generationSessions.finish(sessionId)
+        }
+    }
+
+    /**
+     * 用户消息与图片一起落库（MULTIMODAL_PLAN 3.5）。
+     *
+     * 在附件锁内先把待发送图片移入正式目录，再在同一事务里插入消息与附件行；
+     * 任何异常（包括提交后才重新抛出的取消）都先查库：附件行不存在的文件才删除。
+     */
+    private suspend fun persistUserMessage(userMessage: MessageEntity, images: List<PendingImage>, now: Long) {
+        if (images.isEmpty()) {
+            chatDao.upsertMessage(userMessage)
+            chatDao.touchConversation(userMessage.conversationId, now)
+            return
+        }
+        val attachments = images.mapIndexed { index, image ->
+            val attachmentId = ChatImageStore.newId()
+            image to MessageAttachmentEntity(
+                id = attachmentId,
+                messageId = userMessage.id,
+                conversationId = userMessage.conversationId,
+                kind = MessageAttachmentEntity.KIND_IMAGE,
+                mimeType = image.mimeType,
+                relativePath = imageStore.relativePathFor(attachmentId),
+                byteSize = image.byteSize,
+                width = image.width,
+                height = image.height,
+                sha256 = image.sha256,
+                orderIndex = index,
+                createdAtMillis = now,
+            )
+        }
+        try {
+            imageStore.commitLock.withLock {
+                attachments.forEach { (image, attachment) -> imageStore.promotePending(image.id, attachment.id) }
+                chatDao.insertUserMessageWithAttachments(userMessage, attachments.map { it.second }, now)
+            }
+            Log.i(TAG, "User message stored with images: count=${attachments.size}")
+        } catch (error: Throwable) {
+            withContext(NonCancellable) {
+                deleteFilesOfRemovedAttachments(attachments.map { it.second })
+                images.forEach { imageStore.discardPending(it.id) }
+            }
+            throw error
+        }
+    }
+
+    /**
+     * 文件去留只按库里的事实决定：传入的附件里，库中已经没有对应行的那些才删除文件。
+     * 提交后仍可能重新抛出取消，所以不能凭「走到了异常分支」就认定没提交。
+     */
+    private suspend fun deleteFilesOfRemovedAttachments(candidates: List<MessageAttachmentEntity>) {
+        if (candidates.isEmpty()) return
+        withContext(NonCancellable) {
+            runCatching {
+                val stillReferenced = chatDao.getExistingAttachmentIds(candidates.map { it.id }).toSet()
+                val removed = candidates.filterNot { it.id in stillReferenced }
+                imageStore.delete(removed.map { it.relativePath })
+                if (removed.isNotEmpty()) Log.i(TAG, "Image files removed: count=${removed.size}")
+            }.onFailure { error ->
+                // 留下的孤儿文件由启动扫描兜底，这里只记类型。
+                Log.w(TAG, "Image file cleanup failed: ${error.javaClass.simpleName}")
+            }
         }
     }
 
@@ -386,9 +492,11 @@ class ChatRepositoryImpl(
             .takeWhile { it.id != lastAssistant.id }
             .lastOrNull { it.role == ChatRole.USER }
             ?: error("没有可用于重新生成的用户消息")
+        val attachments = chatDao.getAttachments(conversationId)
         require(
             lastUserBeforeAssistant.status == MessageStatus.COMPLETED &&
-                lastUserBeforeAssistant.content.isNotBlank(),
+                (lastUserBeforeAssistant.content.isNotBlank() ||
+                    attachments.any { it.messageId == lastUserBeforeAssistant.id }),
         ) { "上一条用户消息不可用" }
 
         // 凭据、地址和模型都在写入临时行前冻结；预检失败时数据库完全不变。
@@ -403,11 +511,17 @@ class ChatRepositoryImpl(
             check(chatDao.getMessages(conversationId).filterNotIncompleteReplacementStaging() == messages) {
                 "消息已发生变化，请重试"
             }
-            val promptHistory = HistoryReplacementHistory.beforeAssistant(messages, lastAssistant.id)
+            // 走统一映射：历史图片照样随重新生成发出，不会因走了另一条路径而静默丢失。
+            val promptHistory = HistoryReplacementHistory.beforeAssistant(
+                messages = messages,
+                assistantMessageId = lastAssistant.id,
+                attachmentsByMessageId = attachments.groupBy { it.messageId },
+                isAvailable = ::isAttachmentFileAvailable,
+            )
             val rpTurnSnapshot = captureRpTurnSnapshot(
                 conversationId = conversationId,
                 targetMessageId = lastAssistant.id,
-                lastUserOverride = promptHistory.lastOrNull { it.role == "user" }?.content,
+                lastUserOverride = promptHistory.messages.lastOrNull { it.role == "user" }?.textWithImageNote(),
                 resolveStatusBeforeTarget = true,
             )
             val replacementPlan = HistoryReplacementPlan(
@@ -416,6 +530,7 @@ class ChatRepositoryImpl(
                 editedUserMessage = null,
                 promptHistory = promptHistory,
                 rpTurnSnapshot = rpTurnSnapshot,
+                expectedAttachments = attachments,
             )
 
             withHistoryReplacementOverlay(conversationId, replacementPlan) {

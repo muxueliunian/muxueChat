@@ -2,8 +2,12 @@ package com.muxuechat.data.remote
 
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 
@@ -61,14 +65,59 @@ data class OpenAiCompatibleStreamOptionsDto(
 /**
  * OpenAI 兼容消息。assistant 的纯工具调用允许省略 content；tool 消息必须带
  * tool_call_id 与结果文本。
+ *
+ * [images] 只出现在 user 消息上；非空时 content 序列化为标准 content part 数组，
+ * 为空时仍是字符串，请求字节与引入图片前一致（见 [MessageContentJson]）。
+ * Google Vertex 走同一套 DTO，不需要任何额外代码；xAI 适配器自行翻译成 `input_image`。
  */
-@Serializable
+@Serializable(with = OpenAiCompatibleMessageDtoSerializer::class)
 data class OpenAiCompatibleMessageDto(
     val role: String,
     val content: String? = null,
+    val toolCalls: List<OpenAiCompatibleToolCallDto>? = null,
+    val toolCallId: String? = null,
+    val images: List<ImagePayload> = emptyList(),
+)
+
+/** 线上形状。字段顺序与引入图片前的 DTO 相同，纯文本请求的序列化结果因此逐字节不变。 */
+@Serializable
+private data class OpenAiCompatibleMessageWire(
+    val role: String,
+    val content: JsonElement? = null,
     @SerialName("tool_calls") val toolCalls: List<OpenAiCompatibleToolCallDto>? = null,
     @SerialName("tool_call_id") val toolCallId: String? = null,
 )
+
+internal object OpenAiCompatibleMessageDtoSerializer : KSerializer<OpenAiCompatibleMessageDto> {
+    @OptIn(ExperimentalSerializationApi::class)
+    override val descriptor: SerialDescriptor =
+        SerialDescriptor("OpenAiCompatibleMessageDto", OpenAiCompatibleMessageWire.serializer().descriptor)
+
+    override fun serialize(encoder: Encoder, value: OpenAiCompatibleMessageDto) {
+        encoder.encodeSerializableValue(
+            OpenAiCompatibleMessageWire.serializer(),
+            OpenAiCompatibleMessageWire(
+                role = value.role,
+                content = MessageContentJson.encode(value.content, value.images),
+                toolCalls = value.toolCalls,
+                toolCallId = value.toolCallId,
+            ),
+        )
+    }
+
+    override fun deserialize(decoder: Decoder): OpenAiCompatibleMessageDto {
+        val wire = decoder.decodeSerializableValue(OpenAiCompatibleMessageWire.serializer())
+        return OpenAiCompatibleMessageDto(
+            role = wire.role,
+            content = MessageContentJson.decodeText(wire.content),
+            toolCalls = wire.toolCalls,
+            toolCallId = wire.toolCallId,
+        )
+    }
+}
+
+/** 本次请求随消息发出的全部图片，按消息顺序。 */
+internal fun OpenAiCompatibleChatRequest.imagePayloads(): List<ImagePayload> = messages.flatMap { it.images }
 
 /** 标准 OpenAI function tool 定义。 */
 @Serializable

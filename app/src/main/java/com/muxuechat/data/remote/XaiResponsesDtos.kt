@@ -91,6 +91,18 @@ internal data class XaiInputTextPart(
     val text: String,
 )
 
+/**
+ * 用户图片块（xAI Image Understanding 文档，MULTIMODAL_PLAN 1.2）。订阅路径未抓包验证，需真机验收。
+ * `image_url` 是字符串（data URL），不是 OpenAI 的 `{"url": …}` 对象；不发 `detail`。
+ */
+@Serializable
+internal data class XaiInputImagePart(
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val type: String = "input_image",
+    @SerialName("image_url") val imageUrl: String,
+)
+
 @Serializable
 internal data class XaiOutputTextPart(
     @OptIn(ExperimentalSerializationApi::class)

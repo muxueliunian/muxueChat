@@ -2,8 +2,13 @@ package com.muxuechat.data.remote
 
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 
 @Serializable
@@ -20,13 +25,58 @@ data class DeepSeekChatRequest(
     @SerialName("tool_choice") val toolChoice: String? = null,
 )
 
-@Serializable
+/**
+ * [images] 只出现在 user 消息上（官方：system/assistant 带图返回 400）。非空时 content 序列化为
+ * content part 数组，否则仍是字符串，请求字节与引入图片前一致（见 [MessageContentJson]）。
+ */
+@Serializable(with = DeepSeekMessageDtoSerializer::class)
 data class DeepSeekMessageDto(
     val role: String,
     val content: String? = null,
+    val toolCalls: List<DeepSeekToolCallDto>? = null,
+    val toolCallId: String? = null,
+    val images: List<ImagePayload> = emptyList(),
+)
+
+/** 线上形状。字段顺序与引入图片前的 DTO 相同，纯文本请求的序列化结果因此逐字节不变。 */
+@Serializable
+private data class DeepSeekMessageWire(
+    val role: String,
+    val content: JsonElement? = null,
     @SerialName("tool_calls") val toolCalls: List<DeepSeekToolCallDto>? = null,
     @SerialName("tool_call_id") val toolCallId: String? = null,
 )
+
+internal object DeepSeekMessageDtoSerializer : KSerializer<DeepSeekMessageDto> {
+    @OptIn(ExperimentalSerializationApi::class)
+    override val descriptor: SerialDescriptor =
+        SerialDescriptor("DeepSeekMessageDto", DeepSeekMessageWire.serializer().descriptor)
+
+    override fun serialize(encoder: Encoder, value: DeepSeekMessageDto) {
+        encoder.encodeSerializableValue(
+            DeepSeekMessageWire.serializer(),
+            DeepSeekMessageWire(
+                role = value.role,
+                content = MessageContentJson.encode(value.content, value.images),
+                toolCalls = value.toolCalls,
+                toolCallId = value.toolCallId,
+            ),
+        )
+    }
+
+    override fun deserialize(decoder: Decoder): DeepSeekMessageDto {
+        val wire = decoder.decodeSerializableValue(DeepSeekMessageWire.serializer())
+        return DeepSeekMessageDto(
+            role = wire.role,
+            content = MessageContentJson.decodeText(wire.content),
+            toolCalls = wire.toolCalls,
+            toolCallId = wire.toolCallId,
+        )
+    }
+}
+
+/** 本次请求随消息发出的全部图片，按消息顺序。 */
+internal fun DeepSeekChatRequest.imagePayloads(): List<ImagePayload> = messages.flatMap { it.images }
 
 /**
  * `type` 是 DeepSeek 的必填字段。这里的 Json 配置是 `encodeDefaults = false`，

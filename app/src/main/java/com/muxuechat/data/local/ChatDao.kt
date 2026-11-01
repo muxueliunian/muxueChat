@@ -389,6 +389,52 @@ interface ChatDao {
         if (links.isNotEmpty()) insertConversationSupportingCharacters(links)
     }
 
+    // ---------- 图片附件（v11） ----------
+
+    @Query("SELECT * FROM message_attachments WHERE conversationId = :conversationId ORDER BY orderIndex ASC")
+    fun observeAttachments(conversationId: String): Flow<List<MessageAttachmentEntity>>
+
+    @Query("SELECT * FROM message_attachments WHERE conversationId = :conversationId ORDER BY orderIndex ASC")
+    suspend fun getAttachments(conversationId: String): List<MessageAttachmentEntity>
+
+    @Query("SELECT * FROM message_attachments WHERE messageId = :messageId ORDER BY orderIndex ASC")
+    suspend fun getAttachmentsForMessage(messageId: String): List<MessageAttachmentEntity>
+
+    @Query("SELECT * FROM message_attachments WHERE id = :attachmentId LIMIT 1")
+    suspend fun getAttachment(attachmentId: String): MessageAttachmentEntity?
+
+    @Insert
+    suspend fun insertAttachments(attachments: List<MessageAttachmentEntity>)
+
+    /** 文件去留只按库里的事实决定（MULTIMODAL_PLAN 3.1）：返回仍然存在的那部分 id。 */
+    @Query("SELECT id FROM message_attachments WHERE id IN (:attachmentIds)")
+    suspend fun getExistingAttachmentIds(attachmentIds: List<String>): List<String>
+
+    /** 启动孤儿扫描用：库里仍被引用的全部文件。 */
+    @Query("SELECT relativePath FROM message_attachments")
+    suspend fun getAllAttachmentPaths(): List<String>
+
+    @Query("DELETE FROM message_attachments WHERE id IN (:attachmentIds)")
+    suspend fun deleteAttachmentsByIds(attachmentIds: List<String>)
+
+    /**
+     * 用户消息与它的图片在同一个事务里落库：不会出现「消息在、图片行还没插」的中间态，
+     * 也不会出现图片行指向不存在的消息。
+     */
+    @Transaction
+    suspend fun insertUserMessageWithAttachments(
+        message: MessageEntity,
+        attachments: List<MessageAttachmentEntity>,
+        updatedAtMillis: Long,
+    ) {
+        require(attachments.all { it.messageId == message.id && it.conversationId == message.conversationId }) {
+            "图片不属于这条消息"
+        }
+        upsertMessage(message)
+        if (attachments.isNotEmpty()) insertAttachments(attachments)
+        touchConversation(message.conversationId, updatedAtMillis)
+    }
+
     @Query("DELETE FROM world_settings WHERE id = :worldSettingId")
     suspend fun deleteWorldSetting(worldSettingId: String)
 
@@ -513,10 +559,27 @@ interface ChatDao {
         expectedStatusPanel: RpStatusPanelEntity? = null,
         rpMetadataSnapshot: MessageRpMetadataEntity? = null,
         tokenUsage: ConversationTokenUsageEntity? = null,
+        /**
+         * 开始生成时会话的全部附件；非 null 时与库里比对，生成期间附件变了（例如另一处编辑）就拒绝提交。
+         * 消息快照只覆盖 messages 表，附件必须单独比对。
+         */
+        expectedAttachments: List<MessageAttachmentEntity>? = null,
+        /** 编辑时移除的原附件；行删除后文件由调用方查库确认再删。 */
+        removedAttachmentIds: List<String> = emptyList(),
+        /** 编辑时新增的附件；文件已在提交前移入正式目录，提交后才被引用。 */
+        addedAttachments: List<MessageAttachmentEntity> = emptyList(),
     ): RpStateCommitResult {
         val currentOfficialMessages = getMessages(conversationId)
             .filterNot { it.id == completedAssistant.id }
         check(currentOfficialMessages == expectedMessages) { "生成期间历史已发生变化，请重试" }
+        if (expectedAttachments != null) {
+            check(getAttachments(conversationId).sortedBy { it.id } == expectedAttachments.sortedBy { it.id }) {
+                "生成期间图片已发生变化，请重试"
+            }
+        }
+        require(addedAttachments.all { it.conversationId == conversationId && it.messageId == editedUserMessage?.id }) {
+            "新增图片不属于被编辑的消息"
+        }
         require(completedAssistant.conversationId == conversationId) { "替换回复不属于目标会话" }
         require(completedAssistant.status == MessageStatus.COMPLETED) { "替换回复尚未完成" }
         require(
@@ -537,6 +600,12 @@ interface ChatDao {
         }
         if (editedUserMessage != null) {
             updateMessage(editedUserMessage)
+        }
+        if (removedAttachmentIds.isNotEmpty()) {
+            deleteAttachmentsByIds(removedAttachmentIds)
+        }
+        if (addedAttachments.isNotEmpty()) {
+            insertAttachments(addedAttachments)
         }
         upsertMessage(completedAssistant)
         // 编辑历史会作废摘要，但**不**作废用量：那是一次真实发生过的请求，

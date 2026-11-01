@@ -46,7 +46,8 @@ object ContextSummaryPrompt {
         appendLine("需要压缩的对话记录：")
         appendLine(DELIMITER)
         plan.messagesToSummarize.forEach { message ->
-            appendLine("[${message.roleLabel}] ${message.content.trim()}")
+            // 摘要请求不发图片，只告诉模型这里发过几张图；图片内容因此不会进入摘要（已知限制）。
+            appendLine("[${message.roleLabel}] ${message.textWithImageNote().trim()}")
         }
         appendLine(DELIMITER)
         appendLine()

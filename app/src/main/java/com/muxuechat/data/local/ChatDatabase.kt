@@ -23,8 +23,9 @@ import java.util.UUID
         ProtagonistProfileEntity::class,
         SupportingCharacterEntity::class,
         ConversationSupportingCharacterEntity::class,
+        MessageAttachmentEntity::class,
     ],
-    version = 10,
+    version = 11,
     exportSchema = true,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -49,6 +50,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_7_8)
                     .addMigrations(MIGRATION_8_9)
                     .addMigrations(MIGRATION_9_10)
+                    .addMigrations(MIGRATION_10_11)
                     .addCallback(STARTUP_GENERATION_RECOVERY_CALLBACK)
                     .build()
                     .also { instance = it }
@@ -349,6 +351,46 @@ abstract class ChatDatabase : RoomDatabase() {
                 migrateProtagonistProfiles(db, now)
                 prefixLegacyMetricNames(db)
                 backfillMetricSnapshots(db)
+            }
+        }
+
+        /**
+         * v11：用户消息的图片附件（MULTIMODAL_PLAN 3.1）。
+         *
+         * 与 v9 一样只新建一张侧表，不动任何既有表。`messageId` 外键级联保证删消息、
+         * 清空或删除会话时附件行一并消失；图片文件不在库里，由 Repository 在事务后清理。
+         */
+        internal val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `message_attachments` (
+                        `id` TEXT NOT NULL,
+                        `messageId` TEXT NOT NULL,
+                        `conversationId` TEXT NOT NULL,
+                        `kind` TEXT NOT NULL,
+                        `mimeType` TEXT NOT NULL,
+                        `relativePath` TEXT NOT NULL,
+                        `byteSize` INTEGER NOT NULL,
+                        `width` INTEGER NOT NULL,
+                        `height` INTEGER NOT NULL,
+                        `sha256` TEXT NOT NULL,
+                        `orderIndex` INTEGER NOT NULL,
+                        `createdAtMillis` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`),
+                        FOREIGN KEY(`messageId`) REFERENCES `messages`(`id`)
+                            ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_message_attachments_messageId` " +
+                        "ON `message_attachments` (`messageId`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_message_attachments_conversationId` " +
+                        "ON `message_attachments` (`conversationId`)",
+                )
             }
         }
 
