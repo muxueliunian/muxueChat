@@ -1,6 +1,6 @@
 # muxueChat 多模态（图片输入）实施计划
 
-状态：MM-0 已实现待真机验收；其余分期尚未实施（2026-09-16 已按独立审查意见修订；2026-11-01 第二次修订，见进度记录）  
+状态：MM-0～MM-2 代码已完成，待真机验收；MM-3 未开始（2026-09-16 已按独立审查意见修订；2026-11-01 第二次修订并完成 MM-1a～MM-2 实施，见进度记录）  
 建立日期：2026-09-16  
 范围：用户消息的图片输入，普通聊天与 RP 正文都支持；覆盖全部聊天链路——DeepSeek、自定义 OpenAI 兼容供应商、Google Vertex（OpenAI 兼容钉死实例）、xAI 订阅（Responses 适配器）；以及作为前置条件的 DeepSeek 模型 ID 迁移  
 不在范围：图片生成、音频/视频、PDF 视觉解析、角色卡图片
@@ -9,72 +9,108 @@
 
 ## 进度记录（接续工作先读这里）
 
-最后更新：2026-11-01（第二次修订：纳入 xAI 订阅与 Google Vertex；取消模型图片能力判断）
+最后更新：2026-11-01（第二次修订后，MM-1a～MM-2 实施完成；待真机验收）
 
 | 分期 | 状态 | 说明 |
 | --- | --- | --- |
 | 计划审查 | 完成 | 独立审查（Opus）提出的 H1/H2、M1～M8、L1～L7 已全部写入本文 |
 | 第二次修订 | 完成 | 2026-11-01：D7（渠道范围）、D8（不判断模型能力，不支持就报错）；新增 1.2、1.3 官方事实与 3.4 xAI 映射 |
 | MM-0 | `[~]` 已实现，待真机验收 | 实现记录见第 4 节 MM-0 |
-| MM-1a～MM-2 | **进行中（2026-11-01 用户要求一次做完，未提交；工作区当前编译不通过）** | 见下方「2026-11-01 实施中断点」 |
-| MM-3 | 未开始 | 分享入口（intent-filter）不做；其余在 MM-2 完成后再做 |
+| MM-1a | `[~]` 已实现，待真机验收 | 数据、请求、规划、Repository 发送 / 重新生成 / 基本文件清理；JVM 单测覆盖，androidTest 只编译 |
+| MM-1b | `[~]` 已实现，待真机验收 | 附件菜单、Photo Picker、预览条、气泡缩略图、面板图片信息、删除 `TEXT_ONLY_INPUT` |
+| MM-2 | `[~]` 已实现，待真机验收 | 编辑增删图片（查库决定文件去留）、编辑弹窗、启动孤儿扫描与进程级附件锁 |
+| MM-3 | 未开始 | 分享入口（intent-filter）不做；全屏查看、粘贴、上传提示留待以后 |
 
-### 2026-11-01 实施中断点（接续先读这里）
+### 2026-11-01 实施完成记录（接续先读这里）
 
-已完成并验证（`compileDebugKotlin` 通过，`testDebugUnitTest --tests "com.muxuechat.data.remote.*"` 全过）：
+提交：`d711b86`（数据层、请求层、domain/planner，半成品）→ `4af9c1d`（Repository 收尾）→ `edf7101`（ViewModel 与 UI）
+→ `abe7a3b`（测试）→ 本文档同步提交。
 
-- 数据层：`MessageAttachmentEntity`（`ChatEntities.kt`）、Room v11 + `MIGRATION_10_11`（SQL 已与导出的 `11.json` 逐字核对一致）、
-  `ChatDao` 附件查询 / `insertUserMessageWithAttachments` / `commitHistoryReplacement` 新增 `expectedAttachments`、`removedAttachmentIds`、`addedAttachments`；
-  `data/local/ChatImageStore.kt`（待发送区、原子写、promote 并刷新 mtime、`commitLock`、`removeOrphans`）、`data/local/ChatImageImporter.kt`（ImageDecoder → JPEG 85、白底、只记类型与尺寸）。
-- domain：`domain/model/MessageAttachment.kt`（`MessageAttachment`、`PendingImage`、`MessageImageEdit`、`ImageInputSpec`）、`ChatMessage.attachments`。
-- 请求层：`data/remote/ImagePayload.kt`（`ImagePayload` 占位符、`MessageContentJson`、`ImagePayloadRequestBody` 精确长度流式 base64、`withImageReadTimeout` 180s、`HttpStatusError` + `httpStatusOrNull`）；
-  两个消息 DTO 保持 `content: String?`，新增 `images`，用 Wire 代理序列化器，**纯文本请求字节不变**；三个客户端已接入请求体与图片读超时；
-  xAI `toInputItems` 产出 `input_image`（`image_url` 为字符串）；三家异常带 `httpStatus`。
-- 已改但未编译验证：`PromptMessage.images` / `PromptImage` / `textWithImageNote()`（`PromptComposer.kt`，纯图片消息追加状态段不留空行）；
-  `HeuristicTokenEstimator.estimateMessage(message, tokensPerImage)`；`domain/context/ImagePayloadBudget.kt`（`ImageTokenEstimate`：DeepSeek 1024 / OpenAI 兼容 1600；20 MiB 上限，本轮不省略）；
-  `ChatContextPlanner`（裁剪/压缩都按图片计费、保留窗口后应用体积上限、`ContextWindowPlan.imageCount/omittedImageCount/missingImageCount`、`ChatContextInput.missingImageCount`）；
-  `ContextSummaryPrompt` 用占位文字；`HistoryReplacementHistory` 成为唯一映射 `toPromptHistory(...)`，返回 `MappedHistory`（测试已改 `.messages`）；
-  `RpHistoryMutation.lastCompletedUserContent*` 接受图片计数；`ChatRepository` / 两个 UseCase 新签名（`images`、`imageEdit`）。
-- `ChatRepositoryImpl` 已改：import、构造参数 `imageStore`（测试默认临时目录）、`HistoryReplacementPlan` 新字段、`observeMessages` 合并附件（含编辑遮罩）、
-  `sendMessage` + `persistUserMessage` + `deleteFilesOfRemovedAttachments`、`regenerateLastResponse`（统一映射、`expectedAttachments`）。
+验证（Linux 云端环境，JDK 17 工具链、Gradle 8.13、Android SDK platform 36）：
 
-`ChatRepositoryImpl` 尚未改（这是编译不通过的原因）：
+- `:app:compileDebugKotlin` 通过；`:app:testDebugUnitTest` 通过（616 个用例，0 失败；改动前 586 个）；
+  `:app:compileDebugAndroidTestKotlin` 通过；`:app:assembleDebug` 通过。
+- **androidTest 只编译、未在任何设备或模拟器上运行**（含 `MigrationTestHelper` 10→11 与新增的附件 DAO 测试）。
+- 界面没有截图或真机核对；Compose 代码只经过编译。
 
-1. `editUserMessageAndRegenerate(messageId, content, imageEdit)`：按设计拆成外层 flow（finally 里 discardPending）+ `FlowCollector` 扩展内部函数；
-   冻结后注册 session，promote 新图（`commitLock` 内），`throughEditedUser` 传入替换后的附件映射，计划带 `expectedAttachments`、`editedAttachments`（imageEdit 非空时）、
-   `removedAttachmentIds`、`addedAttachments`；finally 里 `deleteFilesOfRemovedAttachments(已 promote 的新行 + 被移除行 + 后续消息上的附件)`。
-2. `deleteConversation` / `clearConversation`：先 `getAttachments`，try 删除，finally `deleteFilesOfRemovedAttachments`。
-3. 私有 `loadPromptHistory` / `List<MessageEntity>.toPromptHistory` 改为调用 `HistoryReplacementHistory.toPromptHistory`（读 `getAttachments`，`isAvailable` 查文件），返回 `MappedHistory`；
-   需新增 `isAttachmentFileAvailable(entity) = imageStore.exists(entity.relativePath)`。调用点：`planRequestContext`（`replacementPlan.promptHistory`）、`autoCompactIfNeeded`、`runCompaction`、`planContextWindowForRpDraft`、`planContextWindow`。
-4. `observeContextWindow`：把 `observeAttachments` 并入（5 参 combine 已满，需嵌套），`ContextWindowSignals` 加附件，`missingImageCount` 传入 `buildContextInput`（新增参数）。
-5. `toDeepSeekMessages` / `toOpenAiCompatibleMessages`：`images` 映射为 `ImagePayload(imageStore.fileOf(imageStore.relativePathFor(id)), mimeType)`。
-6. 两个 generate 的 catch：记录本轮 `contextPlan.imageCount > 0`，错误文案按 `error.httpStatusOrNull()` 为 400 / 413 时追加图片提示（3.4）。
-7. `commitHistoryReplacement` 调用处传 `expectedAttachments` / `removedAttachmentIds` / `addedAttachments`。
-8. `captureRpTurnSnapshot` 的 `lastUser` 改用 `RpHistoryMutation.lastCompletedUserContent*` + 按消息的图片计数；`renameConversationWithAi` 的标题行可带图片占位；新增常量 `IMAGE_ONLY_TITLE = "图片"`。
+中断点清单的完成情况：
 
-之后的步骤：跑 `testDebugUnitTest` 修测试 → ViewModel（注入 `ChatImageImporter`、`pendingImages`、发送/编辑传图）与 UI（附件菜单、Photo Picker、预览条、气泡缩略图、编辑弹窗、上下文面板图片信息、删除 `TEXT_ONLY_INPUT` 及 `ModelPresentationTest`）
-→ Factory 传 `ChatImageStore(application.filesDir)` → 启动孤儿扫描（进程一次、DB 打开后、持 `commitLock`；`removeOrphans` 还需加「未引用文件 1 小时宽限期」，因为编辑时新图在提交前就已移入正式目录）
-→ 补测试（序列化、xAI、流式请求体逐字节、预算、映射、MigrationTestHelper 10→11 只编译不在真机跑）→ 同步 AGENT.md 第 78、479 行附近与 ROADMAP。
-**不要运行 `connectedDebugAndroidTest`（会卸载应用清数据）。** Bash 里长 heredoc 曾解析失败，改用把 Python 脚本写到 scratchpad 再执行。
+1. `editUserMessageAndRegenerate(messageId, content, imageEdit)`：外层 flow 的 finally 丢弃未移走的待发送图；内部函数在冻结、
+   注册 session 后于 `commitLock` 内 promote 新图，`throughEditedUser` 用替换后的附件映射，计划带齐
+   `expectedAttachments` / `editedAttachments` / `removedAttachmentIds` / `addedAttachments`；结束时对
+   「已 promote 的新行 + 被移除行 + 后续消息的附件」一律查库决定文件去留。`imageEdit` 与原图集合相同时按「图片不变」处理。
+2. `deleteConversation` / `clearConversation`：在 `commitLock` 内先读附件再删行，finally 查库删文件。
+3. `loadPromptHistory` 与上下文面板改走 `HistoryReplacementHistory.toPromptHistory`，`isAttachmentFileAvailable` 查文件；
+   `buildRequestContextInput` 改收 `MappedHistory`，缺失张数经 `ChatContextInput.missingImageCount` 透传。
+4. `observeContextWindow`：消息流与附件流先合并再进 5 参 combine，`ContextWindowSignals` 带附件。
+5. `toDeepSeekMessages` / `toOpenAiCompatibleMessages`：`images` 映射为 `ImagePayload(imageStore.fileOf(relativePathFor(id)), mimeType)`。
+6. 两个 generate 记录最近一次请求是否带图，失败文案经 `ImageRequestErrorHint`（为可测从 Repository 抽出）按
+   `httpStatusOrNull()` 为 400 / 413 时追加图片提示。
+7. `commitHistoryReplacement` 传入三项附件参数；带新图的提交另持 `commitLock`，与孤儿扫描互斥。
+8. `captureRpTurnSnapshot` 的 `lastUser` 改用 `RpHistoryMutation.lastCompletedUserContent*` + 按消息的图片计数；
+   AI 标题的行带图片占位；新增 `IMAGE_ONLY_TITLE = "图片"`。
 
-当前工作区状态：
+后续步骤的完成情况：
 
-- MM-0、MM-0 之前的缺陷修复与 2026-09-20 的前端 UI/UX 优化**已提交**，见 `6705af1`（2026-09-22「建立基线」）；
-  本计划文档首次提交于 `291f596`。代码中尚无任何图片发送逻辑（2026-11-01 核对：三套请求 DTO 的 `content` 仍为字符串，
-  Room 仍为 v10，`ModelNotes.TEXT_ONLY_INPUT` 仍在使用）。
-- 自本计划首版以来新增的链路：xAI 订阅（`XaiResponsesTransport`，`ProviderAuthKind.XAI_OAUTH`）与
-  Google Vertex（`OpenAiCompatibleClient` 钉死主机实例，`ProviderAuthKind.GOOGLE_OAUTH`），以及
-  「RP 辅助请求固定走 DeepSeek」。本次修订已把它们纳入。
-- 最近一次与 MM-0 相关的验证（2026-09-20）：`testDebugUnitTest`、`assembleDebug`、
-  `compileDebugAndroidTestKotlin` 均成功；MM-0 的 androidTest 尚未在真机执行。
+- 测试修复：4 个 Repository 单测的假 DAO 补附件查询（纯文本会话返回空列表）；`ModelPresentationTest` 按 D8 改写。
+- ViewModel：注入 `ChatImageImporter` 与 `ChatImageThumbnailLoader`；`pendingImages` / `isImportingImages` / `editImageDraft`；
+  发送与编辑把待发送图片交给 Repository 后不再持有；移除、放弃编辑时丢弃待发送文件；启动时触发孤儿扫描。
+- UI：输入栏附件菜单（图片始终可用；文本文档不可用时写明原因）、Photo Picker（剩余 ≥ 2 张多选、1 张单选，不申请权限）、
+  预览条（缩略图、删除、「n/4」计数）、用户 / RP 玩家消息气泡缩略图网格、编辑弹窗增删图、上下文面板图片信息；
+  缩略图经 ViewModel 读取，用 `ImageDecoder` 降采样 + 16 MB LruCache，通过 `LocalChatImageThumbnails` 下发。
+- 删除 `ModelNotes.TEXT_ONLY_INPUT` 及其使用。
+- Factory 传 `ChatImageStore(application.filesDir)`。
+- 启动孤儿扫描：`ChatRepository.removeOrphanImagesOncePerProcess()`，进程级标记只跑一次，`Dispatchers.IO` 上先查库
+  （保证数据库已打开、启动恢复回调已完成）再在 `commitLock` 内扫描；失败或取消时复位标记，允许本进程再试。
+  `removeOrphans` 对未被引用的正式图片加 1 小时宽限期。
+- 测试：见第 5 节对应项；另把原 androidTest `migrate1To10…` 同步为 `migrate1To11…`（数据库已是 v11，旧用例只注册到 9→10，运行时会失败）。
+- 规范同步：`AGENT.md`（模型清单旁的图片输入说明、§2「图片输入」、§3.2 存储与文件清理、§3.3 线上形状与请求体、§6 日志、§9 模型标注与图片入口）、
+  `docs/ROADMAP.md`。**未改** `docs/DEEPSEEK_MODEL_DISCOVERY_RESEARCH_2026-09-05.md` 与 `docs/XAI_WIRE_FORMAT.md`（后者要等订阅路径的真机结果）。
 
-待用户处理：
+与计划不一致之处（均为有意取舍）：
 
-1. MM-0 真机验收：旧版选中 `deepseek-v4-flash` 后升级，确认显示并请求 `deepseek-flash`；
-   在 `deepseek-flash` 上验证普通、流式、思考、工具调用与 RP Marker。
-2. D6（允许纯图片消息）是按审查建议采纳的默认值，用户尚未明确表态；如需改为「必须带文字」，在 MM-1a 开工前告知。
+- DTO 没有改成 `MessageContentDto` 密封类型，而是保持 `content: String?` 并新增 `images`，用线上形状的代理序列化器输出（`d711b86`）。
+  效果相同，且改动点少；纯文本字节不变已有单测逐字节对照改动前的 DTO。
+- 流式请求体按文件大小精确计算 `contentLength`，不走分块传输（3.4 原写 -1）：个别反代不接受 chunked 请求。
+- 规划器先按估算裁剪、再对保留窗口应用 20 MiB 上限（3.3 原顺序是上限在前）：上限换成占位只会让估算变小，裁剪结论不受影响，
+  而且只对真正会发出的窗口计体积。
+- 413 的提示与 400 一样只在本轮请求带图时追加（3.4 原写 413 无条件提示）：按 2026-11-01 用户指示，避免与图片无关的 413 被误导。
+- 3.4 的 `ImageAttachmentStore` 实际名为 `ChatImageStore`；附件锁是进程级的（Activity 重建会换 Repository 与 store 实例）。
+- 孤儿扫描由 `ChatViewModel` 初始化时调用 Repository 触发（Repository 内保证每进程一次），没有新增 `Application` 子类。
+- 待发送图片的所有权：交给 `sendMessage` / `editUserMessageAndRegenerate` 后由 Repository 负责，任何结局都在 finally 丢弃未移走的待发送文件，
+  ViewModel 不再持有，因此发送或编辑失败后需要重新选图。
+- 文本文档附件仍只在开启设定生成工具且非 RP 时可用（入口改为菜单项并写明原因）；图片入口不受此限制。
 
-MM-1a 开工时的要点（详见 3.1～3.5）：
+已知限制：
+
+- 摘要、AI 标题与 RP 辅助请求只看到「用户附带了 N 张图片」的占位，看不到图片内容。
+- GIF / 动态 WebP 只取首帧；编辑时保留的原图不重新压缩。
+- 选图后进程被杀时，输入栏的待发送图片不会恢复（文件在 24 小时后由孤儿扫描删除）。
+- 发送或编辑失败后，本次选的图片已被丢弃（原消息里的图片不受影响）。
+- 400 的图片提示只能留有余地；`readTimeout`（180 s）、20 MiB 上限、xAI 不发 `detail` 是否可行、Vertex 单请求 inline 总量上限都未经真机确认。
+- 「20 MiB 图片请求的内存峰值」未在设备上粗测。
+- 暂无全屏查看、粘贴图片、上传进度提示（MM-3）。
+
+待真机验收（用户处理）：
+
+1. 四条链路（DeepSeek `deepseek-flash`、自定义 OpenAI 兼容、Google Vertex、xAI 订阅）× 普通聊天与 RP：发送 1 张 / 4 张 / 纯图片，普通与流式；
+   xAI 订阅路径从未采集过图片请求，需特别确认。
+2. 不支持图片的模型（如 `deepseek-v4-pro`）：图片入口照常可用，发送后显示上游错误与「如果问题与图片有关…」提示，不崩溃、不丢消息。
+3. 编辑历史消息时增删图片后重新生成：成功时新旧附件原子切换；预检失败、网络失败、上游拒绝或取消时原消息与原图片完全不变。
+4. 重新生成带图对话：请求仍含历史图片。
+5. 删除会话、清空会话、编辑删除后续消息后，对应图片文件被清理；发送或编辑中强杀进程，重启后没有残留引用错误、孤儿文件被清理、
+   一小时内未提交的新文件不被误删。
+6. v10→v11 覆盖升级后旧会话、消息与 RP 数据完好（`MigrationTestHelper` 用例已写好但未在设备运行；运行 instrumentation 会卸载应用，须另行授权）。
+7. `ImageDecoder` 管线：大图、透明 PNG、HEIC、动图 GIF、带旋转 EXIF 的相机照片；第 5 张图片无法加入；日志与提示里没有 URI、路径或 base64。
+8. 上下文面板显示图片张数、省略与丢失情况；realme Neo7 上预览条、气泡缩略图、编辑弹窗与键盘、系统栏不冲突。
+
+**不要运行 `connectedDebugAndroidTest`（会卸载应用清数据）。**
+
+待用户确认：
+
+- D6（允许纯图片消息）仍是按审查建议采纳的默认值；如需改为「必须带文字」，恢复 3.5 中的两处非空校验即可。
+
+MM-1a 开工时的要点（历史记录，已按此实施；详见 3.1～3.5）：
 
 - 先做统一历史映射，替换 `HistoryReplacementHistory` 私有的 `toPromptMessages`，否则重新生成会丢图；
 - 文件去留一律查库决定（提交后可能重新抛出取消）；
@@ -409,7 +445,9 @@ D8 取代了首版计划中的以下内容（已从正文删除）：`ModelInput
 - 历史用量显示「已过期」属预期。
 - 真机：`deepseek-flash` 的普通、流式、思考、工具调用与 RP Marker 正常。
 
-### [ ] MM-1a：数据、请求与规划（无 UI）
+### [~] MM-1a：数据、请求与规划（无 UI）
+
+> 2026-11-01 已实现（`d711b86`、`4af9c1d`），JVM 单测覆盖，待真机验收；实施记录与偏差见进度记录。
 
 改动：3.1 的表、文件存储、`observeAttachments` 与**基本文件清理**（删除会话、清空会话、历史替换删除后续消息）；3.2 domain；3.3 统一历史映射、缺失检查、体积上限、图片估算与上下文面板 combine；3.4 两套 DTO、xAI 适配器的 `input_image` 翻译、共用的流式请求体、各客户端 `readTimeout` 与错误映射；3.5 `sendMessage` 与 `regenerateLastResponse`。
 
@@ -424,7 +462,9 @@ D8 取代了首版计划中的以下内容（已从正文删除）：`ModelInput
 - 删除会话、清空会话后对应图片文件被删除；提交后抛出取消的场景下不误删已引用文件（可用假 DAO 模拟）。
 - 20 MiB 图片请求的内存峰值不随图片总量线性叠加多份副本（instrumentation 中粗测）。
 
-### [ ] MM-1b：发送带图片的 UI
+### [~] MM-1b：发送带图片的 UI
+
+> 2026-11-01 已实现（`edf7101`），只经编译，界面待 realme Neo7 真机验收。
 
 改动：3.6 的输入栏菜单、Photo Picker、导入压缩管线、预览条、发送按钮条件、气泡缩略图（含 RP 玩家消息）、上下文面板图片信息、删除 `TEXT_ONLY_INPUT` 文案。
 
@@ -436,7 +476,9 @@ D8 取代了首版计划中的以下内容（已从正文删除）：`ModelInput
 - 日志、错误提示中找不到 base64、URI 或完整路径。
 - 上下文面板显示图片张数与省略情况。
 
-### [ ] MM-2：编辑图片与孤儿清理
+### [~] MM-2：编辑图片与孤儿清理
+
+> 2026-11-01 已实现（`4af9c1d`、`edf7101`）；孤儿扫描对未引用的正式图片加 1 小时宽限期。待真机验收。
 
 改动：3.5 的编辑增删图片与两阶段提交（含查库判断文件去留）；3.6 编辑弹窗；3.1 的启动孤儿扫描与附件 `Mutex`。
 
@@ -455,6 +497,15 @@ D8 取代了首版计划中的以下内容（已从正文删除）：`ModelInput
 - 从其他 App 分享图片到 muxueChat 需要新增 intent-filter，属于入口扩展，实施前另行确认。
 
 ## 5. 测试计划
+
+> 2026-11-01 覆盖情况（`abe7a3b`）：
+> - 已有 JVM 单测：DTO 序列化（纯文本逐字节对照改动前 DTO、带图数组、纯图片无空 text 块）、xAI `input_image`、
+>   流式请求体（长度精确、与一次性编码逐字节相同、可重复写、占位符缺失或重复、文件被删）、体积上限、规划器按协议计图、
+>   统一映射（缺图占位与计数、assistant 不带图、重新生成与编辑同一映射）、含图 400 / 413 提示、`ChatImageStore` 孤儿扫描与宽限期。
+> - 已写但只编译未运行的 androidTest：`MigrationTestHelper` 10→11、附件外键级联、`upsertMessage` / `updateMessage` 不删附件、
+>   历史替换原子切换附件与附件变化时拒绝提交。
+> - 尚未覆盖：Repository 层「提交成功但抛出取消 / 提交失败」时文件去留的假 DAO 测试、压缩目标尺寸纯函数测试、
+>   内部请求只含占位的端到端断言、`ImageDecoder` 管线与删除会话后文件清理的设备测试。
 
 JVM 单元测试：
 
