@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -29,6 +30,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
@@ -73,6 +75,13 @@ import com.muxuechat.data.document.DocumentTextExtractor
 import com.muxuechat.domain.context.ContextCompressionMode
 import com.muxuechat.domain.tool.SettingsToolDraft
 import com.muxuechat.presentation.chat.components.ChatTopBar
+import com.muxuechat.presentation.chat.components.ChatImageRef
+import com.muxuechat.presentation.chat.components.ChatImageThumbnailSource
+import com.muxuechat.presentation.chat.components.ImagePreviewStrip
+import com.muxuechat.presentation.chat.components.LocalChatImageThumbnails
+import com.muxuechat.presentation.chat.components.toStripItem
+import com.muxuechat.domain.model.ChatMessage
+import com.muxuechat.domain.model.ImageInputSpec
 import com.muxuechat.presentation.chat.components.ContextWindowSheet
 import com.muxuechat.presentation.chat.components.ConversationDrawer
 import com.muxuechat.presentation.chat.components.SettingsDraftConfirmation
@@ -141,7 +150,14 @@ fun ChatScreen(
     modifier: Modifier = Modifier,
     onSyncRpMetricDefinitions: (String, com.muxuechat.domain.model.RpEntryOwner) -> Unit = { _, _ -> },
     onEditRpMetric: (String, com.muxuechat.domain.model.RpMetricSnapshot, Int) -> Unit = { _, _, _ -> },
-) {
+    imageThumbnails: ChatImageThumbnailSource = ChatImageThumbnailSource { _, _ -> null },
+    onAttachImages: (List<Uri>) -> Unit = {},
+    onRemovePendingImage: (String) -> Unit = {},
+    onBeginEditUserMessage: (ChatMessage) -> Unit = {},
+    onAttachEditImages: (List<Uri>) -> Unit = {},
+    onRemoveEditImage: (attachmentId: String?, pendingId: String?) -> Unit = { _, _ -> },
+    onCancelEditUserMessage: () -> Unit = {},
+) = CompositionLocalProvider(LocalChatImageThumbnails provides imageThumbnails) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -182,6 +198,17 @@ fun ChatScreen(
     val documentPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri -> uri?.let(onAttachDocument) }
+
+    // 系统 Photo Picker：只读用户选中的图片，不申请任何存储权限（MULTIMODAL_PLAN 3.6）。
+    // PickMultipleVisualMedia 要求 maxItems ≥ 2，只剩 1 个名额时改用单选。
+    val composerImagePicker = rememberImagePicker(
+        remainingSlots = ImageInputSpec.MAX_IMAGES_PER_MESSAGE - state.pendingImages.size,
+        onPicked = onAttachImages,
+    )
+    val editImagePicker = rememberImagePicker(
+        remainingSlots = state.editImageDraft?.remainingSlots ?: 0,
+        onPicked = onAttachEditImages,
+    )
 
     fun closeDrawerThenSelect(conversationId: String?) {
         scope.launch {
@@ -349,7 +376,7 @@ fun ChatScreen(
                     isGenerating = state.isGenerating,
                     onSend = {
                         val text = inputValue.text.trim()
-                        if (text.isNotEmpty() || state.pendingAttachment != null) {
+                        if (text.isNotEmpty() || state.pendingAttachment != null || state.pendingImages.isNotEmpty()) {
                             onSendMessage(text)
                             inputValue = TextFieldValue("")
                         }
@@ -357,10 +384,14 @@ fun ChatScreen(
                     onStop = onStopGeneration,
                     attachment = state.pendingAttachment,
                     isImportingAttachment = state.isImportingAttachment,
-                    // 附件是给设定生成工具用的，RP 进行中工具不可用，入口也一并隐藏。
-                    canAttach = !isRpActive && canUseSettingsTools,
-                    onAttach = { documentPicker.launch(DocumentTextExtractor.SAF_MIME_TYPES) },
+                    // 文本文档附件是给设定生成工具用的，RP 进行中工具不可用；图片入口不受影响（D8）。
+                    canAttachDocument = !isRpActive && canUseSettingsTools,
+                    onAttachDocument = { documentPicker.launch(DocumentTextExtractor.SAF_MIME_TYPES) },
                     onRemoveAttachment = onRemoveAttachment,
+                    pendingImages = state.pendingImages,
+                    isImportingImages = state.isImportingImages,
+                    onPickImages = composerImagePicker,
+                    onRemovePendingImage = onRemovePendingImage,
                 )
             },
             snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -420,6 +451,7 @@ fun ChatScreen(
                         },
                         onEditUserMessage = { message ->
                             if (!state.isGenerating) {
+                                onBeginEditUserMessage(message)
                                 editingUserMessage = MessageEditTarget(
                                     messageId = message.id,
                                     initialContent = message.content,
@@ -910,11 +942,17 @@ fun ChatScreen(
     editingUserMessage?.let { target ->
         EditUserMessageDialog(
             initialContent = target.initialContent,
+            imageDraft = state.editImageDraft?.takeIf { it.messageId == target.messageId },
+            onPickImages = editImagePicker,
+            onRemoveImage = onRemoveEditImage,
             onConfirm = { newContent ->
                 onEditUserMessage(target.messageId, newContent)
                 editingUserMessage = null
             },
-            onDismiss = { editingUserMessage = null },
+            onDismiss = {
+                onCancelEditUserMessage()
+                editingUserMessage = null
+            },
         )
     }
 
@@ -1004,9 +1042,35 @@ internal data class RpSettingsDraft(
     }
 }
 
+/**
+ * 选图入口：剩余名额 ≥ 2 用多选（maxItems = 剩余名额），只剩 1 个用单选；没有名额时什么都不做。
+ * 合约按名额 remember，名额变化后下一次点击就用新的上限，不会每次重组都重新注册。
+ */
+@Composable
+private fun rememberImagePicker(remainingSlots: Int, onPicked: (List<Uri>) -> Unit): () -> Unit {
+    val multipleContract = remember(remainingSlots.coerceAtLeast(2)) {
+        ActivityResultContracts.PickMultipleVisualMedia(maxItems = remainingSlots.coerceAtLeast(2))
+    }
+    val multiple = rememberLauncherForActivityResult(multipleContract) { uris -> onPicked(uris) }
+    val single = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        uri?.let { onPicked(listOf(it)) }
+    }
+    val request = PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+    return {
+        when {
+            remainingSlots >= 2 -> multiple.launch(request)
+            remainingSlots == 1 -> single.launch(request)
+            else -> Unit
+        }
+    }
+}
+
 @Composable
 private fun EditUserMessageDialog(
     initialContent: String,
+    imageDraft: EditImageDraft?,
+    onPickImages: () -> Unit,
+    onRemoveImage: (attachmentId: String?, pendingId: String?) -> Unit,
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1018,8 +1082,14 @@ private fun EditUserMessageDialog(
             ),
         )
     }
-    val canConfirm = text.text.isNotBlank()
-    val guardedDismiss = com.muxuechat.presentation.common.components.rememberGuardedDismiss(text.text != initialContent, onDismiss)
+    val imageCount = imageDraft?.totalCount ?: 0
+    val isImporting = imageDraft?.isImporting == true
+    // D6：文字与图片至少保留一样；删光两者时禁止提交。
+    val canConfirm = (text.text.isNotBlank() || imageCount > 0) && !isImporting
+    val guardedDismiss = com.muxuechat.presentation.common.components.rememberGuardedDismiss(
+        text.text != initialContent || imageDraft?.isChanged == true,
+        onDismiss,
+    )
     AlertDialog(
         onDismissRequest = guardedDismiss,
         title = { Text("编辑用户消息") },
@@ -1030,6 +1100,32 @@ private fun EditUserMessageDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (imageDraft != null) {
+                    ImagePreviewStrip(
+                        items = imageDraft.kept.map { it.toStripItem() } + imageDraft.added.map { it.toStripItem() },
+                        isImporting = isImporting,
+                        enabled = !isImporting,
+                        onRemove = { item ->
+                            when (val ref = item.ref) {
+                                is ChatImageRef.Attachment -> onRemoveImage(ref.id, null)
+                                is ChatImageRef.Pending -> onRemoveImage(null, ref.id)
+                            }
+                        },
+                        modifier = Modifier.padding(top = 12.dp),
+                    )
+                    TextButton(
+                        onClick = onPickImages,
+                        enabled = imageDraft.remainingSlots > 0 && !isImporting,
+                    ) {
+                        Text(
+                            when {
+                                isImporting -> "正在处理图片…"
+                                imageDraft.remainingSlots > 0 -> "添加图片（还可添加 ${imageDraft.remainingSlots} 张）"
+                                else -> "已达 ${ImageInputSpec.MAX_IMAGES_PER_MESSAGE} 张上限"
+                            },
+                        )
+                    }
+                }
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },

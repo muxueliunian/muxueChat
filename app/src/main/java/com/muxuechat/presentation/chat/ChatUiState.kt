@@ -5,6 +5,9 @@ import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.Conversation
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.DisplaySettings
+import com.muxuechat.domain.model.ImageInputSpec
+import com.muxuechat.domain.model.MessageAttachment
+import com.muxuechat.domain.model.PendingImage
 import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.model.RoleCard
@@ -20,6 +23,22 @@ data class PendingAttachment(
     val text: String,
 ) {
     val charCount: Int get() = text.length
+}
+
+/**
+ * 编辑历史用户消息时的图片草稿（D4、MM-2）：保留哪些原图、追加哪些新选的待发送图片。
+ * 新图在选中时就已导入、压缩进待发送区，由 ViewModel 持有；提交或放弃编辑时交给 Repository 或丢弃。
+ */
+data class EditImageDraft(
+    val messageId: String,
+    val original: List<MessageAttachment>,
+    val kept: List<MessageAttachment>,
+    val added: List<PendingImage> = emptyList(),
+    val isImporting: Boolean = false,
+) {
+    val totalCount: Int get() = kept.size + added.size
+    val remainingSlots: Int get() = ImageInputSpec.MAX_IMAGES_PER_MESSAGE - totalCount
+    val isChanged: Boolean get() = kept.map { it.id } != original.map { it.id } || added.isNotEmpty()
 }
 
 data class ChatUiState(
@@ -59,6 +78,11 @@ data class ChatUiState(
     val settingsToolDrafts: List<SettingsToolDraft> = emptyList(),
     val isSavingSettingsDraft: Boolean = false,
     val pendingAttachment: PendingAttachment? = null,
+    /** 已导入、等待随下一条消息发送的图片（最多 4 张）。 */
+    val pendingImages: List<PendingImage> = emptyList(),
+    val isImportingImages: Boolean = false,
+    /** 正在编辑的用户消息的图片草稿；没有打开编辑弹窗时为 null。 */
+    val editImageDraft: EditImageDraft? = null,
     /** 已保存 API Key 的自定义供应商 id；只用于显示状态，不含明文。 */
     val providersWithSavedKey: Set<String> = emptySet(),
     /** 正在拉取模型列表的供应商 id。 */

@@ -88,6 +88,11 @@ class ChatImageImporter(
         }
     }
 
+    /** 用户移除或放弃了待发送图片：删除待发送区里的文件。不存在时是空操作。 */
+    suspend fun discard(pendingIds: Collection<String>) = withContext(Dispatchers.IO) {
+        pendingIds.forEach(store::discardPending)
+    }
+
     private fun decode(uri: Uri): Bitmap {
         val source = ImageDecoder.createSource(contentResolver, uri)
         return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->

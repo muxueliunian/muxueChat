@@ -25,8 +25,12 @@ class ModelPresentationTest {
         val notes = ModelNotes.deepSeekNotes(id, directory, null).map { it.text }
         assertTrue(directory.visibleModelIds.contains(id))
         assertTrue(notes.contains(ModelNotes.LEGACY_FLASH_ID))
-        assertTrue(notes.contains(ModelNotes.TEXT_ONLY_INPUT))
-        // 普通 Flash 旧名不是视觉模型，不应被标注图片相关限制。
+        // D8：不标注任何模型的图片能力，视觉实验旧名也只说明它是旧名。
+        assertTrue(notes.none { "图片" in it })
+        assertEquals(
+            listOf(ModelNotes.LEGACY_FLASH_ID),
+            ModelNotes.deepSeekCapabilityNotes(DeepSeekModels.V4_FLASH_VISION_EXP).map { it.text },
+        )
         val legacyText = ModelNotes.deepSeekCapabilityNotes(DeepSeekModels.V4_FLASH).map { it.text }
         assertEquals(listOf(ModelNotes.LEGACY_FLASH_ID), legacyText)
         assertTrue(notes.any { "仍保留当前选择" in it })
@@ -36,10 +40,12 @@ class ModelPresentationTest {
         assertFalse(marker.unavailableReason.orEmpty().contains("不是 DeepSeek V4"))
     }
 
-    @Test fun flashIsMarkedTextOnlyUntilImageInputShips() {
+    @Test fun noModelIsAnnotatedWithImageCapability() {
+        // D8：App 不判断模型是否支持图片，图片入口始终可用，模型行也不写任何图片能力说明。
         val directory = DeepSeekModels.directory(DeepSeekModels.FLASH, emptyList())
         val notes = ModelNotes.deepSeekNotes(DeepSeekModels.FLASH, directory, null).map { it.text }
-        assertTrue(notes.contains(ModelNotes.TEXT_ONLY_INPUT))
+        assertTrue(ModelNotes.deepSeekCapabilityNotes(DeepSeekModels.FLASH).isEmpty())
+        assertTrue(notes.none { "图片" in it || "文本输入" in it })
         assertFalse(notes.contains(ModelNotes.LEGACY_FLASH_ID))
         assertTrue(ModelNotes.deepSeekNotes(DeepSeekModels.V4_PRO, directory, null).none { "图片" in it.text || "旧名" in it.text })
     }

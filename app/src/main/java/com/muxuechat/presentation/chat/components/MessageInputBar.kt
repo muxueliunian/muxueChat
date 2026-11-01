@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -25,7 +24,10 @@ import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Stop
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -36,6 +38,10 @@ import androidx.compose.material3.Text
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -45,6 +51,8 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.muxuechat.domain.model.ImageInputSpec
+import com.muxuechat.domain.model.PendingImage
 import com.muxuechat.presentation.chat.PendingAttachment
 import com.muxuechat.presentation.theme.MinTouchTarget
 import com.muxuechat.presentation.theme.Spacing
@@ -59,12 +67,19 @@ fun MessageInputBar(
     modifier: Modifier = Modifier,
     attachment: PendingAttachment? = null,
     isImportingAttachment: Boolean = false,
-    canAttach: Boolean = false,
-    onAttach: () -> Unit = {},
+    /** 文本文档附件只给设定生成工具用；RP 进行中或工具未开启时不可用（图片不受影响）。 */
+    canAttachDocument: Boolean = false,
+    onAttachDocument: () -> Unit = {},
     onRemoveAttachment: () -> Unit = {},
+    pendingImages: List<PendingImage> = emptyList(),
+    isImportingImages: Boolean = false,
+    onPickImages: () -> Unit = {},
+    onRemovePendingImage: (String) -> Unit = {},
 ) {
-    // 带附件时即使正文为空也允许发送——附件本身就是内容。
-    val canSend = (value.text.isNotBlank() || attachment != null) && !isGenerating && !isImportingAttachment
+    // 带附件或图片时即使正文为空也允许发送——它们本身就是内容（D6）。
+    val hasContent = value.text.isNotBlank() || attachment != null || pendingImages.isNotEmpty()
+    val isImporting = isImportingAttachment || isImportingImages
+    val canSend = hasContent && !isGenerating && !isImporting
     Surface(
         color = MaterialTheme.colorScheme.background,
         contentColor = MaterialTheme.colorScheme.onBackground,
@@ -84,6 +99,13 @@ fun MessageInputBar(
             attachment?.let { pending ->
                 AttachmentChip(attachment = pending, onRemove = onRemoveAttachment)
             }
+            ImagePreviewStrip(
+                items = pendingImages.map { it.toStripItem() },
+                isImporting = isImportingImages,
+                enabled = !isGenerating,
+                onRemove = { item -> (item.ref as? ChatImageRef.Pending)?.let { onRemovePendingImage(it.id) } },
+                modifier = Modifier.padding(bottom = Spacing.Small),
+            )
             Row(
                 verticalAlignment = Alignment.Bottom,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -98,21 +120,20 @@ fun MessageInputBar(
                     )
                     .padding(Spacing.Tight),
             ) {
-                if (canAttach) {
-                    IconButton(
-                        onClick = onAttach,
-                        enabled = !isGenerating && !isImportingAttachment,
-                        modifier = Modifier.size(com.muxuechat.presentation.theme.MinTouchTarget),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.AttachFile,
-                            contentDescription = if (isImportingAttachment) "正在提取文档文字" else if (isGenerating) "附加文本文档，生成期间不可用" else "附加文本文档，仅提取文字，不支持图片",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                } else {
-                    Spacer(modifier = Modifier.size(Spacing.Small))
-                }
+                // 图片入口始终可用，不按当前模型禁用（D8）；普通聊天与 RP 共用这一个菜单。
+                AttachmentMenuButton(
+                    enabled = !isGenerating && !isImporting,
+                    disabledReason = when {
+                        isImportingImages -> "正在处理图片"
+                        isImportingAttachment -> "正在提取文档文字"
+                        isGenerating -> "生成期间不可用"
+                        else -> null
+                    },
+                    remainingImageSlots = ImageInputSpec.MAX_IMAGES_PER_MESSAGE - pendingImages.size,
+                    canAttachDocument = canAttachDocument,
+                    onPickImages = onPickImages,
+                    onAttachDocument = onAttachDocument,
+                )
                 MessageTextField(
                     value = value,
                     onValueChange = onValueChange,
@@ -125,12 +146,87 @@ fun MessageInputBar(
                 SendOrStopButton(
                     isGenerating = isGenerating,
                     canSend = canSend,
-                    isImportingAttachment = isImportingAttachment,
-                    hasContent = value.text.isNotBlank() || attachment != null,
+                    isImportingAttachment = isImporting,
+                    hasContent = hasContent,
                     onSend = onSend,
                     onStop = onStop,
                 )
             }
+        }
+    }
+}
+
+/**
+ * 附件菜单：「图片」「文本文档」。不可用的项照样列出并写明原因，而不是悄悄消失。
+ */
+@Composable
+private fun AttachmentMenuButton(
+    enabled: Boolean,
+    disabledReason: String?,
+    remainingImageSlots: Int,
+    canAttachDocument: Boolean,
+    onPickImages: () -> Unit,
+    onAttachDocument: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(
+            onClick = { expanded = true },
+            enabled = enabled,
+            modifier = Modifier.size(MinTouchTarget),
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.AttachFile,
+                contentDescription = disabledReason?.let { "添加附件，当前不可用：$it" } ?: "添加附件：图片或文本文档",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            val canPickImages = remainingImageSlots > 0
+            DropdownMenuItem(
+                text = {
+                    Column {
+                        Text("图片")
+                        Text(
+                            text = if (canPickImages) {
+                                "从相册选择，还可添加 $remainingImageSlots 张"
+                            } else {
+                                "每条消息最多 ${ImageInputSpec.MAX_IMAGES_PER_MESSAGE} 张，已达上限"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
+                leadingIcon = { Icon(Icons.Outlined.Image, contentDescription = null) },
+                enabled = canPickImages,
+                onClick = {
+                    expanded = false
+                    onPickImages()
+                },
+            )
+            DropdownMenuItem(
+                text = {
+                    Column {
+                        Text("文本文档")
+                        Text(
+                            text = if (canAttachDocument) {
+                                "仅提取 .txt / .md 文字，供设定生成工具使用"
+                            } else {
+                                "仅在开启设定生成工具、且未进行 RP 时可用"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
+                leadingIcon = { Icon(Icons.Outlined.Description, contentDescription = null) },
+                enabled = canAttachDocument,
+                onClick = {
+                    expanded = false
+                    onAttachDocument()
+                },
+            )
         }
     }
 }
@@ -263,7 +359,7 @@ private fun SendOrStopButton(
             Icon(
                 imageVector = Icons.AutoMirrored.Outlined.Send,
                 // 禁用时也要说明原因，否则 TalkBack 只会读出一个读不出所以然的「发送」。
-                contentDescription = if (isImportingAttachment) "发送不可用，正在提取文档文字" else if (hasContent) "发送" else "发送，当前不可用：还没有输入内容",
+                contentDescription = if (isImportingAttachment) "发送不可用，正在处理附件" else if (hasContent) "发送" else "发送，当前不可用：还没有输入内容",
             )
         }
     }

@@ -20,7 +20,7 @@ enum class ModelNoteTone {
     /** 中性事实，例如「未配置窗口，按回退值计算」。 */
     NEUTRAL,
 
-    /** 需要用户注意的限制或偏差，例如「仅支持文本输入」。 */
+    /** 需要用户注意的限制或偏差，例如「服务器目录未返回该模型」。 */
     CAUTION,
 }
 
@@ -30,13 +30,10 @@ enum class ModelNoteTone {
  * 规则（对应 AGENT.md 的模型元数据边界）：
  * - 只认完整模型 ID，**绝不**按名字里是否含 vision / v4 / 32k 猜测能力；
  * - 未知模型只说「App 不知道它的窗口」，不说它支不支持视觉或 RP；
- * - 多模态模型必须明确说明当前 App 只能发文本；
+ * - 不标注任何模型的图片能力：App 不判断模型是否支持图片，不支持时由上游报错（MULTIMODAL_PLAN D8）；
  * - 已迁移走的旧 ID 必须说明已被取代。
  */
 object ModelNotes {
-    /** 图片输入尚未实现，这条文案不允许在别处另写一份。 */
-    const val TEXT_ONLY_INPUT = "当前 App 仅支持文本输入，尚未支持图片。"
-
     const val LEGACY_FLASH_ID = "旧名，已由 ${DeepSeekModels.FLASH} 取代。"
 
     const val UNKNOWN_WINDOW_PREFIX = "App 不知道此模型的上下文窗口"
@@ -61,17 +58,11 @@ object ModelNotes {
         return notes
     }
 
-    /** 只取决于模型 ID 本身的说明（旧名、仅文本输入），设置页与模型面板共用。 */
+    /** 只取决于模型 ID 本身的说明（目前只有旧名），设置页与模型面板共用。 */
     fun deepSeekCapabilityNotes(modelId: String): List<ModelNote> =
         when {
-            // 视觉实验旧名仍可能出现在服务器目录里；即使它已被取代，也必须写明 App 只能发文本，
-            // 否则用户看到「vision」字样会以为能发图。
-            modelId.trim() == DeepSeekModels.V4_FLASH_VISION_EXP -> listOf(
-                ModelNote(LEGACY_FLASH_ID, ModelNoteTone.CAUTION),
-                ModelNote(TEXT_ONLY_INPUT, ModelNoteTone.CAUTION),
-            )
+            // 视觉实验旧名同属旧名；不再另外标注图片能力（D8）。
             DeepSeekModels.isLegacyFlashId(modelId) -> listOf(ModelNote(LEGACY_FLASH_ID, ModelNoteTone.CAUTION))
-            modelId.trim() == DeepSeekModels.FLASH -> listOf(ModelNote(TEXT_ONLY_INPUT, ModelNoteTone.CAUTION))
             else -> emptyList()
         }
 

@@ -29,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.muxuechat.domain.model.ImageInputSpec
 import com.muxuechat.domain.context.ContextCapacitySource
 import com.muxuechat.domain.context.ContextCompressionMode
 import com.muxuechat.domain.context.ContextCompressionPolicy
@@ -260,6 +261,7 @@ private fun BreakdownSection(plan: ContextWindowPlan) {
             BreakdownRow("已压缩为摘要", "${plan.summarizedMessageCount} 条")
         }
         BreakdownRow("历史总量", "${plan.totalHistoryMessageCount} 条")
+        ImageUsageRows(plan)
 
         if (plan.summaryInvalidated) {
             Text(
@@ -279,6 +281,33 @@ private fun BreakdownSection(plan: ContextWindowPlan) {
                 color = MaterialTheme.colorScheme.error,
             )
         }
+    }
+}
+
+/**
+ * 本轮请求里的图片（MULTIMODAL_PLAN 3.6）：携带张数、因请求体积上限省略的更早图片、文件已丢失的图片。
+ * 图片按每张固定的预计 token 计入「逐字历史」，与文字一样只能标「预计」。
+ */
+@Composable
+private fun ImageUsageRows(plan: ContextWindowPlan) {
+    if (plan.imageCount > 0) {
+        BreakdownRow("本轮携带图片", "${plan.imageCount} 张（预计已计入历史）")
+    }
+    if (plan.omittedImageCount > 0) {
+        Text(
+            text = "有 ${plan.omittedImageCount} 张更早的图片因请求体积上限（" +
+                "${ImageInputSpec.MAX_IMAGE_PAYLOAD_BYTES / (1024 * 1024)} MB）未随本轮发送，已换成文字占位；" +
+                "本条消息的图片不受影响。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    if (plan.missingImageCount > 0) {
+        Text(
+            text = "有 ${plan.missingImageCount} 张图片的文件已丢失，请求中以「图片文件已丢失」文字代替。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+        )
     }
 }
 
