@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -75,6 +76,9 @@ fun MessageInputBar(
     isImportingImages: Boolean = false,
     onPickImages: () -> Unit = {},
     onRemovePendingImage: (String) -> Unit = {},
+    /** 当前供应商与模型下的思考档位；null 时不显示（例如还没有可用的自定义供应商）。 */
+    thinking: ThinkingControlState? = null,
+    onSelectThinking: (ThinkingChoice) -> Unit = {},
 ) {
     // 带附件或图片时即使正文为空也允许发送——它们本身就是内容（D6）。
     val hasContent = value.text.isNotBlank() || attachment != null || pendingImages.isNotEmpty()
@@ -106,9 +110,8 @@ fun MessageInputBar(
                 onRemove = { item -> (item.ref as? ChatImageRef.Pending)?.let { onRemovePendingImage(it.id) } },
                 modifier = Modifier.padding(bottom = Spacing.Small),
             )
-            Row(
-                verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            // 主流聊天应用的输入框：上面整宽写字，下面一排工具（附件、思考档位），发送键在右下。
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(com.muxuechat.presentation.theme.Corner.Container)
@@ -120,37 +123,45 @@ fun MessageInputBar(
                     )
                     .padding(Spacing.Tight),
             ) {
-                // 图片入口始终可用，不按当前模型禁用（D8）；普通聊天与 RP 共用这一个菜单。
-                AttachmentMenuButton(
-                    enabled = !isGenerating && !isImporting,
-                    disabledReason = when {
-                        isImportingImages -> "正在处理图片"
-                        isImportingAttachment -> "正在提取文档文字"
-                        isGenerating -> "生成期间不可用"
-                        else -> null
-                    },
-                    remainingImageSlots = ImageInputSpec.MAX_IMAGES_PER_MESSAGE - pendingImages.size,
-                    canAttachDocument = canAttachDocument,
-                    onPickImages = onPickImages,
-                    onAttachDocument = onAttachDocument,
-                )
                 MessageTextField(
                     value = value,
                     onValueChange = onValueChange,
                     modifier = Modifier
-                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = Spacing.Small)
                         .semantics { contentDescription = "消息正文" }
-                        // 最小高度与右侧按钮一致，单行时文字和按钮垂直居中对齐。
-                        .heightIn(min = MinTouchTarget, max = 180.dp),
+                        .heightIn(min = 40.dp, max = 180.dp),
                 )
-                SendOrStopButton(
-                    isGenerating = isGenerating,
-                    canSend = canSend,
-                    isImportingAttachment = isImporting,
-                    hasContent = hasContent,
-                    onSend = onSend,
-                    onStop = onStop,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.Tight),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    // 图片入口始终可用，不按当前模型禁用（D8）；普通聊天与 RP 共用这一个菜单。
+                    AttachmentMenuButton(
+                        enabled = !isGenerating && !isImporting,
+                        disabledReason = when {
+                            isImportingImages -> "正在处理图片"
+                            isImportingAttachment -> "正在提取文档文字"
+                            isGenerating -> "生成期间不可用"
+                            else -> null
+                        },
+                        remainingImageSlots = ImageInputSpec.MAX_IMAGES_PER_MESSAGE - pendingImages.size,
+                        canAttachDocument = canAttachDocument,
+                        onPickImages = onPickImages,
+                        onAttachDocument = onAttachDocument,
+                    )
+                    thinking?.let { ThinkingSelector(state = it, onSelect = onSelectThinking) }
+                    Spacer(modifier = Modifier.weight(1f))
+                    SendOrStopButton(
+                        isGenerating = isGenerating,
+                        canSend = canSend,
+                        isImportingAttachment = isImporting,
+                        hasContent = hasContent,
+                        onSend = onSend,
+                        onStop = onStop,
+                    )
+                }
             }
         }
     }

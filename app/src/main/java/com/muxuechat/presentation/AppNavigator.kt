@@ -145,6 +145,7 @@ fun MuxueChatApp(
                         onDiscardSettingsDraft = viewModel::discardSettingsDraft,
                         onConfirmSettingsDeletion = viewModel::confirmSettingsDeletion,
                         onSelectDeepSeekModel = viewModel::selectDeepSeekModel,
+                        onSelectThinking = viewModel::selectThinking,
                         onSelectCustomProviderModel = viewModel::selectCustomProviderModel,
                         onRefreshProviderModels = viewModel::refreshProviderModels,
                         onSyncRpMetricDefinitions = viewModel::syncActiveRpMetricDefinitions,

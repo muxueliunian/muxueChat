@@ -35,7 +35,7 @@ internal fun ChatSettings.rpMarkerAvailability(): RpMarkerAvailability {
         else -> RpMarkerAvailability(
             isAvailable = false,
             unavailableReason = "当前模型支持 DeepSeek Marker，但需要开启思考模式。" +
-                "请先到「设置 → 思考与采样」打开思考模式。",
+                "请先在输入框的「思考」里选择一个档位。",
         )
     }
 }

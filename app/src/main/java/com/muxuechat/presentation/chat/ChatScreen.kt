@@ -51,6 +51,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.presentation.chat.components.SettingsDeletionSheet
+import com.muxuechat.presentation.chat.components.thinkingControlState
 import com.muxuechat.domain.tool.RpSettingsInventory
 import com.muxuechat.domain.model.RpSettingRef
 import com.muxuechat.presentation.chat.components.SupportingCharacterEditorSheet
@@ -146,6 +147,7 @@ fun ChatScreen(
     onConfirmSettingsDeletion: (draftId: String, refs: List<RpSettingRef>) -> Unit,
     onSelectDeepSeekModel: (String) -> Unit,
     onSelectCustomProviderModel: (providerId: String, model: String) -> Unit,
+    onSelectThinking: (com.muxuechat.presentation.chat.components.ThinkingChoice) -> Unit,
     onRefreshProviderModels: (String) -> Unit,
     modifier: Modifier = Modifier,
     onSyncRpMetricDefinitions: (String, com.muxuechat.domain.model.RpEntryOwner) -> Unit = { _, _ -> },
@@ -247,6 +249,7 @@ fun ChatScreen(
 
     val isRpActive = state.activeRpSettings?.isRpEnabled == true &&
         state.activeRpSettings.conversationId == state.activeConversationId
+    val thinkingState = remember(state.settings) { state.settings.thinkingControlState() }
     val showStatusPanel = isRpActive && state.activeRpStatusPanel != null &&
         state.activeRpStatusPanel.conversationId == state.activeConversationId
     val rpMarkerAvailability = state.settings.rpMarkerAvailability()
@@ -392,6 +395,8 @@ fun ChatScreen(
                     isImportingImages = state.isImportingImages,
                     onPickImages = composerImagePicker,
                     onRemovePendingImage = onRemovePendingImage,
+                    thinking = thinkingState,
+                    onSelectThinking = onSelectThinking,
                 )
             },
             snackbarHost = { SnackbarHost(snackbarHostState) },

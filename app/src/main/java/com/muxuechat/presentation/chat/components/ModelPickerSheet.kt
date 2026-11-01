@@ -1,7 +1,6 @@
 package com.muxuechat.presentation.chat.components
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -19,6 +18,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.IconButton
+import androidx.compose.foundation.layout.Box
+import com.muxuechat.presentation.common.ModelNoteTone
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -36,6 +39,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -49,12 +57,9 @@ import com.muxuechat.domain.model.CustomProvider
 import com.muxuechat.presentation.common.ModelListWindow
 import com.muxuechat.presentation.common.ModelNote
 import com.muxuechat.presentation.common.ModelNotes
-import com.muxuechat.presentation.common.components.MetaLine
 import com.muxuechat.presentation.common.components.ModelNoteList
 import com.muxuechat.presentation.common.components.ModelSearchField
 import com.muxuechat.presentation.common.components.TruncatedListHint
-import com.muxuechat.presentation.common.describeDirectorySource
-import com.muxuechat.presentation.common.describeLastRefreshed
 import com.muxuechat.presentation.common.describeRefreshAction
 import com.muxuechat.presentation.theme.Corner
 import com.muxuechat.presentation.theme.MinTouchTarget
@@ -104,11 +109,6 @@ fun ModelPickerSheet(
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
-                Text(
-                    text = "选中即同时切换供应商与模型。设置在下一次发送时生效。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
                 ModelSearchField(
                     value = query,
                     onValueChange = { query = it },
@@ -121,10 +121,11 @@ fun ModelPickerSheet(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
+                    .nestedScroll(BlockUpwardOverscrollToSheet)
                     .padding(horizontal = Spacing.Content),
-                verticalArrangement = Arrangement.spacedBy(Spacing.Tight),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    top = Spacing.Medium,
+                    top = Spacing.Small,
                     bottom = Spacing.Section,
                 ),
             ) {
@@ -139,7 +140,6 @@ fun ModelPickerSheet(
                 providerGroup(
                     key = "deepseek",
                     title = "DeepSeek",
-                    meta = describeDirectorySource(directory),
                     refreshError = refreshErrors[deepSeekProviderId],
                     window = deepSeekWindow,
                     emptyText = if (query.isBlank()) {
@@ -182,10 +182,6 @@ fun ModelPickerSheet(
                         key = "provider-${provider.id}",
                         title = provider.displayName,
                         refreshError = refreshErrors[provider.id],
-                        meta = buildString {
-                            append("共 ${provider.models.size} 个已知模型 · ")
-                            append(describeLastRefreshed(provider.modelsUpdatedAtMillis))
-                        },
                         window = providerWindow,
                         emptyText = if (query.isBlank()) {
                             "还没有模型。可以刷新，或在设置里手动添加模型名。"
@@ -204,7 +200,7 @@ fun ModelPickerSheet(
                             ) {
                                 notes += ModelNote(
                                     "该模型不在最近一次拉取的列表里，仍保留当前选择",
-                                    com.muxuechat.presentation.common.ModelNoteTone.CAUTION,
+                                    ModelNoteTone.CAUTION,
                                 )
                             }
                             notes += ModelNotes.customProviderNotes(
@@ -234,25 +230,34 @@ fun ModelPickerSheet(
                 }
             }
 
-            androidx.compose.foundation.layout.FlowRow(
+            TextButton(
+                onClick = {
+                    onDismiss()
+                    onOpenSettings()
+                },
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = Spacing.Small, vertical = Spacing.Tight),
+                    .padding(horizontal = Spacing.Small)
+                    .heightIn(min = MinTouchTarget),
             ) {
-                TextButton(
-                    onClick = {
-                        onDismiss()
-                        onOpenSettings()
-                    },
-                    modifier = Modifier.heightIn(min = MinTouchTarget),
-                ) {
-                    Text("管理供应商与模型")
-                }
-                TextButton(onClick = onDismiss) { Text("关闭") }
+                Text("管理供应商与模型")
             }
             Spacer(modifier = Modifier.height(Spacing.Small))
         }
     }
+}
+
+/**
+ * 列表滑到底后继续上推的余量不交给外层面板。
+ *
+ * 面板已完全展开，再收到向上的拖动/甩动只会触发它自己的越界回弹，与列表的回弹互相拉扯，
+ * 整个面板上下抽动（2026-11-01 真机录屏）。向下的余量照常交给面板，列表在顶部时仍可下拉关闭。
+ */
+private val BlockUpwardOverscrollToSheet = object : NestedScrollConnection {
+    override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset =
+        if (available.y < 0f) Offset(0f, available.y) else Offset.Zero
+
+    override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity =
+        if (available.y < 0f) Velocity(0f, available.y) else Velocity.Zero
 }
 
 /** 选中的模型未必在最近一次拉取的列表里；它必须仍然出现，否则用户会以为自己的选择丢了。 */
@@ -264,13 +269,11 @@ private fun CustomProvider.visibleModelIds(): List<String> {
 /**
  * 一个供应商分组。
  *
- * 每组的结构完全一致：组名 → 目录来源与刷新时间 → 刷新入口 → 模型行 → 截断提示。
- * 分组之间不允许出现「DeepSeek 有刷新时间、自定义供应商没有」这种差异。
+ * 每组的结构完全一致：组名与刷新入口 → 模型行 → 截断提示。
  */
 private fun LazyListScope.providerGroup(
     key: String,
     title: String,
-    meta: String,
     refreshError: String?,
     window: ModelListWindow,
     emptyText: String,
@@ -284,7 +287,6 @@ private fun LazyListScope.providerGroup(
     item(key = "$key-header") {
         ProviderGroupHeader(
             title = title,
-            meta = meta,
             isRefreshingThis = isRefreshingThis,
             isRefreshingOther = isRefreshingOther,
             onRefresh = onRefresh,
@@ -310,57 +312,70 @@ private fun LazyListScope.providerGroup(
     ) { modelId ->
         ModelRow(
             title = modelId,
-            notes = notesFor(modelId),
+            // 面板里只留需要注意的标注，中性说明留给设置页。
+            notes = notesFor(modelId).filter { it.tone == ModelNoteTone.CAUTION },
             selected = isSelected(modelId),
             onClick = { onSelect(modelId) },
         )
     }
-    item(key = "$key-truncated") {
-        TruncatedListHint(hiddenCount = window.hiddenCount, isFiltered = window.isFiltered)
+    // 没有被截断时不放这一项：LazyColumn 里零高度的项落在列表末尾时，滑到底会和面板拖拽来回抢滚动，整面板上下抽动。
+    if (window.hiddenCount > 0) {
+        item(key = "$key-truncated") {
+            TruncatedListHint(hiddenCount = window.hiddenCount, isFiltered = window.isFiltered)
+        }
     }
 }
 
 @Composable
 private fun ProviderGroupHeader(
     title: String,
-    meta: String,
     isRefreshingThis: Boolean,
     isRefreshingOther: Boolean,
     onRefresh: () -> Unit,
 ) {
-    Column(
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = Spacing.Medium, bottom = Spacing.Tight),
-        verticalArrangement = Arrangement.spacedBy(2.dp),
+            .padding(top = Spacing.Medium),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        // 刷新全局串行：别的列表在刷新时这里置灰，并直接写出原因。
+        if (isRefreshingOther) {
             Text(
-                text = title,
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
+                text = describeRefreshAction(isRefreshingThis, isRefreshingOther),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.size(MinTouchTarget),
+        ) {
             if (isRefreshingThis) {
                 CircularProgressIndicator(
                     strokeWidth = 2.dp,
                     modifier = Modifier
-                        .size(16.dp)
+                        .size(18.dp)
                         .semantics { contentDescription = "$title 正在刷新模型列表" },
                 )
-                Spacer(modifier = Modifier.size(Spacing.Small))
-            }
-            TextButton(
-                onClick = onRefresh,
-                enabled = !isRefreshingThis && !isRefreshingOther,
-                modifier = Modifier.heightIn(min = MinTouchTarget),
-            ) {
-                Text(describeRefreshAction(isRefreshingThis, isRefreshingOther))
+            } else {
+                IconButton(onClick = onRefresh, enabled = !isRefreshingOther) {
+                    Icon(
+                        imageVector = Icons.Outlined.Refresh,
+                        contentDescription = "$title：${describeRefreshAction(false, isRefreshingOther)}",
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
             }
         }
-        MetaLine(text = meta)
     }
 }
 
@@ -373,30 +388,18 @@ private fun ModelRow(
 ) {
     val notesDescription = notes.joinToString("；") { it.text }
     Row(
-        verticalAlignment = Alignment.Top,
+        verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = MinTouchTarget)
             .clip(Corner.Control)
-            .background(
-                if (selected) MaterialTheme.colorScheme.primaryContainer
-                else MaterialTheme.colorScheme.surfaceContainerLow,
-            )
-            .border(
-                width = 1.dp,
-                color = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent,
-                shape = Corner.Control,
-            )
+            .background(if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
             .clickable(onClick = onClick)
             .semantics {
                 this.selected = selected
-                contentDescription = if (selected) {
-                    "$title，使用中。$notesDescription"
-                } else {
-                    "$title。$notesDescription"
-                }
+                contentDescription = if (selected) "$title，使用中。$notesDescription" else "$title。$notesDescription"
             }
-            .padding(horizontal = Spacing.Medium, vertical = Spacing.Medium),
+            .padding(horizontal = Spacing.Medium, vertical = Spacing.Small),
     ) {
         Column(
             modifier = Modifier
@@ -406,33 +409,24 @@ private fun ModelRow(
         ) {
             Text(
                 text = title,
-                style = MaterialTheme.typography.bodyMedium,
-                color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (selected) MaterialTheme.colorScheme.onSecondaryContainer
                 else MaterialTheme.colorScheme.onSurface,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+                maxLines = 1,
+                // 模型 ID 的区分信息常在末尾（版本、日期），省略中间。
+                overflow = TextOverflow.MiddleEllipsis,
             )
             ModelNoteList(notes = notes)
         }
         if (selected) {
-            // 选中同时用「图标 + 文字 + 边框」表达，不依赖底色这一种信号。
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(start = Spacing.Small),
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Check,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.size(16.dp),
-                )
-                Text(
-                    text = "使用中",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.padding(start = Spacing.Tight),
-                )
-            }
+            Icon(
+                imageVector = Icons.Outlined.Check,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier
+                    .padding(start = Spacing.Small)
+                    .size(20.dp),
+            )
         }
     }
 }

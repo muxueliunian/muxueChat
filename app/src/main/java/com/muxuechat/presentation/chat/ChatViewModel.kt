@@ -38,6 +38,7 @@ import com.muxuechat.domain.model.ChatSettings
 import com.muxuechat.domain.model.Conversation
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.CustomProvider
+import com.muxuechat.domain.model.ThinkingMode
 import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
@@ -74,6 +75,8 @@ import com.muxuechat.domain.usecase.RetryRpOptionsUseCase
 import com.muxuechat.domain.usecase.SendMessageUseCase
 import com.muxuechat.domain.usecase.StopGenerationUseCase
 import com.muxuechat.presentation.chat.components.ChatImageRef
+import com.muxuechat.presentation.chat.components.ThinkingChoice
+import com.muxuechat.domain.model.ReasoningEffortCatalog
 import com.muxuechat.data.repository.RpBindingDraft
 import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.model.RpSettingRef
@@ -1024,6 +1027,21 @@ class ChatViewModel(
         }
     }
 
+    /** 输入栏的思考档位：DeepSeek 改全局 thinking 设置，自定义供应商改当前供应商的 reasoning_effort。 */
+    fun selectThinking(choice: ThinkingChoice) {
+        when (choice) {
+            ThinkingChoice.DeepSeekOff -> updateSettings { it.copy(thinkingMode = ThinkingMode.DISABLED) }
+            is ThinkingChoice.DeepSeekEffort -> updateSettings {
+                it.copy(thinkingMode = ThinkingMode.ENABLED, reasoningEffort = choice.effort)
+            }
+            is ThinkingChoice.ProviderEffort -> {
+                val providerId = uiState.value.settings.activeCustomProvider?.id ?: return
+                val value = choice.value.trim().take(CustomProvider.MAX_REASONING_EFFORT_LENGTH)
+                updateCustomProvider(providerId) { it.copy(reasoningEffort = value) }
+            }
+        }
+    }
+
     /** 聊天页选择 DeepSeek 的某个模型：同时把路由切回 DeepSeek。 */
     fun selectDeepSeekModel(modelId: String) {
         val normalized = DeepSeekModels.normalizeSelectedId(modelId)
@@ -1035,6 +1053,15 @@ class ChatViewModel(
         viewModelScope.launch {
             runCatching {
                 settingsRepository.selectCustomProviderModel(providerId, model)
+                // 新模型有已核实的档位、而当前值不在其中时改回「不发送」：留着会让请求直接 400。
+                // 不在内置表里的模型保留用户自填值。
+                val allowed = ReasoningEffortCatalog.optionsFor(model)
+                if (allowed != null) {
+                    settingsRepository.updateCustomProvider(providerId) { provider ->
+                        val current = provider.reasoningEffort.trim()
+                        if (current.isNotEmpty() && current !in allowed) provider.copy(reasoningEffort = "") else provider
+                    }
+                }
             }.onFailure { error ->
                 Log.w(TAG, "Selecting provider model failed: ${error.message}", error)
                 transient.update { it.copy(errorMessage = "模型切换失败：${error.message ?: "未知错误"}") }
