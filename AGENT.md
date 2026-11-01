@@ -68,6 +68,18 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 - 「一般化」的边界到此为止：不引入通用多 Provider SDK，不为 Anthropic、Gemini 等非 OpenAI 协议新增适配层。用户需要这些服务时，应填写它们的 OpenAI 兼容端点（Google Vertex 的 `openapi` 端点即属此类，见上文「Google Vertex 链路」）。
 - 设置页必须明确告知用户「只支持 DeepSeek 协议与 OpenAI 兼容格式」，不要让用户以为填任意厂商地址都能用。
 
+### 图片输入（用户 2026-09-16 / 2026-11-01 确认，详见 `docs/MULTIMODAL_PLAN.md`）
+
+- **不判断模型是否支持图片**（D8）：不维护能力表、不加逐模型或全局开关、不剥除历史图片、不按模型禁用图片入口，
+  也不在模型标注里写图片能力。图片一律照发，上游拒绝就按普通请求错误显示；唯一的附加处理是本轮请求带图且
+  HTTP 400 / 413 时追加一句留有余地的图片提示，判断只依据「请求是否含图」与通用 HTTP 状态码（`httpStatusOrNull()`），
+  不匹配错误文案、不识别厂商异常类型。
+- 允许只发图片、不写文字（D6）；每条用户消息最多 4 张；本地统一压缩为 JPEG（长边 ≤ 1568px、质量 85），丢弃 EXIF，绝不上传原图字节。
+- 历史图片每轮重发（D2），唯一例外是 20 MiB 的请求体安全上限：超出时从最旧的历史图片开始换成文字占位，本轮图片永不省略。
+- 图片只挂在 user 消息上，system / assistant / 工具消息绝不带图。
+- 以下内部请求不发图片，只发文字占位：RP 剧情推进建议、元数据补写、状态兜底、上下文摘要、AI 标题、设定生成工具
+  （RP 辅助请求固定走 DeepSeek 时同样只发占位）。
+
 当前 MVP 已验证：
 
 - DeepSeek API Key 本地保存。
@@ -75,7 +87,8 @@ App 只承认两类协议，且这两类是**协议边界**而不是服务清单
 - 流式输出可正常显示。
 - 支持 `deepseek-flash`（默认，V4.1-Flash）与 `deepseek-v4-pro`。旧名 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`
   由 `DeepSeekModelIdMigration`（DataStore 迁移，只执行一次）改写为 `deepseek-flash`；自定义供应商的模型 ID 不参与迁移。
-  图片输入尚未实现，计划见 `docs/MULTIMODAL_PLAN.md`。
+- 用户消息支持图片输入（2026-11-01 代码完成，待真机验收；设计见 `docs/MULTIMODAL_PLAN.md`）：全部聊天链路
+  （DeepSeek、自定义 OpenAI 兼容、Google Vertex、xAI 订阅）、普通聊天与 RP 正文都可发图，规则见下文「图片输入」。
 - 支持基础生成参数：
   - Base URL
   - model
@@ -170,6 +183,13 @@ com.muxuechat
 - xAI OAuth 凭据（access / refresh / id token）与 API Key 同法保存：独立 Keystore alias 持有 AES 密钥，AES/GCM 密文与 IV 写入应用私有 SharedPreferences，明文只在内存中存在。解密失败按未登录处理并清理残留密文，不得崩溃；登出同时删除密文与 alias。
 - 会话和消息数据优先通过 DAO 暴露，避免 UI 层直接操作数据库。
 - 删除会话应依赖 Room 外键级联删除消息，避免手工多处删除导致不一致。
+- 聊天图片只保存在 App 私有目录 `filesDir/chat_images/`（待发送区为其下 `pending/`），不写系统相册，不参与云备份与设备迁移；
+  附件元数据在 Room 表 `message_attachments`（v11，外键级联到 `messages`），**数据库是唯一真相来源**。
+- 图片文件的去留**一律查库决定**，不得因走到了异常分支就认定「没有提交」：提交在 `NonCancellable` 中执行，事务提交后
+  返回边界仍可能重新抛出取消。删除 / 清空会话、编辑删除后续消息时，事务提交后查库确认附件行已不存在再删文件，
+  失败只记异常类型、不回滚数据库。移入正式目录与提交事务、启动孤儿扫描共用进程级 `ChatImageStore.commitLock`；
+  孤儿扫描每个进程只做一次、在数据库打开后执行，未被引用的正式图片有 1 小时宽限期（编辑时新图在提交前已移入正式目录）。
+- 缩略图用 `ImageDecoder` 按目标尺寸降采样解码，不引入 Coil 等图片库。
 
 ### 3.3 data.remote 层
 
@@ -186,6 +206,13 @@ com.muxuechat
 - 线上格式**只能依据 `docs/XAI_WIRE_FORMAT.md` 的实测记录实现**。该文档 §3.4 / §5.5 列出的未采集场景（截断、错误事件、流中取消、429、无终止事件断流）**不得凭 OpenAI Responses 的经验猜测**：未采集的事件一律走保守兜底（未知事件忽略、缺终止事件按失败处理并给可读文案），不得臆造字段语义。
 - `OpenAiCompatibleClient` 请求用户配置的 `http(s)://` 端点；除 §2 的 xAI 与 Google Vertex 例外外，不允许 App 内 OAuth。地址仍不得包含 user-info、query 或 fragment。Google Vertex 使用该客户端的**钉死主机实例**（https、主机固定、禁止重定向），并对 401 抛出带类型的异常供上层强制刷新后重试一次；用户可见文案与其他供应商一致。
 - 通用错误解析必须兼容「单元素数组包着的 error 对象」（Vertex 的 `[{"error":{...}}]`），否则会落到误导性的「请检查 API Key」。这是结构兼容，不是厂商特判。
+- 图片的线上形状：两条协议共用标准 content part 数组（`{"type":"text"}` 与 `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,…"}}`）。
+  **没有图片的消息必须仍序列化为 JSON 字符串，纯文本请求的字节与引入图片前完全一致**（只支持纯文本的旧反代不受影响）；
+  纯图片消息不生成空的 text 块；不发送 `detail` 等可选字段，不使用 DeepSeek Files API。Vertex 走同一套 DTO，不写任何图片代码。
+  xAI 订阅链路的 `input_image`（`image_url` 为字符串）翻译只在 `XaiResponsesTransport` 内部完成，上层不可见。
+- 含图请求的请求体由三条传输共用的 `ImagePayloadRequestBody` 写出：JSON 里只放每次请求随机生成的占位符，
+  写请求体时边读文件边 base64 编码，长度精确计算；请求层只做映射，不二次裁剪或替换图片。含图请求单独放宽读超时
+  （同源 `OkHttpClient` 的 `newBuilder()`，共享连接池，不影响纯文本请求）。
 - 对自定义 OpenAI 兼容供应商，上游服务的 OAuth、令牌刷新、部署和运维均由该服务自身负责，App 不参与。
 - `GET {base}/models` 只用于填充模型选择列表；服务不支持时必须优雅降级到手填，不能阻断聊天。
 - 思考内容的响应字段名不统一：`reasoning_content`（DeepSeek/Qwen/GLM 等）与 `reasoning`（OpenRouter）都要解析，取先出现的非空值。这是字段别名，不是厂商特判。
@@ -389,6 +416,8 @@ DeepSeek 官方文档明确：**`thinking` 的缺省值是 `enabled`**（默认 
 - 角色卡敏感内容。
 - 任一 Provider 的完整响应正文，除非经过截断并确认不含敏感信息。
 - 自定义供应商的完整 Base URL 中如含用户可识别信息，日志只输出 host。
+- 图片内容、base64、原始 `content://` URI、图片文件路径或附件 id；日志、异常信息与 UI 文案中都不得出现，
+  图片相关日志只允许张数、字节数、宽高与异常类型。
 
 推荐 Logcat 筛选：
 
@@ -476,7 +505,9 @@ Windows 下优先使用：
 - 模型列表可在面板内触发刷新（`GET {base}/models`）；拉取失败只提示，不清空已缓存的列表。
 - 刷新在 ViewModel 中全局串行：任一列表刷新期间，所有刷新入口都要禁用并写明原因，不能点了没反应。
 - 模型标注文案统一出自 `presentation/common/ModelPresentation.kt` 的 `ModelNotes`，只认完整模型 ID，不按名字猜能力。
-  图片输入上线前，`deepseek-flash` 与视觉实验旧名必须标注「当前 App 仅支持文本输入，尚未支持图片。」
+  不标注任何模型的图片能力（D8）；视觉实验旧名只说明「已由 `deepseek-flash` 取代」。
+- 图片入口在输入栏附件菜单（「图片」「文本文档」），始终可用；选图只用系统 Photo Picker
+  （`PickMultipleVisualMedia` / 只剩 1 个名额时 `PickVisualMedia`），不申请任何存储权限。
 - 不要展示 DeepSeek 已废弃的参数控件（presence penalty、frequency penalty）。
 
 ## 10. Agent 工作流

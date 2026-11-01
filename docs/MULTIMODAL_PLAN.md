@@ -1,64 +1,144 @@
 # muxueChat 多模态（图片输入）实施计划
 
-状态：MM-0 已实现待真机验收；其余分期尚未实施（2026-09-16 已按独立审查意见修订）  
+状态：MM-0～MM-2 代码已完成，待真机验收；MM-3 未开始（2026-09-16 已按独立审查意见修订；2026-11-01 第二次修订并完成 MM-1a～MM-2 实施，见进度记录）  
 建立日期：2026-09-16  
-范围：用户消息的图片输入（DeepSeek 与自定义 OpenAI 兼容供应商），以及作为前置条件的 DeepSeek 模型 ID 迁移  
+范围：用户消息的图片输入，普通聊天与 RP 正文都支持；覆盖全部聊天链路——DeepSeek、自定义 OpenAI 兼容供应商、Google Vertex（OpenAI 兼容钉死实例）、xAI 订阅（Responses 适配器）；以及作为前置条件的 DeepSeek 模型 ID 迁移  
 不在范围：图片生成、音频/视频、PDF 视觉解析、角色卡图片
 
-> 本文中的代码位置来自 2026-09-16 的工作区快照，行号仅供参考。实施时以类名、函数名和调用链为主定位。
+> 本文中的代码位置来自 2026-09-16 与 2026-11-01 的工作区快照，行号仅供参考。实施时以类名、函数名和调用链为主定位。
 
 ## 进度记录（接续工作先读这里）
 
-最后更新：2026-10-09（核对提交状态；上次内容更新为 2026-09-23 的 Room 版本调整）
+最后更新：2026-11-01（第二次修订后，MM-1a～MM-2 实施完成；待真机验收）
 
 | 分期 | 状态 | 说明 |
 | --- | --- | --- |
 | 计划审查 | 完成 | 独立审查（Opus）提出的 H1/H2、M1～M8、L1～L7 已全部写入本文 |
+| 第二次修订 | 完成 | 2026-11-01：D7（渠道范围）、D8（不判断模型能力，不支持就报错）；新增 1.2、1.3 官方事实与 3.4 xAI 映射 |
 | MM-0 | `[~]` 已实现，待真机验收 | 实现记录见第 4 节 MM-0 |
-| MM-1a | 未开始 | **下一步**：用户确认后开工 |
-| MM-1b / MM-2 / MM-3 | 未开始 | — |
+| MM-1a | `[~]` 已实现，待真机验收 | 数据、请求、规划、Repository 发送 / 重新生成 / 基本文件清理；JVM 单测覆盖，androidTest 只编译 |
+| MM-1b | `[~]` 已实现，待真机验收 | 附件菜单、Photo Picker、预览条、气泡缩略图、面板图片信息、删除 `TEXT_ONLY_INPUT` |
+| MM-2 | `[~]` 已实现，待真机验收 | 编辑增删图片（查库决定文件去留）、编辑弹窗、启动孤儿扫描与进程级附件锁 |
+| MM-3 | 未开始 | 分享入口（intent-filter）不做；全屏查看、粘贴、上传提示留待以后 |
 
-当前工作区状态：
+### 2026-11-01 实施完成记录（接续先读这里）
 
-- MM-0、MM-0 之前的缺陷修复与 2026-09-20 的前端 UI/UX 优化**已提交**，见 `6705af1`（2026-09-22「建立基线」）；
-  本计划文档首次提交于 `291f596`，v10→v11 调整随 `270e669` 提交。工作区现有未提交改动属于 RP / xAI 等其他线，不含多模态代码。
-- 最近一次验证（2026-09-20）：`testDebugUnitTest`（294 个，0 失败）、`assembleDebug`、
-  `compileDebugAndroidTestKotlin` 均成功，`git diff --check` 无问题；未跑 `lint`。
-- 2026-09-20 已用 `adb install -r` 覆盖安装到真机（保留数据），首次启动时会执行 MM-0 迁移。
-  现已有可用真机，androidTest 可以在其上执行，但尚未执行。
-- 前端 UI/UX 优化与多模态无关：图片仍不可发送；`deepseek-flash` 与视觉实验旧名在界面上标注「仅支持文本输入」，
-  MM-1b 上线图片发送时需同步移除或改写 `ModelNotes.TEXT_ONLY_INPUT` 的使用点。
+提交：`d711b86`（数据层、请求层、domain/planner，半成品）→ `4af9c1d`（Repository 收尾）→ `edf7101`（ViewModel 与 UI）
+→ `abe7a3b`（测试）→ 本文档同步提交。
 
-待用户处理：
+验证（Linux 云端环境，JDK 17 工具链、Gradle 8.13、Android SDK platform 36）：
 
-1. MM-0 真机验收：旧版选中 `deepseek-v4-flash` 后升级，确认显示并请求 `deepseek-flash`；
-   在 `deepseek-flash` 上验证普通、流式、思考、工具调用与 RP Marker。
-2. D6（允许纯图片消息）是按审查建议采纳的默认值，用户尚未明确表态；如需改为「必须带文字」，在 MM-1a 开工前告知。
+- `:app:compileDebugKotlin` 通过；`:app:testDebugUnitTest` 通过（616 个用例，0 失败；改动前 586 个）；
+  `:app:compileDebugAndroidTestKotlin` 通过；`:app:assembleDebug` 通过。
+- **androidTest 只编译、未在任何设备或模拟器上运行**（含 `MigrationTestHelper` 10→11 与新增的附件 DAO 测试）。
+- 界面没有截图或真机核对；Compose 代码只经过编译。
 
-MM-1a 开工时的要点（详见 3.1～3.5）：
+中断点清单的完成情况：
+
+1. `editUserMessageAndRegenerate(messageId, content, imageEdit)`：外层 flow 的 finally 丢弃未移走的待发送图；内部函数在冻结、
+   注册 session 后于 `commitLock` 内 promote 新图，`throughEditedUser` 用替换后的附件映射，计划带齐
+   `expectedAttachments` / `editedAttachments` / `removedAttachmentIds` / `addedAttachments`；结束时对
+   「已 promote 的新行 + 被移除行 + 后续消息的附件」一律查库决定文件去留。`imageEdit` 与原图集合相同时按「图片不变」处理。
+2. `deleteConversation` / `clearConversation`：在 `commitLock` 内先读附件再删行，finally 查库删文件。
+3. `loadPromptHistory` 与上下文面板改走 `HistoryReplacementHistory.toPromptHistory`，`isAttachmentFileAvailable` 查文件；
+   `buildRequestContextInput` 改收 `MappedHistory`，缺失张数经 `ChatContextInput.missingImageCount` 透传。
+4. `observeContextWindow`：消息流与附件流先合并再进 5 参 combine，`ContextWindowSignals` 带附件。
+5. `toDeepSeekMessages` / `toOpenAiCompatibleMessages`：`images` 映射为 `ImagePayload(imageStore.fileOf(relativePathFor(id)), mimeType)`。
+6. 两个 generate 记录最近一次请求是否带图，失败文案经 `ImageRequestErrorHint`（为可测从 Repository 抽出）按
+   `httpStatusOrNull()` 为 400 / 413 时追加图片提示。
+7. `commitHistoryReplacement` 传入三项附件参数；带新图的提交另持 `commitLock`，与孤儿扫描互斥。
+8. `captureRpTurnSnapshot` 的 `lastUser` 改用 `RpHistoryMutation.lastCompletedUserContent*` + 按消息的图片计数；
+   AI 标题的行带图片占位；新增 `IMAGE_ONLY_TITLE = "图片"`。
+
+后续步骤的完成情况：
+
+- 测试修复：4 个 Repository 单测的假 DAO 补附件查询（纯文本会话返回空列表）；`ModelPresentationTest` 按 D8 改写。
+- ViewModel：注入 `ChatImageImporter` 与 `ChatImageThumbnailLoader`；`pendingImages` / `isImportingImages` / `editImageDraft`；
+  发送与编辑把待发送图片交给 Repository 后不再持有；移除、放弃编辑时丢弃待发送文件；启动时触发孤儿扫描。
+- UI：输入栏附件菜单（图片始终可用；文本文档不可用时写明原因）、Photo Picker（剩余 ≥ 2 张多选、1 张单选，不申请权限）、
+  预览条（缩略图、删除、「n/4」计数）、用户 / RP 玩家消息气泡缩略图网格、编辑弹窗增删图、上下文面板图片信息；
+  缩略图经 ViewModel 读取，用 `ImageDecoder` 降采样 + 16 MB LruCache，通过 `LocalChatImageThumbnails` 下发。
+- 删除 `ModelNotes.TEXT_ONLY_INPUT` 及其使用。
+- Factory 传 `ChatImageStore(application.filesDir)`。
+- 启动孤儿扫描：`ChatRepository.removeOrphanImagesOncePerProcess()`，进程级标记只跑一次，`Dispatchers.IO` 上先查库
+  （保证数据库已打开、启动恢复回调已完成）再在 `commitLock` 内扫描；失败或取消时复位标记，允许本进程再试。
+  `removeOrphans` 对未被引用的正式图片加 1 小时宽限期。
+- 测试：见第 5 节对应项；另把原 androidTest `migrate1To10…` 同步为 `migrate1To11…`（数据库已是 v11，旧用例只注册到 9→10，运行时会失败）。
+- 规范同步：`AGENT.md`（模型清单旁的图片输入说明、§2「图片输入」、§3.2 存储与文件清理、§3.3 线上形状与请求体、§6 日志、§9 模型标注与图片入口）、
+  `docs/ROADMAP.md`。**未改** `docs/DEEPSEEK_MODEL_DISCOVERY_RESEARCH_2026-09-05.md` 与 `docs/XAI_WIRE_FORMAT.md`（后者要等订阅路径的真机结果）。
+
+与计划不一致之处（均为有意取舍）：
+
+- DTO 没有改成 `MessageContentDto` 密封类型，而是保持 `content: String?` 并新增 `images`，用线上形状的代理序列化器输出（`d711b86`）。
+  效果相同，且改动点少；纯文本字节不变已有单测逐字节对照改动前的 DTO。
+- 流式请求体按文件大小精确计算 `contentLength`，不走分块传输（3.4 原写 -1）：个别反代不接受 chunked 请求。
+- 规划器先按估算裁剪、再对保留窗口应用 20 MiB 上限（3.3 原顺序是上限在前）：上限换成占位只会让估算变小，裁剪结论不受影响，
+  而且只对真正会发出的窗口计体积。
+- 413 的提示与 400 一样只在本轮请求带图时追加（3.4 原写 413 无条件提示）：按 2026-11-01 用户指示，避免与图片无关的 413 被误导。
+- 3.4 的 `ImageAttachmentStore` 实际名为 `ChatImageStore`；附件锁是进程级的（Activity 重建会换 Repository 与 store 实例）。
+- 孤儿扫描由 `ChatViewModel` 初始化时调用 Repository 触发（Repository 内保证每进程一次），没有新增 `Application` 子类。
+- 待发送图片的所有权：交给 `sendMessage` / `editUserMessageAndRegenerate` 后由 Repository 负责，任何结局都在 finally 丢弃未移走的待发送文件，
+  ViewModel 不再持有，因此发送或编辑失败后需要重新选图。
+- 文本文档附件仍只在开启设定生成工具且非 RP 时可用（入口改为菜单项并写明原因）；图片入口不受此限制。
+
+已知限制：
+
+- 摘要、AI 标题与 RP 辅助请求只看到「用户附带了 N 张图片」的占位，看不到图片内容。
+- GIF / 动态 WebP 只取首帧；编辑时保留的原图不重新压缩。
+- 选图后进程被杀时，输入栏的待发送图片不会恢复（文件在 24 小时后由孤儿扫描删除）。
+- 发送或编辑失败后，本次选的图片已被丢弃（原消息里的图片不受影响）。
+- 400 的图片提示只能留有余地；`readTimeout`（180 s）、20 MiB 上限、xAI 不发 `detail` 是否可行、Vertex 单请求 inline 总量上限都未经真机确认。
+- 「20 MiB 图片请求的内存峰值」未在设备上粗测。
+- 暂无全屏查看、粘贴图片、上传进度提示（MM-3）。
+
+待真机验收（用户处理）：
+
+1. 四条链路（DeepSeek `deepseek-flash`、自定义 OpenAI 兼容、Google Vertex、xAI 订阅）× 普通聊天与 RP：发送 1 张 / 4 张 / 纯图片，普通与流式；
+   xAI 订阅路径从未采集过图片请求，需特别确认。
+2. 不支持图片的模型（如 `deepseek-v4-pro`）：图片入口照常可用，发送后显示上游错误与「如果问题与图片有关…」提示，不崩溃、不丢消息。
+3. 编辑历史消息时增删图片后重新生成：成功时新旧附件原子切换；预检失败、网络失败、上游拒绝或取消时原消息与原图片完全不变。
+4. 重新生成带图对话：请求仍含历史图片。
+5. 删除会话、清空会话、编辑删除后续消息后，对应图片文件被清理；发送或编辑中强杀进程，重启后没有残留引用错误、孤儿文件被清理、
+   一小时内未提交的新文件不被误删。
+6. v10→v11 覆盖升级后旧会话、消息与 RP 数据完好（`MigrationTestHelper` 用例已写好但未在设备运行；运行 instrumentation 会卸载应用，须另行授权）。
+7. `ImageDecoder` 管线：大图、透明 PNG、HEIC、动图 GIF、带旋转 EXIF 的相机照片；第 5 张图片无法加入；日志与提示里没有 URI、路径或 base64。
+8. 上下文面板显示图片张数、省略与丢失情况；realme Neo7 上预览条、气泡缩略图、编辑弹窗与键盘、系统栏不冲突。
+
+**不要运行 `connectedDebugAndroidTest`（会卸载应用清数据）。**
+
+待用户确认：
+
+- D6（允许纯图片消息）仍是按审查建议采纳的默认值；如需改为「必须带文字」，恢复 3.5 中的两处非空校验即可。
+
+MM-1a 开工时的要点（历史记录，已按此实施；详见 3.1～3.5）：
 
 - 先做统一历史映射，替换 `HistoryReplacementHistory` 私有的 `toPromptMessages`，否则重新生成会丢图；
 - 文件去留一律查库决定（提交后可能重新抛出取消）；
-- 规划顺序：缺失检查 → 剥图 → 20 MiB 上限 → 估算与裁剪；
-- 发送预检基于冻结后的 `requestSnapshot`，保持「先写用户消息、失败写失败回复」；
-- 含图片请求使用流式 `RequestBody`，并单独放宽 `readTimeout`；
-- Room **v11** 需导出 `11.json`，并补 `MigrationTestHelper` 10→11 测试。
-  （v10 已被 `docs/RP_ACTOR_PLAN.md` 的 RP-1 占用，2026-09-23 改。）
+- 规划顺序：缺失检查 → 20 MiB 上限 → 估算与裁剪（D8 后不再有「剥图」步骤）；
+- 不做任何模型图片能力判断，不加设置开关；上游拒绝就按普通错误显示（D8）；
+- 三条传输（DeepSeek、OpenAI 兼容含 Vertex、xAI 适配器）共用同一个「占位符 + 流式 base64」请求体写出器（3.4）；
+- xAI 适配器把 `image_url` 块翻译成 `input_image`，翻译封在适配器内部；
+- Room **v11** 需导出 `11.json`，并补 `MigrationTestHelper` 10→11 测试（v10 已被 RP-1 占用）。
 
 ## 0. 已确认的产品决策
 
-2026-09-16 由用户确认：
+| # | 决策 | 确认日期 |
+| --- | --- | --- |
+| D1 | 已保存的旧 DeepSeek 模型 ID（`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`）**自动迁移**到 `deepseek-flash`。 | 2026-09-16 |
+| D2 | 历史中的图片**每轮都重发**（仍受上下文预算与请求体安全上限约束，见 3.3）。 | 2026-09-16 |
+| D3 | 本地压缩规格：长边不超过 **1568px**，JPEG 质量 **85**；每条用户消息最多 **4 张**。 | 2026-09-16 |
+| D4 | 编辑历史用户消息时**允许增删图片**。 | 2026-09-16 |
+| D5 | 先落计划，按第 4 节分期实施；每期开工前由用户确认。 | 2026-09-16 |
+| D6 | **允许只发图片、不写文字**（按审查建议采纳；如用户改变主意，只需恢复 3.5 中的两处非空校验）。 | 默认值，待确认 |
+| D7 | 渠道范围：**所有聊天链路都支持发图片**——DeepSeek、自定义 OpenAI 兼容供应商、Google Vertex、xAI 订阅；普通聊天与 RP 正文都支持。 | 2026-11-01 |
+| D8 | **不判断模型是否支持图片**：不维护内置能力表，不加逐模型开关，不剥除历史图片，不禁用图片入口。图片一律照发，上游拒绝时按普通请求错误显示。用户已知并接受：发过图的会话切到不支持图片的模型（如 `deepseek-v4-pro`）后，因 D2 历史图片每轮重发，**之后每一轮都会报错**，切回支持图片的模型或新开会话即可恢复。 | 2026-11-01 |
 
-| # | 决策 |
-| --- | --- |
-| D1 | 已保存的旧 DeepSeek 模型 ID（`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`）**自动迁移**到 `deepseek-flash`。 |
-| D2 | 历史中的图片**每轮都重发**（仍受上下文预算与请求体安全上限约束，见 3.3）。 |
-| D3 | 本地压缩规格：长边不超过 **1568px**，JPEG 质量 **85**；每条用户消息最多 **4 张**。 |
-| D4 | 编辑历史用户消息时**允许增删图片**。 |
-| D5 | 先落计划，按第 4 节分期实施；每期开工前由用户确认。 |
-| D6 | **允许只发图片、不写文字**（按审查建议采纳；如用户改变主意，只需恢复 3.5 中的两处非空校验）。 |
+D8 取代了首版计划中的以下内容（已从正文删除）：`ModelInputCapabilities`、`deepSeekModelImageInput`、
+`CustomProvider.modelImageInput`、剥图占位、发送/编辑的图片能力预检、图片入口禁用与设置页图片开关。
 
-## 1. 官方事实（2026-09-16 核查）
+## 1. 官方事实
+
+### 1.1 DeepSeek（2026-09-16 核查）
 
 只采用 DeepSeek 官方文档：
 [Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion)、
@@ -87,18 +167,48 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 
 - 流式请求不发 `stream_options` 时，`usage` 仍会出现在最后一个 chunk。
 - 官方文档**没有写明**视觉输入与 thinking 模式、tools 能否同时使用，需真机验收。
-- OpenAI 兼容上游使用同样形状的 `image_url` content part，但是否支持图片取决于具体服务，App 无法从标准 `GET /models` 得知。
+- OpenAI 兼容上游使用同样形状的 `image_url` content part，但是否支持图片取决于具体服务。按 D8，App 不判断，交给上游报错。
+
+### 1.2 xAI（2026-11-01 核查）
+
+来源：[xAI Image Understanding](https://docs.x.ai/docs/guides/image-understanding)（公开 `api.x.ai` 的 Responses API 文档）。
+
+- 用户消息 `content` 为数组，图片块：`{"type": "input_image", "image_url": "data:image/jpeg;base64,..."}`。
+  注意 `image_url` 是**字符串**，不是 OpenAI 的 `{"url": …}` 对象；文本块为 `{"type": "input_text", "text": …}`。
+- 文档示例带 `"detail": "high"`，但未说明取值与默认值。本 App 不发送 `detail`；不发时是否正常需真机验收。
+- 支持格式：**仅 JPEG 与 PNG**；单图上限 **20 MiB**；未写明张数上限；图片与文字顺序任意。
+- 文档提醒发送图片时**不要让服务端保存请求/响应历史**，否则请求可能失败。现有适配器已固定发送 `store: false`，满足要求。
+- 未写明每张图的 token 计费。
+- **未采集**：订阅路径 `cli-chat-proxy.grok.com` 是否接受 `input_image`。`docs/XAI_WIRE_FORMAT.md` 的两轮抓包都只有纯文本；
+  公开路径与订阅路径的请求体此前被证实一致（线上格式 §0、§2），据此推断可用，但必须真机验收。
+
+### 1.3 Google Vertex（2026-11-01 核查）
+
+来源：[Vertex AI OpenAI compatibility overview](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/migrate/openai/overview)、
+[Image understanding](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/image-understanding)。
+
+- OpenAI 兼容端点的 `image_url` 支持 Cloud Storage URI 与 base64，写法 `data:<MIME-TYPE>;base64,<BASE64-ENCODED-BYTES>`，
+  与 DeepSeek / OpenAI 的形状一致，**App 侧无需任何特殊代码**。
+- `detail` 每个请求只能用一种取值，混用报错。本 App 不发送 `detail`，不受影响。
+- 多数 Gemini 模型：每个 prompt 最多 3000 张；**inline 数据每个文件最大 7 MB**；支持 PNG、JPEG、WebP、HEIC、HEIF。
+  D3 压缩后的单张约 200～500 KB，远低于 7 MB。
+- **未写明**单个请求 inline 数据的总上限，20 MiB 安全上限（3.3）是否足够宽松需真机验收。
+- 计费：Gemini 3 默认每张图 1120 tokens（3 之前的模型为 258）。
 
 ## 2. 不得突破的边界
 
-- 请求协议仍然只有「DeepSeek 专属」与「OpenAI 兼容」两条。图片块采用两者共有的标准 `image_url` 形状，不使用 DeepSeek Files API，不发送 `detail` 等可选字段，不为任何厂商写特判。
+- 上层仍只有「DeepSeek 专属」与「OpenAI 兼容」两条分支（`AGENT.md` §2）。图片块在上层统一用标准 `image_url` 形状；
+  Vertex 走 OpenAI 兼容同一套 DTO，不另写代码；xAI 订阅链路的 `input_image` 翻译**只在 Responses 适配器内部**完成，
+  上层不可见。不使用 DeepSeek Files API，不发送 `detail` 等可选字段，不按厂商名称、地址或认证类型写图片特判。
+- **不判断模型是否支持图片**（D8）：不按模型名猜测，不维护能力表，不加用户开关。
 - 不新增第三方依赖：选图用系统 Photo Picker（`ActivityResultContracts.PickVisualMedia` / `PickMultipleVisualMedia`，无需权限），解码与压缩用 `ImageDecoder` + `Bitmap.compress`，缩略图自行降采样解码，流式请求体用 OkHttp 自带的 okio，不引入 Coil 等图片库。若后续确有需要，另行说明用途与替代方案并取得确认。
 - `minSdk` / `targetSdk` / `compileSdk` 保持 36。
 - 图片内容、base64、原始 `content://` URI、完整文件路径**绝不进入日志**、错误提示或测试快照；日志只允许张数、字节数、宽高。
 - 图片只保存在 App 私有 `filesDir`。现有 `data_extraction_rules.xml` 已排除 `file` 域，不参与云备份与设备迁移；不写入系统相册。
 - 本地重新编码会丢弃 EXIF（含 GPS 定位），这是期望行为，不得为保留元数据而上传原图字节。
-- 模型是否支持图片**不得按模型名猜测**，解析顺序与上下文窗口一致：用户逐模型覆盖 → 内置已知 ID → 默认不支持。
-- 以下内部请求一律不发图片，只发文字占位：RP 元数据补写、RP 状态兜底、上下文摘要、设定生成工具。
+- 压缩输出固定为 JPEG：这是三方（DeepSeek、xAI、Vertex）支持格式的交集，xAI 只接受 JPEG/PNG。
+- 以下内部请求一律不发图片，只发文字占位：RP 剧情推进建议、RP 元数据补写、RP 状态兜底、上下文摘要、AI 标题、设定生成工具。
+  RP 辅助请求固定走 DeepSeek 时同样只发占位。
 
 ## 3. 总体设计
 
@@ -150,11 +260,10 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 - 新增 `MessageAttachment`（id、messageId、mimeType、width、height、byteSize、orderIndex），不含字节。
 - `ChatMessage.attachments: List<MessageAttachment> = emptyList()`。
 - `PromptMessage` 增加 `images: List<PromptImageRef> = emptyList()`，其中 `PromptImageRef` 含 `attachmentId`、`mimeType` 与 **`byteSize`**（规划器按它计算请求体上限，无需读盘）。默认空列表，现有构造点与测试无需改动。
-- 新增 `ModelInputCapabilities.supportsImageInput(settings, modelId)`：
-  - DeepSeek 内置：`deepseek-flash` 支持；两个旧名 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` **判断一致**，都按支持处理（官方称两者都由 V4.1-Flash 处理；MM-0 迁移后这只影响用户在未知/手填场景重新输入旧名的情况）；`deepseek-v4-pro` 不支持；其余 ID 默认不支持。
-  - DeepSeek 用户覆盖：`ChatSettings.deepSeekModelImageInput: Map<String, Boolean>`，用于服务端新出现的未知 ID。
-  - 自定义供应商：`CustomProvider.modelImageInput: Map<String, Boolean>`，按模型手动开启，默认关闭；旧 DataStore JSON 缺字段时视为关闭。
+- 不新增任何模型图片能力类型或设置字段（D8）。
 - 常量集中定义：`MAX_IMAGES_PER_MESSAGE = 4`、`MAX_LONG_EDGE_PX = 1568`、`JPEG_QUALITY = 85`、`MAX_IMAGE_PAYLOAD_BYTES = 20 MiB`。
+- 每图 token 估算按**协议**取常量（上层只认两条协议，不得按 Vertex/xAI 区分）：DeepSeek 协议 1024（官方单图上限）；
+  OpenAI 兼容协议（含 Vertex、xAI）1600（无统一官方口径，取保守值；Vertex Gemini 3 默认 1120、xAI 未公布，均不超过此值）。
 
 ### 3.3 Prompt 与上下文规划
 
@@ -165,15 +274,16 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 - 现状：正常发送走 `ChatRepositoryImpl.toPromptHistory`；重新生成（`HistoryReplacementHistory.beforeAssistant`）与编辑（`throughEditedUser`）走 `HistoryReplacementHistory` 自己的私有 `toPromptMessages`。后者拿不到附件，若不改，重新生成时历史图片会**静默丢失**。
 - 改为只保留**一个**纯映射函数，签名形如 `List<MessageEntity>.toPromptHistory(attachmentsByMessageId: Map<String, List<MessageAttachmentEntity>>, excludeMessageId)`，发送、重新生成、编辑、上下文面板四处共用。`HistoryReplacementHistory` 只负责截取与替换消息列表（编辑时同时替换该消息的附件集合），再调用这个函数。
 - 过滤条件由 `content.isNotBlank()` 改为「**文字非空或带有图片**」（D6）。
-- COMPLETED 的 user 消息带上图片引用。RP 状态段和 RP Marker 仍只追加到文本部分。
+- COMPLETED 的 user 消息带上图片引用。RP 状态段和 RP Marker 仍只追加到文本部分。普通聊天与 RP 正文共用这一映射，无需分别实现。
 
 **规划顺序（固定，写进代码注释与测试）**
 
 1. **缺失文件检查**：映射前确认每个附件文件存在。缺失的图片在此处替换为占位 `[图片文件已丢失]`，并计入 `missingImageCount`，UI 给出提示。不得留到请求层再悄悄替换，否则估算与实际请求不一致。
-2. **剥图**：当前请求所用模型不支持图片时，把每条**历史**消息的图片替换成文字占位，例如 `[图片 ×2：当前模型不支持图片输入，已省略]`；UI 提示「本轮将省略 N 张历史图片」。本轮新消息带图但模型不支持时不走剥图，而是在预检阶段直接失败（见 3.5）。
-3. **请求体上限**（D2 的唯一例外）：按 `PromptImageRef.byteSize` 换算 base64 大小（×4/3 向上取整），总量超过 `MAX_IMAGE_PAYLOAD_BYTES` 时从最旧的消息开始把图片换成占位 `[更早的图片因请求体积上限已省略]`；**本轮用户消息的图片永不省略**。按 1568px JPEG 单张约 200～500 KB 估算，20 MiB 约可容纳 30～75 张历史图片。
-4. **token 估算与 `findKeepFromIndex` 裁剪**：`HeuristicTokenEstimator` 新增图片估算，**每张图的 token 数由规划器按模型传入**（DeepSeek 已知视觉模型 1024；自定义供应商无官方口径，保守取 1600），估算器本身不判断模型。一律标注「预计」。图片 token 计入对应消息所在分项。
-- `ContextWindowPlan` 额外暴露 `imageCount`、`omittedImageCount`（区分原因：不支持 / 体积上限）与 `missingImageCount`。
+2. **请求体上限**（D2 的唯一例外）：按 `PromptImageRef.byteSize` 换算 base64 大小（×4/3 向上取整），总量超过 `MAX_IMAGE_PAYLOAD_BYTES` 时从最旧的消息开始把图片换成占位 `[更早的图片因请求体积上限已省略]`；**本轮用户消息的图片永不省略**。按 1568px JPEG 单张约 200～500 KB 估算，20 MiB 约可容纳 30～75 张历史图片。
+3. **token 估算与 `findKeepFromIndex` 裁剪**：`HeuristicTokenEstimator` 新增图片估算，每张图的 token 数由规划器按协议传入（3.2），估算器本身不判断模型。一律标注「预计」。图片 token 计入对应消息所在分项。
+
+- 首版的「剥图」步骤按 D8 删除：无论当前模型是什么，历史图片都照发。
+- `ContextWindowPlan` 额外暴露 `imageCount`、`omittedImageCount`（只有「体积上限」一种原因）与 `missingImageCount`。
 - `toEstimationMessages`（`ChatRepositoryImpl` 中两处）目前使用 `content.orEmpty()`，DTO 类型变更后需同步改为「取文本部分 + 图片计数」。
 - 已被摘要覆盖的消息本来就不发送，其图片也不再发送；这与 D2 不冲突。
 - 摘要请求只看到文字占位 `[用户发送了 N 张图片]`，因此摘要会丢失图片内容，这是已知限制。
@@ -184,31 +294,60 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 
 ### 3.4 请求层
 
+**DTO（DeepSeek 与 OpenAI 兼容，Vertex 自动包含在后者中）**
+
 - `DeepSeekMessageDto.content` 与 `OpenAiCompatibleMessageDto.content` 从 `String?` 改为 `MessageContentDto?`：
   - `Text(String)` 序列化为 JSON 字符串；
   - `Parts(List<ContentPartDto>)` 序列化为数组，包含 `{"type":"text","text":...}` 与 `{"type":"image_url","image_url":{"url":...}}`；纯图片消息（D6）不生成空的 text 块；
   - `type` 字段与现有 `tools` 同理，用 `@EncodeDefault(ALWAYS)` 强制序列化；
   - 用自定义 `KSerializer` 实现；响应 DTO 不变。
 - **没有图片的消息继续发字符串**，只支持纯文本的旧反代不受影响。
-- 构造点：`ChatRepositoryImpl` 中实际约 **12 处**直接构造两种消息 DTO，另有 `ContextSummaryPrompt` 等主代码构造点，以及约 **7 个测试文件**直接构造这些 DTO。为减少改动，**新增**（当前并不存在）`text(role, content)` 形式的伴生工厂函数，统一替换这些构造点。
-- **流式请求体**（不再推迟到出现 OOM 后）：20 MiB 图片的 base64 若先拼成 `String` 再编码为请求体，峰值内存会有多份副本（原始字节、base64 字符串、JSON 字符串、UTF-8 字节），可能超过 100 MB。含图片的请求改为自定义 `RequestBody`：在 `writeTo(sink)` 中逐条写出消息 JSON，图片部分边读文件边 base64 编码写入 `sink`，不在内存中保留整份请求体。`contentLength()` 返回 -1（分块传输）。纯文本请求保持现状。
+- 构造点：`ChatRepositoryImpl` 中实际约 **12 处**直接构造两种消息 DTO，另有 `ContextSummaryPrompt` 等主代码构造点，以及约 **7 个测试文件**直接构造这些 DTO。为减少改动，**新增**（当前并不存在）`text(role, content)` 形式的伴生工厂函数，统一替换这些构造点。实施时重新统计，xAI 与 Vertex 接入后数量可能有变。
+- Vertex 使用 `OpenAiCompatibleClient` 的钉死主机实例，请求 DTO 与默认实例相同，**不需要任何图片相关的额外代码**。
+
+**xAI 订阅适配器（`XaiResponsesTransport`）**
+
+- `toInputItems` 目前对 user 消息只产出 `[{"type":"input_text","text":…}]`。改为遍历 `MessageContentDto`：
+  - `Text` → 保持现状（一个 `input_text` 块），纯文本请求字节不变；
+  - `Parts` → 按顺序产出 `input_text` 与 `{"type":"input_image","image_url":"<data URL 字符串>"}`；不发 `detail`。
+- 新增 `XaiInputImagePart` DTO（`type` 同样 `@EncodeDefault(ALWAYS)`）。
+- system/assistant/工具结果不会带图（3.3 只给 user 消息挂图片引用），适配器遇到时按协议错误处理即可，不做静默丢弃。
+- 翻译完全封在适配器内部，符合 `AGENT.md` §2 对 xAI 例外的约束；上层不知道这条链路的图片字段名不同。
+
+**流式请求体（三条传输共用）**
+
+- 20 MiB 图片的 base64 若先拼成 `String` 再编码为请求体，峰值内存会有多份副本（原始字节、base64 字符串、JSON 字符串、UTF-8 字节），可能超过 100 MB。
+- 做法：映射阶段图片的 URL 字段不放真实数据，而是放**每次请求随机生成**的占位符（例如 `@@muxue-img-<请求 UUID>-<序号>@@`）。照常把请求序列化成 JSON 字符串——此时它只有文字，体积很小。
+  自定义 `ImagePayloadRequestBody.writeTo(sink)` 按占位符切分该字符串，文字段原样写出，占位符处写 `data:image/jpeg;base64,` 后边读文件边 base64 编码写入 `sink`。
+  base64 字符集不含需要 JSON 转义的字符，因此直接写入合法。`contentLength()` 返回 -1（分块传输）。
+- 这个写出器只依赖「JSON 字符串 + 占位符到文件的映射」，不关心协议，因此 DeepSeek、OpenAI 兼容（含 Vertex）与 xAI 适配器共用。
+  xAI 的 `image_url` 是字符串、OpenAI 的在 `{"url": …}` 里，但占位符都落在 JSON 字符串值内部，写出方式相同。
+- 占位符随请求随机生成，用户正文不可能事先包含它；仍在写出前断言每个占位符恰好出现一次。
+- 纯文本请求保持现状，不走这个请求体。
 - base64 读取：新增 `ImageAttachmentStore`（data.local），只负责按 `relativePath` 打开文件流；读取发生在 OkHttp 写请求体时（IO 线程）。请求层只做映射，不得二次裁剪或替换图片。
-- **超时（修正原计划的误判）**：
-  - OkHttp 的 `writeTimeout` 限制的是**单次写操作之间的间隔**，不是整个上传的总时长；上传慢但持续有进度不会触发它。现有 30 秒可保留。
-  - 真正的风险是 `readTimeout = 60s`：服务端要先接收并处理大量图片（可能还有思考），首个字节可能晚于 60 秒到达。含图片的请求用 `client.newBuilder().readTimeout(...)` 单独放宽（例如 180 秒），共享连接池，不影响纯文本请求。具体数值在真机验收后确定。
-- 错误映射（沿用 `DeepSeekErrorSanitizer` 不回显正文的原则）：
-  - 413 提示「请求体过大，请减少图片」；
-  - 400 无法可靠判断是否与图片有关，因此只在**本次请求含图片**时追加一句留有余地的提示，例如「如果问题与图片有关，可能是当前模型或服务不接受图片输入」，不断言原因。
+
+**超时**
+
+- OkHttp 的 `writeTimeout` 限制的是**单次写操作之间的间隔**，不是整个上传的总时长；上传慢但持续有进度不会触发它。现有 30 秒可保留。
+- 真正的风险是 `readTimeout = 60s`：服务端要先接收并处理大量图片（可能还有思考），首个字节可能晚于 60 秒到达。含图片的请求用 `client.newBuilder().readTimeout(...)` 单独放宽（例如 180 秒），共享连接池，不影响纯文本请求。
+  DeepSeek 客户端、`OpenAiCompatibleClient` 的两个实例、xAI 适配器各有自己的 `OkHttpClient`，都要同样处理。具体数值在真机验收后确定。
+
+**错误映射**（沿用 `DeepSeekErrorSanitizer` 等不回显正文的原则）
+
+- 413：提示「请求体过大，请减少图片」。
+- 400：无法可靠判断是否与图片有关。只在**本次请求含图片**时追加一句留有余地的提示：
+  「如果问题与图片有关，可能是当前模型或服务不接受图片输入，可切换到支持图片的模型或新开会话」。不断言原因。
+  这是 D8 下唯一的「不支持图片」处理，判断依据只有「请求是否含图片」，不识别厂商、模型或异常类型。
+- 「请求是否含图片」由请求层通过通用标记传给错误映射，三条传输一致；xAI 适配器的 `httpError` 与 Vertex 的数组错误体解析都要接上。
 
 ### 3.5 Repository 流程
 
 **`sendMessage(conversationId, content, images)`**
 
 - 非空校验：现有 `require(trimmed.isNotEmpty())` 改为「文字非空**或**带图片」（D6）。
-- 保持现有语义不变：**先写入用户消息，再冻结请求配置**（`freezeProviderRequest`）；冻结或预检失败时仍走 `persistSendPreflightFailure`，写入失败的 assistant 回复并在 UI 显示。原计划中「在任何写库之前失败」的写法会改变这一语义，已作废。
-- 图片能力预检**基于冻结后的 `requestSnapshot`**（冻结那一刻的供应商与模型），不再读取实时设置。这样用户在发送途中切换模型时，本轮图片既不会被误剥，也不会违反「本轮图片永不省略」。本轮带图而冻结的模型不支持图片时，预检失败，写入可读错误；不走剥图。
+- 保持现有语义不变：**先写入用户消息，再冻结请求配置**（`freezeProviderRequest`）；冻结失败时仍走 `persistSendPreflightFailure`，写入失败的 assistant 回复并在 UI 显示。
+- **不做图片能力预检**（D8）：模型不接受图片时，上游返回错误，走正常的请求失败路径，用户消息与图片保留。
 - 写入顺序：在同一把附件 `Mutex` 内，先把 pending 文件移入正式目录并 `setLastModified(now)`，再在同一 Room 事务中插入 user 消息与附件行。事务出现异常后按 3.1 的规则**查库确认**后再决定是否删除已移动的文件。
-- ViewModel 本应在 UI 层拦截不支持图片的情况，Repository 的预检是兜底。
 
 **`regenerateLastResponse`**
 
@@ -219,7 +358,7 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 
 其中 `imageEdit` 描述保留哪些原附件、新增哪些 pending 图片。
 
-- 遵守 FIX-02 语义：配置预检失败时历史完全不变；新增或保留了图片但冻结的模型不支持图片，同样视为预检失败。
+- 遵守 FIX-02 语义：配置预检失败时历史完全不变。上游因不支持图片而报错时同样视为生成失败，历史不变（D8）。
 - `HistoryReplacementHistory.throughEditedUser` 使用编辑后的文本与图片集合，再走统一映射函数规划请求。
 - `ChatDao.commitHistoryReplacement` 增加「新增附件行」与「删除附件 id」参数，在同一事务中切换；提交前比对原消息的附件快照，历史在生成期间变化时拒绝提交。
 - 文件处理：新图片文件在提交前移入正式目录，但只有提交后才被引用。无论出现何种异常（含提交后重新抛出的取消），都**先查库**：
@@ -227,39 +366,38 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
   - 被移除的附件行已不存在 → 删除其文件；仍存在 → 保留。
 - 启动孤儿扫描作为最后兜底。
 
-**RP 补写**
+**RP**
 
-- `RpTurnSnapshot.lastUser`：文本 + `[用户附带了 N 张图片]`，不发图片。
+- RP 正文请求与普通聊天走同一条发送/重新生成/编辑流程，图片随用户消息发送，四条链路都适用。
+- RP 补写等辅助请求：`RpTurnSnapshot.lastUser` 为文本 + `[用户附带了 N 张图片]`，不发图片；辅助请求无论跟随正文还是固定走 DeepSeek 都一样。
 
 ### 3.6 ViewModel 与 UI
 
 - `ChatUiState` 增加 `pendingImages` 与 `isImportingImages`。现有文本文档附件（`PendingAttachment`）保留，二者可以同时存在。
 - 发送按钮的可用条件改为「文字非空、或有待发送图片、或有文本文档附件」（D6）。
-- 输入栏附件按钮改为菜单：「图片」「文本文档」。
+- 输入栏附件按钮改为菜单：「图片」「文本文档」。普通聊天与 RP 共用同一输入栏。
   - 剩余名额 ≥ 2 时用 `PickMultipleVisualMedia(maxItems)`，剩余 1 张时用 `PickVisualMedia`（前者要求 maxItems ≥ 2）。
   - 导入在后台线程进行：`ImageDecoder` 按目标尺寸降采样解码；带透明通道的 PNG/WebP 先铺白底再转 JPEG；GIF 与动图只取首帧；HEIC 由系统解码后转 JPEG。EXIF 方向处理需用真机照片验证。
   - 解码失败、源文件过大时给出可读提示，不改变已有待发送图片。
+- 图片入口**始终可用**，不按当前模型禁用，也不显示能力说明（D8）。
 - 预览条：缩略图、删除按钮、「2/4」计数。
-- 当前模型不支持图片时，图片入口禁用并说明原因（自定义供应商引导到对应模型开关）；已有待发送图片后切到不支持的模型时，禁止发送并提示。
-- 消息气泡：user 消息显示缩略图网格（降采样解码 + 小容量内存 LruCache）；纯图片消息不显示空文本块。
+- 消息气泡：user 消息显示缩略图网格（降采样解码 + 小容量内存 LruCache）；纯图片消息不显示空文本块。RP 的玩家消息气泡同样显示。
 - 编辑消息弹窗（MM-2）：显示原图片，可删除，可继续添加（受 4 张上限约束）；删光文字与图片时禁止提交。
-- 设置页：
-  - 自定义供应商的模型列表增加逐模型「支持图片输入」开关；
-  - DeepSeek 上下文窗口编辑区为未知 ID 提供同样的开关；
-  - 删除现有 `ModelNotes.TEXT_ONLY_INPUT`（`ModelPresentation.kt`、`ContextSections.kt`）这句「尚未支持图片」的文案。
-- 上下文面板：显示本轮图片张数、省略张数及原因、丢失张数。
+- 设置页：只删除现有 `ModelNotes.TEXT_ONLY_INPUT`（`ModelPresentation.kt`、`ContextSections.kt`）这句「尚未支持图片」的文案；**不新增**图片开关。
+- 上下文面板：显示本轮图片张数、因体积上限省略的张数、丢失张数。
 - 无障碍：缩略图提供 `contentDescription`，触控目标不小于 44dp。
 
 ### 3.7 规范文档同步（随实施提交）
 
 - `AGENT.md`：
   - §2、§3.3 的 DeepSeek 模型清单；
-  - 两条协议的 content 数组规则（无图时保持字符串）；
+  - 两条协议的 content 数组规则（无图时保持字符串），以及 xAI 适配器内部的 `input_image` 翻译；
   - 图片不进日志与存储位置规则；
-  - 模型图片能力的解析顺序；
+  - 不判断模型图片能力（D8），删除 `TEXT_ONLY_INPUT` 相关条款（当前第 479 行附近）与「图片输入尚未实现」（第 78 行附近）；
   - 内部请求不发图片；
   - 「是否已提交以数据库状态为准」的文件清理规则。
-- `docs/ROADMAP.md` 当前状态；`docs/DEEPSEEK_MODEL_DISCOVERY_RESEARCH_2026-09-05.md` 顶部状态段。
+- `docs/ROADMAP.md` 当前状态；`docs/DEEPSEEK_MODEL_DISCOVERY_RESEARCH_2026-09-05.md` 顶部状态段；
+  `docs/XAI_WIRE_FORMAT.md` 补记订阅路径图片请求的真机结果。
 
 ## 4. 分期任务
 
@@ -273,7 +411,7 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 > - `ModelNotes` 新增 `LEGACY_FLASH_ID` 与 `deepSeekCapabilityNotes`（设置页与模型面板共用）。在 MM-1b 前，
 >   `deepseek-flash` 显示「仅支持文本输入」，旧名显示「已由 deepseek-flash 取代」；
 > - `:app:testDebugUnitTest` 294 个用例通过（新增 `DeepSeekModelIdMigrationTest` 9 个），`:app:compileDebugAndroidTestKotlin` 成功；
->   新增的 androidTest `legacyDeepSeekModelIds_areMigratedBeforeFirstRead` 因本机无 API 36 设备尚未执行；
+>   新增的 androidTest `legacyDeepSeekModelIds_areMigratedBeforeFirstRead` 尚未在真机执行；
 > - 未完成：真机验收（见下方验收最后一条）。
 
 改动：
@@ -307,43 +445,49 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 - 历史用量显示「已过期」属预期。
 - 真机：`deepseek-flash` 的普通、流式、思考、工具调用与 RP Marker 正常。
 
-### [ ] MM-1a：数据、请求与规划（无 UI）
+### [~] MM-1a：数据、请求与规划（无 UI）
 
-改动：3.1 的表、文件存储、`observeAttachments` 与**基本文件清理**（删除会话、清空会话、历史替换删除后续消息）；3.2 domain 与能力解析；3.3 统一历史映射、缺失检查、剥图、体积上限、图片估算与上下文面板 combine；3.4 DTO、流式请求体、`readTimeout` 与错误映射；3.5 `sendMessage` 与 `regenerateLastResponse`。
+> 2026-11-01 已实现（`d711b86`、`4af9c1d`），JVM 单测覆盖，待真机验收；实施记录与偏差见进度记录。
+
+改动：3.1 的表、文件存储、`observeAttachments` 与**基本文件清理**（删除会话、清空会话、历史替换删除后续消息）；3.2 domain；3.3 统一历史映射、缺失检查、体积上限、图片估算与上下文面板 combine；3.4 两套 DTO、xAI 适配器的 `input_image` 翻译、共用的流式请求体、各客户端 `readTimeout` 与错误映射；3.5 `sendMessage` 与 `regenerateLastResponse`。
 
 验收（以单元测试与 instrumentation 为主）：
 
-- 纯文本消息的请求体与改动前逐字节一致（`content` 仍为字符串）。
-- 带图消息的请求 JSON 与官方示例形状一致；纯图片消息不含空 text 块。
+- 纯文本消息的请求体与改动前逐字节一致：DeepSeek、OpenAI 兼容（含 Vertex 实例）的 `content` 仍为字符串；xAI 的 `input` 仍为单个 `input_text`。
+- 带图消息的请求 JSON 与官方示例形状一致（DeepSeek / OpenAI 兼容为 `image_url.url`，xAI 为 `input_image.image_url` 字符串）；纯图片消息不含空 text 块。
+- 流式请求体的输出与一次性编码的 JSON 逐字节一致，三条传输各测一次。
 - 重新生成带图对话时，请求仍包含历史图片。
-- 冻结模型不支持图片时：历史图片被占位替换，请求不含 `image_url`；本轮带图则预检失败并写入失败回复，用户消息保留。
+- 不论当前模型是什么，请求都带上历史图片；上游返回 400 时写入失败回复，用户消息与图片保留，提示文案含「可能与图片有关」一句。
 - 超过 20 MiB 时最旧图片被省略，本轮图片保留；文件缺失时以占位替换且计数正确；面板数据与实际请求一致。
 - 删除会话、清空会话后对应图片文件被删除；提交后抛出取消的场景下不误删已引用文件（可用假 DAO 模拟）。
 - 20 MiB 图片请求的内存峰值不随图片总量线性叠加多份副本（instrumentation 中粗测）。
 
-### [ ] MM-1b：发送带图片的 UI
+### [~] MM-1b：发送带图片的 UI
 
-改动：3.6 的输入栏菜单、Photo Picker、导入压缩管线、预览条、发送按钮条件、气泡缩略图、设置页图片开关、上下文面板图片信息、删除 `TEXT_ONLY_INPUT` 文案。
+> 2026-11-01 已实现（`edf7101`），只经编译，界面待 realme Neo7 真机验收。
+
+改动：3.6 的输入栏菜单、Photo Picker、导入压缩管线、预览条、发送按钮条件、气泡缩略图（含 RP 玩家消息）、上下文面板图片信息、删除 `TEXT_ONLY_INPUT` 文案。
 
 验收：
 
-- `deepseek-flash` 与已开启图片开关的自定义供应商都能发送 1～4 张图片（含纯图片消息），普通与流式均可。
-- `deepseek-v4-pro`、未开启开关的自定义模型：图片入口禁用并说明原因。
+- 第 5 节手动矩阵中的「发送」行：四条链路都能发送 1～4 张图片（含纯图片消息），普通与流式、普通聊天与 RP 均可。
+- 不支持图片的模型（如 `deepseek-v4-pro`）：图片入口照常可用，发送后显示上游错误与「可能与图片有关」提示，不崩溃、不丢消息。
 - 第 5 张图片无法加入。
 - 日志、错误提示中找不到 base64、URI 或完整路径。
-- 上下文面板显示图片张数与省略原因。
+- 上下文面板显示图片张数与省略情况。
 
-### [ ] MM-2：编辑图片与孤儿清理
+### [~] MM-2：编辑图片与孤儿清理
+
+> 2026-11-01 已实现（`4af9c1d`、`edf7101`）；孤儿扫描对未引用的正式图片加 1 小时宽限期。待真机验收。
 
 改动：3.5 的编辑增删图片与两阶段提交（含查库判断文件去留）；3.6 编辑弹窗；3.1 的启动孤儿扫描与附件 `Mutex`。
 
 验收：
 
-- 编辑历史消息增删图片后重新生成：成功时新旧附件原子切换；预检失败、网络失败或取消时原消息与原附件完全不变。
+- 编辑历史消息增删图片后重新生成：成功时新旧附件原子切换；预检失败、网络失败、上游拒绝图片或取消时原消息与原附件完全不变。
 - 提交后重新抛出取消的场景：新附件文件保留且可读，被移除附件的文件被删除。
 - 删除后续消息后没有孤儿附件行。
 - 发送或编辑过程中强杀进程，重启后没有残留引用错误，孤儿文件被清理，未提交的新文件不被提前误删。
-- 切到不支持图片的模型后继续对话，请求成功且不含图片。
 
 ### [ ] MM-3：体验打磨
 
@@ -354,18 +498,28 @@ MM-1a 开工时的要点（详见 3.1～3.5）：
 
 ## 5. 测试计划
 
+> 2026-11-01 覆盖情况（`abe7a3b`）：
+> - 已有 JVM 单测：DTO 序列化（纯文本逐字节对照改动前 DTO、带图数组、纯图片无空 text 块）、xAI `input_image`、
+>   流式请求体（长度精确、与一次性编码逐字节相同、可重复写、占位符缺失或重复、文件被删）、体积上限、规划器按协议计图、
+>   统一映射（缺图占位与计数、assistant 不带图、重新生成与编辑同一映射）、含图 400 / 413 提示、`ChatImageStore` 孤儿扫描与宽限期。
+> - 已写但只编译未运行的 androidTest：`MigrationTestHelper` 10→11、附件外键级联、`upsertMessage` / `updateMessage` 不删附件、
+>   历史替换原子切换附件与附件变化时拒绝提交。
+> - 尚未覆盖：Repository 层「提交成功但抛出取消 / 提交失败」时文件去留的假 DAO 测试、压缩目标尺寸纯函数测试、
+>   内部请求只含占位的端到端断言、`ImageDecoder` 管线与删除会话后文件清理的设备测试。
+
 JVM 单元测试：
 
 - `MessageContentDto` 序列化：无图为字符串；有图为数组且 JSON 与官方示例形状一致；`type` 不被省略；纯图片消息无空 text 块。
-- 流式请求体：输出与一次性编码的 JSON 逐字节一致（小图片 fixture）。
-- 图片能力解析：用户覆盖 → 内置 → 默认不支持；两个旧名判断一致；自定义供应商旧 JSON 缺字段时为关闭。
-- 统一历史映射：发送、重新生成、编辑三条路径得到相同的图片引用；纯图片消息不被过滤。
-- 规划顺序：缺失检查 → 剥图 → 20 MiB 上限（最旧优先省略、本轮不省略）→ 估算与裁剪，并与 `ContextWindowPlan` 一致；每图 token 数按模型传入。
-- 发送预检基于冻结快照：发送途中切换模型不影响本轮。
+- xAI 适配器：`Text` 内容的 `input` 与改动前逐字节一致；`Parts` 产出 `input_text` / `input_image`，顺序保持，`image_url` 为字符串，无 `detail`。
+- 流式请求体：三条传输各自的输出与一次性编码的 JSON 逐字节一致（小图片 fixture）；占位符缺失或重复时断言失败。
+- 统一历史映射：发送、重新生成、编辑三条路径得到相同的图片引用；纯图片消息不被过滤；RP 正文与普通聊天一致。
+- 规划顺序：缺失检查 → 20 MiB 上限（最旧优先省略、本轮不省略）→ 估算与裁剪，并与 `ContextWindowPlan` 一致；每图 token 数按协议传入。
+- 错误映射：含图片的 400 追加提示、不含图片的 400 不追加；413 文案；三条传输一致。
 - MM-0 DataStore 迁移的每个字段、供应商条件与幂等性。
 - `HistoryReplacementHistory` 对编辑后图片集合的处理。
 - 文件去留判断：用假 DAO 模拟「提交成功但抛出取消」「提交失败」两种情况。
 - 压缩目标尺寸计算（抽成纯函数）。
+- 内部请求（RP 辅助含固定 DeepSeek 路由、摘要、标题、设定生成）只含文字占位，不含图片块。
 
 API 36 设备 instrumentation：
 
@@ -373,46 +527,48 @@ API 36 设备 instrumentation：
 - 附件外键级联；`upsertMessage` / `updateMessage` 不删除附件的回归测试。
 - 删除、清空、历史替换后的文件清理，以及启动孤儿扫描（含刚移动文件不被误删）。
 - `ImageDecoder` 管线：大图、透明 PNG、HEIC、动图 GIF、带旋转 EXIF 的相机照片。
-- Repository 发送与编辑的预检失败语义（发送保留用户消息并写失败回复；编辑历史不变）。
+- Repository 发送与编辑的失败语义（发送保留用户消息并写失败回复；编辑历史不变）。
 
 手动验收矩阵：
 
-| 场景 | deepseek-flash | deepseek-v4-pro | 自定义 HTTPS（开关开） | 自定义（开关关） |
-| --- | --- | --- | --- | --- |
-| 发送 1 张 / 4 张 / 纯图片 | 必测 | 入口禁用 | 必测 | 入口禁用 |
-| 流式 + 图片 | 必测 | — | 必测 | — |
-| 思考模式 + 图片 | 必测（官方未写明） | — | 支持时测 | — |
-| 工具调用 + 图片 | 必测（官方未写明） | — | 显式开启时测 | — |
-| RP 模式 + 图片 | 必测 | — | 必测 | — |
-| 重新生成带图对话 | 必测 | 剥图 | 必测 | 剥图 |
-| 长会话大量历史图片 | 必测（20 MiB 提示、超时） | 剥图 | 必测 | 剥图 |
-| 编辑消息增删图片 | 必测 | 预检失败 | 必测 | 预检失败 |
-| 发送中强杀进程 | 必测 | — | 任一链路覆盖 | — |
+| 场景 | deepseek-flash | deepseek-v4-pro（不支持） | 自定义 OpenAI 兼容 | Google Vertex（Gemini） | xAI 订阅（Grok） |
+| --- | --- | --- | --- | --- | --- |
+| 发送 1 张 / 4 张 / 纯图片 | 必测 | 报错可读 | 必测（视服务） | 必测 | 必测（订阅路径未采集） |
+| 流式 + 图片 | 必测 | — | 必测 | 必测 | 必测 |
+| 思考模式 + 图片 | 必测（官方未写明） | — | 支持时测 | 必测 | 必测 |
+| 工具调用 + 图片 | 必测（官方未写明） | — | 显式开启时测 | 显式开启时测 | 显式开启时测 |
+| RP 模式 + 图片 | 必测 | — | 必测 | 必测 | 必测 |
+| 重新生成带图对话 | 必测 | 报错可读 | 必测 | 必测 | 必测 |
+| 长会话大量历史图片 | 必测（20 MiB、超时） | — | 必测 | 必测（请求总量上限未写明） | 必测 |
+| 带图会话切到不支持图片的模型 | — | 每轮报错，切回可恢复（D8 预期） | — | — | — |
+| 编辑消息增删图片 | 必测 | 报错且历史不变 | 必测 | 必测 | 必测 |
+| 发送中强杀进程 | 必测 | — | 任一链路覆盖 | — | — |
 
-真实服务的可用性由用户验收；自动化测试不得包含真实 API Key 或真实用户图片。
+真实服务的可用性由用户验收；自动化测试不得包含真实 API Key、OAuth token 或真实用户图片。
 
 ## 6. 风险与未决事项
 
-1. **费用与延迟**（D2 的代价）：DeepSeek 每张图最多 1024 tokens，20 张历史图片约等于每轮多 2 万输入 token。字节恒定有利于前缀缓存，但不保证命中。
-2. **请求体上限**：20 MiB 是对 D2 唯一的例外，属于物理限制；如需调整数值，实施前再确认。
-3. **视觉 + 思考 / 工具**：官方未写明，若真机出现 400，先给出可读错误，不自动关闭用户设置。
-4. **旧名停用时间未公布**：因此 MM-0 应尽早实施，与后续多模态开发解耦。
-5. **自定义供应商的图片 token 估算**没有官方口径，只能保守估计并标注「预计」。
-6. **摘要会丢失图片内容**，长会话压缩后模型只知道「曾经发过图片」。
-7. GIF 与动态 WebP 只保留首帧。
-8. 编辑消息时保留的原图不重新压缩，始终沿用首次导入的字节。
-9. **400 错误无法可靠归因于图片**，提示文案只能留有余地。
-10. **`readTimeout` 的合适数值**需要真机测大量图片 + 思考的首字节延迟后确定。
-11. **提交后重新抛出取消**会让「异常 ≠ 未提交」，所有文件去留必须查库决定；这是 MM-1a 与 MM-2 中最容易出错的地方，需重点测试。
+1. **费用与延迟**（D2 的代价）：DeepSeek 每张图最多 1024 tokens，Vertex Gemini 3 默认 1120，20 张历史图片约等于每轮多 2 万输入 token。字节恒定有利于前缀缓存，但不保证命中。Vertex 按用户自己的 GCP 项目计费，xAI 消耗订阅配额。
+2. **请求体上限**：20 MiB 是对 D2 唯一的例外，属于物理限制；Vertex 未写明单请求 inline 总量上限，如真机触发再调整，调整前再确认。
+3. **视觉 + 思考 / 工具**：官方均未写明，若真机出现 400，按 D8 给出可读错误，不自动关闭用户设置。
+4. **D8 的已知代价**：发过图的会话切到不支持图片的模型后每轮报错；400 的提示只能留有余地，无法断言就是图片导致。
+5. **xAI 订阅路径未采集图片请求**：若 `cli-chat-proxy.grok.com` 拒绝 `input_image`，按 D8 只显示错误；是否需要抓包补采由用户决定。不发 `detail` 是否可行同样待验收。
+6. **旧名停用时间未公布**：因此 MM-0 应尽早完成真机验收，与后续多模态开发解耦。
+7. **OpenAI 兼容协议的图片 token 估算**没有统一官方口径，只能保守估计并标注「预计」。
+8. **摘要会丢失图片内容**，长会话压缩后模型只知道「曾经发过图片」。
+9. GIF 与动态 WebP 只保留首帧。
+10. 编辑消息时保留的原图不重新压缩，始终沿用首次导入的字节。
+11. **`readTimeout` 的合适数值**需要真机测大量图片 + 思考的首字节延迟后确定，四个 `OkHttpClient` 实例都要覆盖。
+12. **提交后重新抛出取消**会让「异常 ≠ 未提交」，所有文件去留必须查库决定；这是 MM-1a 与 MM-2 中最容易出错的地方，需重点测试。
 
 ## 7. 工作量估算
 
-以下为粗略估算（含测试），实施时按实际拆分。审查认为原估算偏低，已上调：
+以下为粗略估算（含测试），实施时按实际拆分。2026-11-01 修订：D8 删掉了能力解析、剥图与设置开关；D7 增加了 xAI 适配器翻译与第三条传输的流式请求体、超时与错误映射，两者大致相抵。
 
 | 分期 | 主要涉及 | 估计 |
 | --- | --- | --- |
-| MM-0 | `DeepSeekModels`、DataStore 迁移、RP Marker 与模型提示文案、预览、相关测试、文档 | 约 12～14 个文件，300～500 行 |
-| MM-1a | Room v11 与导出 schema、文件存储与基本清理、domain、两套 DTO 与约 12 处构造点（另约 7 个测试文件）、流式请求体、统一历史映射、规划器与估算器、上下文面板、Repository 发送与重新生成 | 约 25 个文件，1800～2500 行 |
-| MM-1b | Photo Picker 与压缩管线、输入栏与预览、气泡缩略图、设置开关、面板展示 | 约 10 个文件，800～1200 行 |
+| MM-0 | `DeepSeekModels`、DataStore 迁移、RP Marker 与模型提示文案、预览、相关测试、文档 | 约 12～14 个文件，300～500 行（已实现） |
+| MM-1a | Room v11 与导出 schema、文件存储与基本清理、domain、两套 DTO 与构造点、xAI 适配器翻译、共用流式请求体、统一历史映射、规划器与估算器、上下文面板、Repository 发送与重新生成 | 约 25 个文件，1800～2500 行 |
+| MM-1b | Photo Picker 与压缩管线、输入栏与预览、气泡缩略图、面板展示 | 约 8 个文件，650～1000 行 |
 | MM-2 | 编辑两阶段提交与文件去留、编辑弹窗、启动孤儿扫描与 Mutex、测试 | 约 10 个文件，700～1000 行 |
 | MM-3 | 大图查看、粘贴、上传提示 | 约 5 个文件，300～500 行 |

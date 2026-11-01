@@ -16,7 +16,6 @@ import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okio.BufferedSource
 import java.io.IOException
@@ -50,6 +49,12 @@ class DeepSeekApiClient private constructor(
     private val activeCalls = ConcurrentHashMap.newKeySet<Call>()
     private val modelCatalogRequester = ModelCatalogRequester(okHttpClient, json, logger)
 
+    /** 含图片的请求用放宽了读超时的同源 client（共享连接池）。 */
+    private val imageOkHttpClient: OkHttpClient by lazy { okHttpClient.withImageReadTimeout() }
+
+    private fun clientFor(requestDto: DeepSeekChatRequest): OkHttpClient =
+        if (requestDto.imagePayloads().isEmpty()) okHttpClient else imageOkHttpClient
+
     fun streamChat(
         apiKey: String,
         baseUrl: String,
@@ -59,7 +64,7 @@ class DeepSeekApiClient private constructor(
         val requestUrl = "${normalizeBaseUrl(baseUrl)}/chat/completions"
         val normalizedApiKey = normalizeApiKey(apiKey)
         logger.info("Starting DeepSeek stream request")
-        val body = json.encodeToString(requestDto).toRequestBody(JSON_MEDIA_TYPE)
+        val body = ImagePayloadRequestBody.create(json.encodeToString(requestDto), requestDto.imagePayloads(), JSON_MEDIA_TYPE)
         val request = Request.Builder()
             .url(requestUrl)
             .addHeader("Authorization", "Bearer $normalizedApiKey")
@@ -68,7 +73,7 @@ class DeepSeekApiClient private constructor(
             .post(body)
             .build()
 
-        val call = okHttpClient.newCall(request)
+        val call = clientFor(requestDto).newCall(request)
         activeCalls.add(call)
         try {
             call.enqueue(object : Callback {
@@ -86,7 +91,7 @@ class DeepSeekApiClient private constructor(
                         response.use {
                             if (!it.isSuccessful) {
                                 logger.warn("DeepSeek stream HTTP ${it.code}")
-                                close(IOException("DeepSeek API returned HTTP ${it.code}"))
+                                close(DeepSeekHttpException(it.code))
                                 return
                             }
 
@@ -163,7 +168,7 @@ class DeepSeekApiClient private constructor(
         val requestUrl = "${normalizeBaseUrl(baseUrl)}/chat/completions"
         val normalizedApiKey = normalizeApiKey(apiKey)
         logger.info("Starting DeepSeek non-stream request")
-        val body = json.encodeToString(requestDto).toRequestBody(JSON_MEDIA_TYPE)
+        val body = ImagePayloadRequestBody.create(json.encodeToString(requestDto), requestDto.imagePayloads(), JSON_MEDIA_TYPE)
         val request = Request.Builder()
             .url(requestUrl)
             .addHeader("Authorization", "Bearer $normalizedApiKey")
@@ -171,7 +176,7 @@ class DeepSeekApiClient private constructor(
             .post(body)
             .build()
 
-        val call = okHttpClient.newCall(request)
+        val call = clientFor(requestDto).newCall(request)
         activeCalls.add(call)
         continuation.invokeOnCancellation {
             // 只取消当前协程拥有的 Call；同 client 上的正文、RP 补写或模型请求互不误伤。
@@ -196,7 +201,7 @@ class DeepSeekApiClient private constructor(
                             response.use {
                                 if (!it.isSuccessful) {
                                     logger.warn("DeepSeek non-stream HTTP ${it.code}")
-                                    throw IOException("DeepSeek API returned HTTP ${it.code}")
+                                    throw DeepSeekHttpException(it.code)
                                 }
 
                                 val responseBody = readBodyWithinLimit(it)
@@ -261,6 +266,14 @@ class DeepSeekApiClient private constructor(
             mapHttpError = { response, _ -> deepSeekModelListHttpError(response.code) },
             mapNetworkError = { error -> toUserReadableNetworkError(error) },
         )
+
+    /**
+     * 文案保持原有的固定格式（`DeepSeekErrorSanitizer` 按它识别状态码），
+     * 额外带上结构化状态码，供上层判断「含图片的 400 / 413」而不必解析文案。
+     */
+    private class DeepSeekHttpException(override val httpStatus: Int) :
+        IOException("DeepSeek API returned HTTP $httpStatus"),
+        HttpStatusError
 
     /** 固定文案且不携带原始响应或 cause，避免解析器把响应片段带到上层。 */
     private class DeepSeekResponseException(message: String) : SerializationException(message)

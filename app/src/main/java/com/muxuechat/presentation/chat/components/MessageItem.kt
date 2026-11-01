@@ -106,11 +106,18 @@ private fun UserMessage(
                 )
                 .padding(horizontal = Spacing.Content, vertical = Spacing.Medium),
         ) {
-            Text(
-                text = message.content,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
+                // 普通聊天与 RP 的玩家消息共用这个气泡，图片在上、文字在下。
+                MessageImageGrid(attachments = message.attachments)
+                // 纯图片消息（D6）不显示空文本块。
+                if (message.content.isNotBlank() || message.attachments.isEmpty()) {
+                    Text(
+                        text = message.content,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+            }
         }
     }
 }

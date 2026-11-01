@@ -16,12 +16,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.muxuechat.presentation.chat.ChatScreen
 import com.muxuechat.presentation.chat.ChatViewModel
+import com.muxuechat.presentation.chat.components.ChatImageThumbnailSource
 import com.muxuechat.presentation.settings.GoogleAuthViewModel
 import com.muxuechat.presentation.settings.SettingsScreen
 import com.muxuechat.presentation.settings.XaiAuthViewModel
@@ -147,6 +149,15 @@ fun MuxueChatApp(
                         onRefreshProviderModels = viewModel::refreshProviderModels,
                         onSyncRpMetricDefinitions = viewModel::syncActiveRpMetricDefinitions,
                         onEditRpMetric = viewModel::updateActiveRpMetric,
+                        imageThumbnails = remember(viewModel) {
+                            ChatImageThumbnailSource { ref, maxEdgePx -> viewModel.loadImageThumbnail(ref, maxEdgePx) }
+                        },
+                        onAttachImages = viewModel::attachImages,
+                        onRemovePendingImage = viewModel::removePendingImage,
+                        onBeginEditUserMessage = viewModel::beginEditUserMessage,
+                        onAttachEditImages = viewModel::attachEditImages,
+                        onRemoveEditImage = viewModel::removeEditImage,
+                        onCancelEditUserMessage = viewModel::cancelEditUserMessage,
                     )
                     Destination.Settings -> SettingsScreen(
                         settings = state.settings,

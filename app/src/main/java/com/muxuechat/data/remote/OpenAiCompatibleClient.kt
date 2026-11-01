@@ -43,7 +43,10 @@ internal interface OpenAiCompatibleUserFacingError
 internal class OpenAiCompatibleUnauthorizedException(message: String) :
     IOException(message),
     OpenAiCompatibleUserFacingError,
-    ModelCatalogUserFacingError
+    ModelCatalogUserFacingError,
+    HttpStatusError {
+    override val httpStatus: Int get() = 401
+}
 
 /**
  * 所有自定义供应商共用的 OpenAI 兼容客户端。
@@ -83,6 +86,12 @@ class OpenAiCompatibleClient private constructor(
     private val activeCalls = ConcurrentHashMap.newKeySet<Call>()
     private val modelCatalogRequester = ModelCatalogRequester(okHttpClient, json, logger)
 
+    /** 含图片的请求用放宽了读超时的同源 client（共享连接池，钉死实例的禁止重定向同样保留）。 */
+    private val imageOkHttpClient: OkHttpClient by lazy { okHttpClient.withImageReadTimeout() }
+
+    private fun clientFor(requestDto: OpenAiCompatibleChatRequest): OkHttpClient =
+        if (requestDto.imagePayloads().isEmpty()) okHttpClient else imageOkHttpClient
+
     fun streamChat(
         apiKey: String,
         baseUrl: String,
@@ -100,9 +109,11 @@ class OpenAiCompatibleClient private constructor(
             conversationId = conversationId,
         )
 
+        val client = clientFor(requestDto)
+
         return callbackFlow {
             logger.info("Starting OpenAI-compatible stream request")
-            val call = okHttpClient.newCall(request)
+            val call = client.newCall(request)
             activeCalls.add(call)
             try {
                 call.enqueue(object : Callback {
@@ -214,7 +225,7 @@ class OpenAiCompatibleClient private constructor(
         )
         logger.info("Starting OpenAI-compatible non-stream request")
 
-        val call = okHttpClient.newCall(request)
+        val call = clientFor(requestDto).newCall(request)
         activeCalls.add(call)
         continuation.invokeOnCancellation {
             // Job 与 Call 一一绑定；取消正文不会再通过全局 activeCalls 误伤 RP 补写。
@@ -356,7 +367,7 @@ class OpenAiCompatibleClient private constructor(
             require(key.isNotEmpty()) { "请先在设置中保存供应商 API Key" }
             require(key.none { it == '\r' || it == '\n' }) { "供应商 API Key 格式无效" }
         }
-        val body = json.encodeToString(requestDto).toRequestBody(JSON_MEDIA_TYPE)
+        val body = ImagePayloadRequestBody.create(json.encodeToString(requestDto), requestDto.imagePayloads(), JSON_MEDIA_TYPE)
 
         return Request.Builder()
             .url(requestUrl)
@@ -376,10 +387,13 @@ class OpenAiCompatibleClient private constructor(
     }
 
     /** 仅承载本客户端生成并已做凭据清理、长度限制的用户可见错误。 */
-    private class OpenAiCompatibleResponseException(message: String) :
-        IOException(message),
+    private class OpenAiCompatibleResponseException(
+        message: String,
+        override val httpStatus: Int? = null,
+    ) : IOException(message),
         OpenAiCompatibleUserFacingError,
-        ModelCatalogUserFacingError
+        ModelCatalogUserFacingError,
+        HttpStatusError
 
     /**
      * 读取供应商明确返回的结构化错误，而不是只保留 HTTP 状态码。
@@ -427,6 +441,7 @@ class OpenAiCompatibleClient private constructor(
                     append(it)
                 }
             },
+            response.code,
         )
     }
 
@@ -526,6 +541,7 @@ class OpenAiCompatibleClient private constructor(
                 in 500..599 -> "供应商服务暂时不可用（HTTP $code）"
                 else -> "供应商请求失败（HTTP $code）"
             },
+            code,
         )
 
         private fun toUserReadableNetworkError(error: IOException): IOException = when (error) {

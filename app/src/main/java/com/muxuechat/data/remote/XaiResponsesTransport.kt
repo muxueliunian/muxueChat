@@ -20,7 +20,6 @@ import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okio.BufferedSource
 import java.io.IOException
@@ -91,9 +90,11 @@ class XaiResponsesTransport private constructor(
     ): Flow<OpenAiCompatibleStreamEvent> {
         val request = buildRequest(accessToken, baseUrl, requestDto)
 
+        val client = clientFor(requestDto)
+
         return callbackFlow {
             logger.info("Starting xAI Responses stream request")
-            val call = okHttpClient.newCall(request)
+            val call = client.newCall(request)
             activeCalls.add(call)
             try {
                 call.enqueue(object : Callback {
@@ -329,6 +330,12 @@ class XaiResponsesTransport private constructor(
         emit(OpenAiCompatibleStreamEvent.Done)
     }
 
+    /** 含图片的请求用放宽了读超时的同源 client（共享连接池）。 */
+    private val imageOkHttpClient: OkHttpClient by lazy { okHttpClient.withImageReadTimeout() }
+
+    private fun clientFor(requestDto: OpenAiCompatibleChatRequest): OkHttpClient =
+        if (requestDto.imagePayloads().isEmpty()) okHttpClient else imageOkHttpClient
+
     private fun buildRequest(
         accessToken: String,
         baseUrl: String,
@@ -337,9 +344,10 @@ class XaiResponsesTransport private constructor(
         val normalized = requirePinnedBaseUrl(baseUrl)
         warnUnsupportedSamplingParams(requestDto)
         val payload = json.encodeToString(toResponsesRequest(requestDto))
+        val body = ImagePayloadRequestBody.create(payload, requestDto.imagePayloads(), JSON_MEDIA_TYPE)
         return identityHeaders(Request.Builder(), accessToken)
             .url("$normalized/responses")
-            .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+            .post(body)
             .header("Accept", "text/event-stream")
             .header("x-grok-conv-id", sessionId)
             .header("x-grok-session-id", sessionId)
@@ -425,13 +433,25 @@ class XaiResponsesTransport private constructor(
 
             // user 以及任何其它角色都按用户输入发送：Responses 的 input 只认 developer /
             // user / assistant 与上面的工具项。
-            else -> listOf(
-                XaiInputItem(
-                    role = ROLE_USER,
-                    content = jsonArrayOf(json.encodeToJsonElement(XaiInputTextPart(text = text))),
-                ),
-            )
+            else -> listOf(XaiInputItem(role = ROLE_USER, content = userContent(text, message.images)))
         }
+    }
+
+    /**
+     * 用户消息的 content 数组。没有图片时保持 XAI-2 的形状（单个 `input_text`），字节不变。
+     *
+     * 有图片时追加 `input_image`（xAI Image Understanding 文档，见 MULTIMODAL_PLAN 1.2）：
+     * `image_url` 是**字符串**而不是 OpenAI 的 `{"url": …}` 对象；这里写占位符，
+     * 真实 data URL 由 [ImagePayloadRequestBody] 发送时写出。不发 `detail`。
+     * 纯图片消息（D6）不生成空的 `input_text`。
+     */
+    private fun userContent(text: String, images: List<ImagePayload>): JsonArray {
+        if (images.isEmpty()) return jsonArrayOf(json.encodeToJsonElement(XaiInputTextPart(text = text)))
+        val parts = buildList {
+            if (text.isNotBlank()) add(json.encodeToJsonElement(XaiInputTextPart(text = text)))
+            images.forEach { image -> add(json.encodeToJsonElement(XaiInputImagePart(imageUrl = image.placeholder))) }
+        }
+        return JsonArray(parts)
     }
 
     /** 上层的 tool_call id 就是解析器交出的 `call_id`，原样带回（线上格式 §3.3）。 */
@@ -455,10 +475,10 @@ class XaiResponsesTransport private constructor(
     private fun httpError(code: Int): XaiResponsesException = when {
         // 401 单独成型：调用方要能据此判断「这个 token 被拒了」，从而刷新后重试一次。
         code == 401 -> XaiUnauthorizedException()
-        code == 403 -> XaiResponsesException("xAI 拒绝了本次请求，请重新登录后重试")
-        code == 429 -> XaiResponsesException("xAI 请求过于频繁或已达订阅额度，请稍后重试")
-        code >= 500 -> XaiResponsesException("xAI 服务暂时不可用（HTTP $code），请稍后重试")
-        else -> XaiResponsesException("xAI 请求失败（HTTP $code）")
+        code == 403 -> XaiResponsesException("xAI 拒绝了本次请求，请重新登录后重试", code)
+        code == 429 -> XaiResponsesException("xAI 请求过于频繁或已达订阅额度，请稍后重试", code)
+        code >= 500 -> XaiResponsesException("xAI 服务暂时不可用（HTTP $code），请稍后重试", code)
+        else -> XaiResponsesException("xAI 请求失败（HTTP $code）", code)
     }
 
     private fun networkError(error: IOException): IOException =
@@ -477,9 +497,12 @@ class XaiResponsesTransport private constructor(
      * 文案完全由 App 生成，不含 token、地址或上游响应原文，可直接展示。
      * 复用 [OpenAiCompatibleUserFacingError] 标记，走与自定义供应商相同的错误映射。
      */
-    internal open class XaiResponsesException(message: String) :
-        IOException(message),
-        OpenAiCompatibleUserFacingError
+    internal open class XaiResponsesException(
+        message: String,
+        override val httpStatus: Int? = null,
+    ) : IOException(message),
+        OpenAiCompatibleUserFacingError,
+        HttpStatusError
 
     /**
      * 上游以 401 拒绝了本次使用的 access token。
@@ -489,7 +512,7 @@ class XaiResponsesTransport private constructor(
      * 尤其是正文结束后才发出的 RP 补写。
      */
     internal class XaiUnauthorizedException :
-        XaiResponsesException("xAI 拒绝了本次请求，请重新登录后重试")
+        XaiResponsesException("xAI 拒绝了本次请求，请重新登录后重试", 401)
 
     internal companion object {
         private const val TAG = "muxueChat.XaiResponses"

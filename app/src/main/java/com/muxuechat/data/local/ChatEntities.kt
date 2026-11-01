@@ -10,6 +10,7 @@ import com.muxuechat.domain.model.ChatRole
 import com.muxuechat.domain.model.ConversationRpSettings
 import com.muxuechat.domain.model.ConversationTokenUsage
 import com.muxuechat.domain.model.Conversation
+import com.muxuechat.domain.model.MessageAttachment
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.RoleCard
@@ -63,7 +64,10 @@ data class MessageEntity(
     val createdAtMillis: Long,
     val updatedAtMillis: Long,
 ) {
-    fun toDomain(rpMetadata: RpMessageMetadata? = null) = ChatMessage(
+    fun toDomain(
+        rpMetadata: RpMessageMetadata? = null,
+        attachments: List<MessageAttachment> = emptyList(),
+    ) = ChatMessage(
         id = id,
         conversationId = conversationId,
         role = role,
@@ -74,7 +78,57 @@ data class MessageEntity(
         createdAtMillis = createdAtMillis,
         updatedAtMillis = updatedAtMillis,
         rpMetadata = rpMetadata,
+        attachments = attachments,
     )
+}
+
+/**
+ * 用户消息的图片附件（v11，MULTIMODAL_PLAN 3.1）。
+ *
+ * 单独建表而不是给 `messages` 加 JSON 列：流式期间消息行高频更新，附件不可变，
+ * 不该跟着反复序列化；外键级联也让删消息时附件行一定消失（文件由 Repository 事后清理）。
+ * `conversationId` 是冗余列，只为按会话查询与清理，不另设外键。
+ */
+@Entity(
+    tableName = "message_attachments",
+    foreignKeys = [
+        ForeignKey(
+            entity = MessageEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["messageId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [Index("messageId"), Index("conversationId")],
+)
+data class MessageAttachmentEntity(
+    @PrimaryKey val id: String,
+    val messageId: String,
+    val conversationId: String,
+    val kind: String,
+    val mimeType: String,
+    /** 相对 `filesDir` 的路径，例如 `chat_images/<id>.jpg`。 */
+    val relativePath: String,
+    val byteSize: Long,
+    val width: Int,
+    val height: Int,
+    val sha256: String,
+    val orderIndex: Int,
+    val createdAtMillis: Long,
+) {
+    fun toDomain() = MessageAttachment(
+        id = id,
+        messageId = messageId,
+        mimeType = mimeType,
+        width = width,
+        height = height,
+        byteSize = byteSize,
+        orderIndex = orderIndex,
+    )
+
+    companion object {
+        const val KIND_IMAGE = "IMAGE"
+    }
 }
 
 fun Conversation.toEntity() = ConversationEntity(id, title, createdAtMillis, updatedAtMillis)

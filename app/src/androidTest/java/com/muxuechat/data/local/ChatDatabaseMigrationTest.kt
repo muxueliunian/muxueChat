@@ -31,7 +31,7 @@ import org.junit.runner.RunWith
  * 这能验证迁移 SQL 的连续性、数据保留和最终 Room schema，但不能替代来自已发布版本的
  * 原始 schema/identity hash。证据与边界见 docs/ROOM_MIGRATION_TEST_NOTES.md。
  *
- * 例外是 8→9 与 9→10：8.json、9.json、10.json 都是 Room 真实导出的 schema，
+ * 例外是 8→9、9→10 与 10→11：8.json 至 11.json 都是 Room 真实导出的 schema，
  * 因此另有 [MigrationTestHelper] 用例按导出 schema 建库并做真实升级校验。
  */
 @RunWith(AndroidJUnit4::class)
@@ -39,10 +39,10 @@ class ChatDatabaseMigrationTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val databaseNames = mutableSetOf<String>()
     private val migrations: List<Migration> by lazy {
-        (1..9).map { startVersion -> findProductionMigration(startVersion, startVersion + 1) }
+        (1..10).map { startVersion -> findProductionMigration(startVersion, startVersion + 1) }
     }
 
-    /** 只用于 8→9 与 9→10：从测试 APK assets 中读取 Room 导出的 schema。 */
+    /** 只用于 8→9、9→10 与 10→11：从测试 APK assets 中读取 Room 导出的 schema。 */
     @get:Rule
     val exportedSchemaHelper = MigrationTestHelper(
         InstrumentationRegistry.getInstrumentation(),
@@ -411,7 +411,7 @@ class ChatDatabaseMigrationTest {
     }
 
     @Test
-    fun migrate1To10_opensWithRoomV10ValidationAndPreservesCoreRows() {
+    fun migrate1To11_opensWithRoomV11ValidationAndPreservesCoreRows() {
         val name = newDatabaseName("full-path")
         createReconstructedDatabase(name, 1).use { helper ->
             insertCoreConversationAndMessage(helper.writableDatabase)
@@ -423,8 +423,8 @@ class ChatDatabaseMigrationTest {
             .build()
         try {
             val db = roomDatabase.openHelper.writableDatabase
-            // 成功打开已经触发 ChatDatabase_Impl 对 v10 表、列、索引和外键的完整校验。
-            assertEquals(10L, queryLong(db, "PRAGMA user_version"))
+            // 成功打开已经触发 ChatDatabase_Impl 对 v11 表、列、索引和外键的完整校验。
+            assertEquals(11L, queryLong(db, "PRAGMA user_version"))
             assertEquals("历史会话", queryString(db, "SELECT title FROM conversations WHERE id = 'conversation'"))
             assertEquals("历史消息", queryString(db, "SELECT content FROM messages WHERE id = 'message'"))
             assertFalse(tableExists(db, "conversation_rp_settings_new"))
@@ -434,8 +434,64 @@ class ChatDatabaseMigrationTest {
             assertTrue(tableExists(db, "protagonist_profiles"))
             assertTrue(tableExists(db, "supporting_characters"))
             assertTrue(tableExists(db, "conversation_supporting_characters"))
+            assertTrue(tableExists(db, "message_attachments"))
+            assertEquals(0, rowCount(db, "message_attachments"))
         } finally {
             roomDatabase.close()
+        }
+    }
+
+    /**
+     * v10 → v11（MULTIMODAL_PLAN 3.1）：按导出的 10.json 建库，真实升级并对照 11.json 校验。
+     * 只新建附件表，既有会话、消息与 RP 数据原样保留。
+     */
+    @Test
+    fun migrate10To11_fromExportedV10Schema_addsAttachmentTableAndPreservesRows() {
+        val name = newDatabaseName("exported-10-11")
+        exportedSchemaHelper.createDatabase(name, 10).use { db ->
+            insertCoreConversationAndMessage(db)
+            insertUserMessage(db, "user-message")
+        }
+
+        exportedSchemaHelper.runMigrationsAndValidate(
+            name,
+            11,
+            true,
+            findProductionMigration(10, 11),
+        ).use { db ->
+            assertEquals("历史会话", queryString(db, "SELECT title FROM conversations WHERE id = 'conversation'"))
+            assertEquals("历史消息", queryString(db, "SELECT content FROM messages WHERE id = 'message'"))
+            assertEquals("看看这张图", queryString(db, "SELECT content FROM messages WHERE id = 'user-message'"))
+            assertEquals(2, rowCount(db, "messages"))
+
+            assertTrue(tableExists(db, "message_attachments"))
+            assertEquals(0, rowCount(db, "message_attachments"))
+            assertForeignKey(db, "message_attachments", "messageId", "messages", "id", "CASCADE")
+            assertIndex(db, "message_attachments", "index_message_attachments_messageId", "messageId")
+            assertIndex(db, "message_attachments", "index_message_attachments_conversationId", "conversationId")
+        }
+    }
+
+    /** 升级后附件行随消息、会话级联删除；改写消息正文（UPDATE）不影响附件。 */
+    @Test
+    fun migrate10To11_thenAttachmentsFollowMessageLifecycle() {
+        val name = newDatabaseName("exported-10-11-fk")
+        exportedSchemaHelper.createDatabase(name, 10).use { db ->
+            insertCoreConversationAndMessage(db)
+            insertUserMessage(db, "user-message")
+        }
+
+        exportedSchemaHelper.runMigrationsAndValidate(name, 11, true, findProductionMigration(10, 11)).use { db ->
+            db.execSQL("PRAGMA foreign_keys = ON")
+            insertAttachment(db, id = "attachment-1", messageId = "user-message", orderIndex = 0)
+            insertAttachment(db, id = "attachment-2", messageId = "user-message", orderIndex = 1)
+
+            db.execSQL("UPDATE messages SET content = '改过的正文' WHERE id = 'user-message'")
+            assertEquals(2, rowCount(db, "message_attachments"))
+
+            db.execSQL("DELETE FROM messages WHERE id = 'user-message'")
+            assertEquals(0, rowCount(db, "message_attachments"))
+            assertEquals(1, rowCount(db, "messages"))
         }
     }
 
@@ -744,6 +800,26 @@ class ChatDatabaseMigrationTest {
                 "createdAtMillis, updatedAtMillis) VALUES (?, 'conversation', 'ASSISTANT', " +
                 "'历史消息', NULL, 'COMPLETED', NULL, 1, 2)",
             arrayOf<Any?>(id),
+        )
+    }
+
+    private fun insertUserMessage(db: SupportSQLiteDatabase, id: String) {
+        db.execSQL(
+            "INSERT INTO messages " +
+                "(id, conversationId, role, content, reasoningContent, status, errorMessage, " +
+                "createdAtMillis, updatedAtMillis) VALUES (?, 'conversation', 'USER', " +
+                "'看看这张图', NULL, 'COMPLETED', NULL, 3, 3)",
+            arrayOf<Any?>(id),
+        )
+    }
+
+    private fun insertAttachment(db: SupportSQLiteDatabase, id: String, messageId: String, orderIndex: Int) {
+        db.execSQL(
+            "INSERT INTO message_attachments " +
+                "(id, messageId, conversationId, kind, mimeType, relativePath, byteSize, width, height, " +
+                "sha256, orderIndex, createdAtMillis) " +
+                "VALUES (?, ?, 'conversation', 'IMAGE', 'image/jpeg', ?, 100, 10, 10, 'fixture', ?, 4)",
+            arrayOf<Any?>(id, messageId, "chat_images/$id.jpg", orderIndex),
         )
     }
 

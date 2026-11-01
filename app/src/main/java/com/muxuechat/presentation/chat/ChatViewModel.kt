@@ -9,6 +9,10 @@ import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.AP
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.lifecycle.viewModelScope
 import com.muxuechat.data.local.ChatDatabase
+import com.muxuechat.data.local.ChatImageImporter
+import com.muxuechat.data.local.ChatImageStore
+import com.muxuechat.data.local.ChatImageThumbnailLoader
+import com.muxuechat.data.local.ImageImportResult
 import com.muxuechat.data.local.EncryptedApiKeyStore
 import com.muxuechat.data.local.EncryptedCliProxyApiKeyStore
 import com.muxuechat.data.local.EncryptedProviderKeyStore
@@ -37,6 +41,9 @@ import com.muxuechat.domain.model.CustomProvider
 import com.muxuechat.domain.model.DeepSeekModels
 import com.muxuechat.domain.model.DisplayScale
 import com.muxuechat.domain.model.DisplaySettings
+import com.muxuechat.domain.model.ImageInputSpec
+import com.muxuechat.domain.model.MessageImageEdit
+import com.muxuechat.domain.model.PendingImage
 import com.muxuechat.domain.model.MessageStatus
 import com.muxuechat.domain.model.ProtagonistProfile
 import com.muxuechat.domain.model.ProtagonistProfileDraft
@@ -66,6 +73,7 @@ import com.muxuechat.domain.usecase.RenameConversationUseCase
 import com.muxuechat.domain.usecase.RetryRpOptionsUseCase
 import com.muxuechat.domain.usecase.SendMessageUseCase
 import com.muxuechat.domain.usecase.StopGenerationUseCase
+import com.muxuechat.presentation.chat.components.ChatImageRef
 import com.muxuechat.data.repository.RpBindingDraft
 import com.muxuechat.domain.model.SupportingCharacter
 import com.muxuechat.domain.model.RpSettingRef
@@ -111,6 +119,8 @@ class ChatViewModel(
     private val rpRepository: RpRepository,
     private val settingsRepository: SettingsRepository,
     private val documentTextExtractor: DocumentTextExtractor,
+    private val chatImageImporter: ChatImageImporter,
+    private val imageThumbnailLoader: ChatImageThumbnailLoader,
 ) : ViewModel() {
     private val activeConversationId = MutableStateFlow<String?>(null)
     private val transient = MutableStateFlow(TransientState())
@@ -123,6 +133,8 @@ class ChatViewModel(
                 .onFailure { error -> Log.w(TAG, "Legacy provider migration failed: ${error.message}", error) }
             refreshSavedProviderKeys()
         }
+        // 启动孤儿图片扫描：Repository 保证每个进程只真正执行一次，且在数据库打开后、持附件锁时进行。
+        viewModelScope.launch { chatRepository.removeOrphanImagesOncePerProcess() }
     }
 
     private val messages = activeConversationId.flatMapLatest { conversationId ->
@@ -233,6 +245,9 @@ class ChatViewModel(
             isCompactingContext = transient.isCompactingContext,
             isSavingSettingsDraft = transient.isSavingSettingsDraft,
             pendingAttachment = transient.pendingAttachment,
+            pendingImages = transient.pendingImages,
+            isImportingImages = transient.isImportingImages,
+            editImageDraft = transient.editImageDraft,
             providersWithSavedKey = transient.providersWithSavedKey,
             isImportingAttachment = transient.isImportingAttachment,
             modelRefreshErrors = transient.modelRefreshErrors,
@@ -308,6 +323,9 @@ class ChatViewModel(
             settingsToolDrafts = tool.drafts,
             isSavingSettingsDraft = core.isSavingSettingsDraft,
             pendingAttachment = core.pendingAttachment,
+            pendingImages = core.pendingImages,
+            isImportingImages = core.isImportingImages,
+            editImageDraft = core.editImageDraft,
             providersWithSavedKey = core.providersWithSavedKey,
             isImportingAttachment = core.isImportingAttachment,
             modelRefreshErrors = core.modelRefreshErrors,
@@ -399,17 +417,101 @@ class ChatViewModel(
         transient.update { it.copy(pendingAttachment = null) }
     }
 
+    /** 缩略图只经 ViewModel 读取；UI 拿不到路径（AGENT.md §3.5）。 */
+    suspend fun loadImageThumbnail(ref: ChatImageRef, maxEdgePx: Int): android.graphics.Bitmap? = when (ref) {
+        is ChatImageRef.Attachment -> imageThumbnailLoader.loadAttachment(ref.id, maxEdgePx)
+        is ChatImageRef.Pending -> imageThumbnailLoader.loadPending(ref.id, maxEdgePx)
+    }
+
+    /**
+     * 输入栏选中的图片（系统 Photo Picker，无需存储权限）：后台解码压缩为待发送 JPEG。
+     * 单张失败只提示原因，不影响已有待发送图片；超出 4 张的部分不导入。
+     */
+    fun attachImages(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val current = transient.value
+        if (current.isImportingImages) return
+        val remaining = ImageInputSpec.MAX_IMAGES_PER_MESSAGE - current.pendingImages.size
+        if (remaining <= 0) {
+            transient.update { it.copy(errorMessage = IMAGE_LIMIT_MESSAGE) }
+            return
+        }
+        transient.update { it.copy(isImportingImages = true) }
+        viewModelScope.launch {
+            try {
+                val outcome = importImages(uris, remaining) { image ->
+                    var added = false
+                    transient.update { state ->
+                        if (state.pendingImages.size < ImageInputSpec.MAX_IMAGES_PER_MESSAGE) {
+                            added = true
+                            state.copy(pendingImages = state.pendingImages + image)
+                        } else {
+                            state
+                        }
+                    }
+                    added
+                }
+                outcome?.let { message -> transient.update { it.copy(errorMessage = message) } }
+            } finally {
+                transient.update { it.copy(isImportingImages = false) }
+            }
+        }
+    }
+
+    fun removePendingImage(pendingId: String) {
+        val removed = transient.value.pendingImages.any { it.id == pendingId }
+        transient.update { state -> state.copy(pendingImages = state.pendingImages.filterNot { it.id == pendingId }) }
+        if (removed) viewModelScope.launch { chatImageImporter.discard(listOf(pendingId)) }
+    }
+
+    /**
+     * 逐张导入，[accept] 返回 false 表示名额已满（该图随即丢弃）。返回需要提示用户的一句话，没有则为 null。
+     * 日志只记张数，不记 URI。
+     */
+    private suspend fun importImages(
+        uris: List<Uri>,
+        remaining: Int,
+        accept: (PendingImage) -> Boolean,
+    ): String? {
+        val accepted = uris.take(remaining)
+        var skipped = uris.size - accepted.size
+        val failures = mutableListOf<String>()
+        accepted.forEach { uri ->
+            when (val result = chatImageImporter.import(uri)) {
+                is ImageImportResult.Success -> if (!accept(result.image)) {
+                    skipped++
+                    chatImageImporter.discard(listOf(result.image.id))
+                }
+                is ImageImportResult.Failure -> failures += result.reason
+            }
+        }
+        Log.i(TAG, "Images imported: requested=${uris.size} failed=${failures.size} skipped=$skipped")
+        return when {
+            failures.isNotEmpty() -> failures.distinct().joinToString(" ")
+            skipped > 0 -> "$IMAGE_LIMIT_MESSAGE 多出的 $skipped 张未添加。"
+            else -> null
+        }
+    }
+
     fun sendMessage(content: String) {
         val currentConversationId = activeConversationId.value
-        val attachment = transient.value.pendingAttachment
+        val current = transient.value
+        if (current.isImportingImages) {
+            transient.update { it.copy(errorMessage = "图片还在处理中，请稍候再发送。") }
+            return
+        }
+        val attachment = current.pendingAttachment
+        val images = current.pendingImages
         val composed = AttachmentFormat.composeUserMessage(
             userText = content,
             attachmentName = attachment?.fileName,
             attachmentText = attachment?.text,
         )
-        if (composed.isBlank()) return
+        // D6：只发图片、不写文字也可以。
+        if (composed.isBlank() && images.isEmpty()) return
 
-        transient.update { it.copy(pendingAttachment = null) }
+        // 待发送图片随这次调用交给 Repository：成功时移入正式目录，失败时由它丢弃，这里不再持有。
+        transient.update { it.copy(pendingAttachment = null, pendingImages = emptyList()) }
         startGeneration(
             initialConversationId = currentConversationId,
             autoSelectCreatedConversation = currentConversationId == null,
@@ -419,9 +521,9 @@ class ChatViewModel(
             Log.i(
                 TAG,
                 "Sending message: conversationId=$currentConversationId length=${composed.length} " +
-                    "hasAttachment=${attachment != null}",
+                    "hasAttachment=${attachment != null} images=${images.size}",
             )
-            sendMessageUseCase(currentConversationId, composed)
+            sendMessageUseCase(currentConversationId, composed, images)
         }
     }
 
@@ -479,11 +581,112 @@ class ChatViewModel(
         }
     }
 
-    fun editUserMessageAndRegenerate(messageId: String, content: String) {
-        if (transient.value.isGenerating) {
-            transient.update { it.copy(errorMessage = "正在生成时不能编辑历史消息") }
+    /** 打开编辑弹窗时建立图片草稿；上一份没提交的草稿里新选的图一并丢弃。 */
+    fun beginEditUserMessage(message: ChatMessage) {
+        val previous = transient.value.editImageDraft
+        transient.update {
+            it.copy(
+                editImageDraft = EditImageDraft(
+                    messageId = message.id,
+                    original = message.attachments.sortedBy { attachment -> attachment.orderIndex },
+                    kept = message.attachments.sortedBy { attachment -> attachment.orderIndex },
+                ),
+            )
+        }
+        previous?.added?.takeIf { it.isNotEmpty() }?.let { added ->
+            viewModelScope.launch { chatImageImporter.discard(added.map { it.id }) }
+        }
+    }
+
+    /** 编辑弹窗里继续添加图片（受 4 张上限约束）。 */
+    fun attachEditImages(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val draft = transient.value.editImageDraft ?: return
+        if (draft.isImporting) return
+        if (draft.remainingSlots <= 0) {
+            transient.update { it.copy(errorMessage = IMAGE_LIMIT_MESSAGE) }
             return
         }
+        val messageId = draft.messageId
+        updateEditDraft(messageId) { it.copy(isImporting = true) }
+        viewModelScope.launch {
+            try {
+                val outcome = importImages(uris, draft.remainingSlots) { image ->
+                    var added = false
+                    updateEditDraft(messageId) { current ->
+                        if (current.remainingSlots > 0) {
+                            added = true
+                            current.copy(added = current.added + image)
+                        } else {
+                            current
+                        }
+                    }
+                    added
+                }
+                outcome?.let { message -> transient.update { it.copy(errorMessage = message) } }
+            } finally {
+                updateEditDraft(messageId) { it.copy(isImporting = false) }
+            }
+        }
+    }
+
+    fun removeEditImage(attachmentId: String?, pendingId: String?) {
+        val draft = transient.value.editImageDraft ?: return
+        updateEditDraft(draft.messageId) { current ->
+            current.copy(
+                kept = current.kept.filterNot { it.id == attachmentId },
+                added = current.added.filterNot { it.id == pendingId },
+            )
+        }
+        if (pendingId != null && draft.added.any { it.id == pendingId }) {
+            viewModelScope.launch { chatImageImporter.discard(listOf(pendingId)) }
+        }
+    }
+
+    /** 放弃编辑：新选的图片丢弃，原消息与原图片不受影响。 */
+    fun cancelEditUserMessage() {
+        val draft = transient.value.editImageDraft ?: return
+        transient.update { it.copy(editImageDraft = null) }
+        if (draft.added.isNotEmpty()) {
+            viewModelScope.launch { chatImageImporter.discard(draft.added.map { it.id }) }
+        }
+    }
+
+    /**
+     * 草稿只在仍属于 [messageId] 时更新：导入期间用户可能已关掉弹窗或改编辑别的消息，
+     * 这时导入完成的图片会被 [importImages] 的回调拒收并丢弃。
+     */
+    private fun updateEditDraft(messageId: String, transform: (EditImageDraft) -> EditImageDraft) {
+        transient.update { state ->
+            val draft = state.editImageDraft?.takeIf { it.messageId == messageId } ?: return@update state
+            state.copy(editImageDraft = transform(draft))
+        }
+    }
+
+    fun editUserMessageAndRegenerate(messageId: String, content: String) {
+        val draft = transient.value.editImageDraft?.takeIf { it.messageId == messageId }
+        if (transient.value.isGenerating) {
+            transient.update { it.copy(errorMessage = "正在生成时不能编辑历史消息") }
+            cancelEditUserMessage()
+            return
+        }
+        if (draft?.isImporting == true) {
+            transient.update { it.copy(errorMessage = "图片还在处理中，请稍候再重新发送。") }
+            return
+        }
+        // 图片草稿随这次调用交给 Repository：新图由它移入正式目录或丢弃，这里不再持有。
+        val imageEdit = draft?.takeIf { it.isChanged }?.let {
+            MessageImageEdit(keptAttachmentIds = it.kept.map { attachment -> attachment.id }, addedImages = it.added)
+        }
+        val imageCountAfterEdit = draft?.totalCount
+            ?: uiState.value.messages.firstOrNull { it.id == messageId }?.attachments?.size
+            ?: 0
+        // 删光文字与图片时不提交（弹窗本身也会禁用按钮）。
+        if (content.isBlank() && imageCountAfterEdit == 0) {
+            cancelEditUserMessage()
+            return
+        }
+        transient.update { it.copy(editImageDraft = null) }
 
         startGeneration(
             initialConversationId = uiState.value.messages
@@ -494,8 +697,12 @@ class ChatViewModel(
             operationLabel = "Editing user message",
             fallbackError = "编辑历史消息失败",
         ) {
-            Log.i(TAG, "Editing user message and regenerating: messageId=$messageId length=${content.length}")
-            editUserMessageAndRegenerateUseCase(messageId, content)
+            Log.i(
+                TAG,
+                "Editing user message and regenerating: messageId=$messageId length=${content.length} " +
+                    "imagesChanged=${imageEdit != null}",
+            )
+            editUserMessageAndRegenerateUseCase(messageId, content, imageEdit)
         }
     }
 
@@ -1453,6 +1660,9 @@ class ChatViewModel(
         val isCompactingContext: Boolean = false,
         val isSavingSettingsDraft: Boolean = false,
         val pendingAttachment: PendingAttachment? = null,
+        val pendingImages: List<PendingImage> = emptyList(),
+        val isImportingImages: Boolean = false,
+        val editImageDraft: EditImageDraft? = null,
         /** 已保存 API Key 的供应商 id；只表示"有没有"，不含明文。 */
         val providersWithSavedKey: Set<String> = emptySet(),
         val isImportingAttachment: Boolean = false,
@@ -1472,6 +1682,9 @@ class ChatViewModel(
         val isCompactingContext: Boolean,
         val isSavingSettingsDraft: Boolean,
         val pendingAttachment: PendingAttachment?,
+        val pendingImages: List<PendingImage>,
+        val isImportingImages: Boolean,
+        val editImageDraft: EditImageDraft?,
         val providersWithSavedKey: Set<String>,
         val isImportingAttachment: Boolean,
         val modelRefreshErrors: Map<String, String>,
@@ -1512,6 +1725,7 @@ class ChatViewModel(
     companion object {
         private const val TAG = "muxueChat.ChatViewModel"
         private const val RP_DRAFT_PLAN_DEBOUNCE_MILLIS = 300L
+        private const val IMAGE_LIMIT_MESSAGE = "每条消息最多 ${ImageInputSpec.MAX_IMAGES_PER_MESSAGE} 张图片。"
 
         val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
@@ -1529,6 +1743,8 @@ class ChatViewModel(
                 }.getOrNull().orEmpty()
                 val xaiResponsesTransport = XaiResponsesTransport(clientVersion = appVersion)
                 val xaiAccessTokens = XaiAuthRepository.getInstance(application)
+                // 聊天图片只放在 App 私有目录（不参与云备份与设备迁移）；附件锁是进程级的。
+                val imageStore = ChatImageStore(application.filesDir)
                 val settingsRepository = SettingsRepositoryImpl(
                     settingsDataStore = SettingsDataStore(application),
                     apiKeyStore = EncryptedApiKeyStore(application),
@@ -1548,6 +1764,7 @@ class ChatViewModel(
                     xaiAccessTokens = xaiAccessTokens,
                     // 与设置页的 GoogleAuthViewModel 共用同一个单例：登录状态只有一份。
                     googleAccessTokens = GoogleAuthRepository.getInstance(application),
+                    imageStore = imageStore,
                 )
                 val rpRepository = RpRepositoryImpl(database = database)
 
@@ -1565,6 +1782,8 @@ class ChatViewModel(
                     rpRepository = rpRepository,
                     settingsRepository = settingsRepository,
                     documentTextExtractor = DocumentTextExtractor(application.contentResolver),
+                    chatImageImporter = ChatImageImporter(application.contentResolver, imageStore),
+                    imageThumbnailLoader = ChatImageThumbnailLoader(imageStore),
                 ) as T
             }
         }

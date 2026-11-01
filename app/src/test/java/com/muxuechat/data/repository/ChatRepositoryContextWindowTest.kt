@@ -4,6 +4,7 @@ import com.muxuechat.data.local.ChatDao
 import com.muxuechat.data.local.ConversationContextEntity
 import com.muxuechat.data.local.ConversationRpSettingsEntity
 import com.muxuechat.data.local.ConversationTokenUsageEntity
+import com.muxuechat.data.local.MessageAttachmentEntity
 import com.muxuechat.data.local.MessageEntity
 import com.muxuechat.data.local.ProtagonistProfileEntity
 import com.muxuechat.data.local.RpStatusPanelEntity
@@ -120,6 +121,7 @@ class ChatRepositoryContextWindowTest {
         ) else null
         val observedFlows: Map<String, Flow<*>> = mapOf(
             "observeMessages" to messages,
+            "observeAttachments" to MutableStateFlow(emptyList<MessageAttachmentEntity>()),
             "observeConversationContext" to MutableStateFlow<ConversationContextEntity?>(null),
             "observeConversationRpSettings" to MutableStateFlow(rpSettings),
             "observeRpStatusPanel" to MutableStateFlow<RpStatusPanelEntity?>(null),

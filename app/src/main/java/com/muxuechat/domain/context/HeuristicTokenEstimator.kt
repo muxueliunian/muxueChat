@@ -74,6 +74,14 @@ object HeuristicTokenEstimator {
     fun estimateMessage(message: PromptMessage): Long =
         estimateMessage(role = message.role, content = message.content)
 
+    /**
+     * 带图片的消息：文字 + 每张图固定的 [tokensPerImage]。
+     *
+     * 每张图计多少由规划器按协议传入（[ImageTokenEstimate]），估算器本身不判断模型。
+     */
+    fun estimateMessage(message: PromptMessage, tokensPerImage: Long): Long =
+        estimateMessage(message) + message.images.size * tokensPerImage
+
     fun estimateMessages(messages: List<PromptMessage>): Long =
         messages.sumOf { estimateMessage(it) }
 

@@ -3,6 +3,8 @@ package com.muxuechat.data.repository
 import com.muxuechat.domain.context.ContextWindowPlan
 import com.muxuechat.domain.model.ChatMessage
 import com.muxuechat.domain.model.Conversation
+import com.muxuechat.domain.model.MessageImageEdit
+import com.muxuechat.domain.model.PendingImage
 import com.muxuechat.domain.tool.SettingsToolDraft
 import kotlinx.coroutines.flow.Flow
 
@@ -64,10 +66,22 @@ interface ChatRepository {
     fun observeConversations(): Flow<List<Conversation>>
     fun observeMessages(conversationId: String): Flow<List<ChatMessage>>
     suspend fun createConversation(title: String? = null): Conversation
-    fun sendMessage(conversationId: String?, content: String): Flow<ChatMessage>
+    /**
+     * 发送一条用户消息。[images] 是已导入的待发送图片（最多 4 张）；允许只发图片不写文字（D6）。
+     * 不判断当前模型是否支持图片（D8）：上游拒绝时按普通请求失败处理，用户消息与图片保留。
+     */
+    fun sendMessage(conversationId: String?, content: String, images: List<PendingImage> = emptyList()): Flow<ChatMessage>
     fun regenerateLastResponse(conversationId: String): Flow<ChatMessage>
     fun retryLatestRpOptions(conversationId: String): Flow<ChatMessage>
-    fun editUserMessageAndRegenerate(messageId: String, content: String): Flow<ChatMessage>
+    /**
+     * 编辑历史用户消息并重新生成。[imageEdit] 为 null 表示图片不变；否则按它保留原图、追加新图（D4）。
+     * 失败、取消时原消息与原图片完全不变。
+     */
+    fun editUserMessageAndRegenerate(
+        messageId: String,
+        content: String,
+        imageEdit: MessageImageEdit? = null,
+    ): Flow<ChatMessage>
 
     /**
      * 就地改写一条模型回复，不重新生成。
@@ -85,4 +99,11 @@ interface ChatRepository {
     suspend fun deleteConversation(conversationId: String)
     suspend fun renameConversation(conversationId: String, title: String)
     suspend fun clearConversation(conversationId: String)
+
+    /**
+     * 启动孤儿图片扫描（MULTIMODAL_PLAN 3.1）：删除库里不再引用的图片文件与过期的待发送图片。
+     * 每个进程只真正执行一次（重复调用直接返回）；在数据库打开之后、持有附件锁时执行，
+     * 失败只记日志，不影响聊天。
+     */
+    suspend fun removeOrphanImagesOncePerProcess()
 }

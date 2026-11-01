@@ -2,6 +2,7 @@ package com.muxuechat.data.repository
 
 import com.muxuechat.data.local.ChatDao
 import com.muxuechat.data.local.ConversationRpSettingsEntity
+import com.muxuechat.data.local.MessageAttachmentEntity
 import com.muxuechat.data.local.MessageEntity
 import com.muxuechat.data.local.RoleCardEntity
 import com.muxuechat.data.local.RpTurnConfigurationSnapshot
@@ -90,6 +91,8 @@ class RpAuxiliaryRoutingTest {
                     message("assistant-1", ChatRole.ASSISTANT, "门后是一条安静的走廊。", 2),
                 )
                 "getMessageRpMetadataForMessage" -> null
+                // 纯文本会话：RP 辅助请求的「最近用户发言」不带图片占位。
+                "getAttachments" -> emptyList<MessageAttachmentEntity>()
                 "getRpTurnConfigurationSnapshot" -> RpTurnConfigurationSnapshot(
                     settings = rpSettings,
                     roleCard = roleCard,

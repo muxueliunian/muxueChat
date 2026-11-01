@@ -24,7 +24,7 @@ private fun ReadingDeskPreview() {
             Column {
                 ChatTopBar("写作练习", "示例供应商", "fixture-model-with-a-very-long-identifier", false, {}, {}, {}, {})
                 MessageList(emptyList(), false, null, emptySet(), false, {}, {}, {}, {}, {}, {}, {}, Modifier.weight(1f))
-                MessageInputBar(TextFieldValue(""), {}, false, {}, {}, canAttach = true)
+                MessageInputBar(TextFieldValue(""), {}, false, {}, {}, canAttachDocument = true)
             }
         }
     }
@@ -66,7 +66,7 @@ private fun DirectoryNotesPreview() {
                 Text("刷新失败，保留旧目录与当前选择", color = MaterialTheme.colorScheme.error)
                 CircularProgressIndicator(Modifier.size(24.dp))
                 Text(describeRefreshAction(true, false))
-                MessageInputBar(TextFieldValue("文档处理示例"), {}, false, {}, {}, isImportingAttachment = true, canAttach = true)
+                MessageInputBar(TextFieldValue("文档处理示例"), {}, false, {}, {}, isImportingAttachment = true, canAttachDocument = true)
             }
         }
     }

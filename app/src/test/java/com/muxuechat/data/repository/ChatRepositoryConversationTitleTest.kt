@@ -2,6 +2,7 @@ package com.muxuechat.data.repository
 
 import com.muxuechat.data.local.ChatDao
 import com.muxuechat.data.local.ConversationEntity
+import com.muxuechat.data.local.MessageAttachmentEntity
 import com.muxuechat.data.local.MessageEntity
 import com.muxuechat.data.remote.DeepSeekApiClient
 import com.muxuechat.data.remote.OpenAiCompatibleClient
@@ -165,6 +166,8 @@ class ChatRepositoryConversationTitleTest {
                     conversation.set(null)
                     Unit
                 }
+                // 纯文本会话：标题请求只需要知道没有图片。
+                "getAttachments" -> emptyList<MessageAttachmentEntity>()
                 else -> error("不应调用 DAO 方法：${method.name}")
             }
         } as ChatDao
