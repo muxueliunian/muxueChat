@@ -183,6 +183,79 @@ class XaiResponsesTransportTest {
         assertEquals("output_text", assistantPart["type"]?.jsonPrimitive?.content)
     }
 
+    // ------------------------------------------------------------------ 图片（MULTIMODAL_PLAN 1.2 / 3.4）
+
+    @Test
+    fun textOnlyUserMessage_keepsSingleInputTextBytes() {
+        collect(INTERLEAVED_SSE).getOrThrow()
+        // 与引入图片前完全相同：单个 input_text，不带 type 字段之外的任何东西。
+        assertTrue(
+            recordedBody.get(),
+            recordedBody.get().contains("""{"role":"user","content":[{"type":"input_text","text":"你好"}]}"""),
+        )
+        assertFalse(recordedBody.get().contains("input_image"))
+    }
+
+    @Test
+    fun userImages_becomeInputImageWithDataUrlString_inOrder_withoutDetail() {
+        val dir = java.nio.file.Files.createTempDirectory("xai-image").toFile()
+        try {
+            val firstBytes = ByteArray(1000) { it.toByte() }
+            val secondBytes = byteArrayOf(7, 8)
+            val first = ImagePayload(java.io.File(dir, "a.jpg").apply { writeBytes(firstBytes) }, "image/jpeg")
+            val second = ImagePayload(java.io.File(dir, "b.jpg").apply { writeBytes(secondBytes) }, "image/jpeg")
+            runBlocking {
+                transportReturning(INTERLEAVED_SSE).streamChat(
+                    TOKEN,
+                    BASE_URL,
+                    request(listOf(OpenAiCompatibleMessageDto(role = "user", content = "看看", images = listOf(first, second)))),
+                ).toList()
+            }
+
+            val parts = json.parseToJsonElement(recordedBody.get()).jsonObject["input"]!!.jsonArray[0]
+                .jsonObject["content"]!!.jsonArray
+            assertEquals(listOf("input_text", "input_image", "input_image"), parts.map { it.jsonObject["type"]!!.jsonPrimitive.content })
+            assertEquals("看看", parts[0].jsonObject["text"]!!.jsonPrimitive.content)
+            listOf(firstBytes, secondBytes).forEachIndexed { index, bytes ->
+                val imageUrl = parts[index + 1].jsonObject["image_url"]
+                // xAI 的 image_url 是字符串，不是 OpenAI 的 {"url": …} 对象。
+                assertTrue(imageUrl is JsonPrimitive && imageUrl.isString)
+                assertEquals(
+                    "data:image/jpeg;base64," + java.util.Base64.getEncoder().encodeToString(bytes),
+                    imageUrl!!.jsonPrimitive.content,
+                )
+                assertNull(parts[index + 1].jsonObject["detail"])
+            }
+            // 占位符不会漏到线上。
+            assertFalse(recordedBody.get().contains(first.placeholder))
+            assertEquals(false, json.parseToJsonElement(recordedBody.get()).jsonObject["store"]?.jsonPrimitive?.content?.toBoolean())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun imageOnlyUserMessage_hasNoEmptyInputText() {
+        val dir = java.nio.file.Files.createTempDirectory("xai-image-only").toFile()
+        try {
+            val image = ImagePayload(java.io.File(dir, "only.jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }, "image/jpeg")
+            runBlocking {
+                transportReturning(INTERLEAVED_SSE).streamChat(
+                    TOKEN,
+                    BASE_URL,
+                    request(listOf(OpenAiCompatibleMessageDto(role = "user", content = "", images = listOf(image)))),
+                ).toList()
+            }
+
+            val parts = json.parseToJsonElement(recordedBody.get()).jsonObject["input"]!!.jsonArray[0]
+                .jsonObject["content"]!!.jsonArray
+            assertEquals(1, parts.size)
+            assertEquals("input_image", parts.single().jsonObject["type"]!!.jsonPrimitive.content)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     @Test
     fun headers_identifyMuxueChatItselfAndVaryPerRequest() {
         collect(INTERLEAVED_SSE).getOrThrow()

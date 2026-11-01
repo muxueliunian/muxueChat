@@ -30,7 +30,6 @@ import com.muxuechat.data.remote.SettingsToolCatalog
 import com.muxuechat.data.remote.SafeUserFacingError
 import com.muxuechat.data.remote.XaiResponsesTransport
 import com.muxuechat.data.remote.ImagePayload
-import com.muxuechat.data.remote.httpStatusOrNull
 import com.muxuechat.domain.tool.SettingsTool
 import com.muxuechat.domain.tool.SettingsToolArgumentParser
 import com.muxuechat.domain.tool.SettingsToolDraft
@@ -3148,21 +3147,9 @@ class ChatRepositoryImpl(
             }
         }
 
-    /**
-     * 本轮请求带了图片、上游又以 400 / 413 拒绝时追加一句留有余地的图片提示（D8、MULTIMODAL_PLAN 3.4）。
-     *
-     * 判断只依据「请求是否含图片」与通用的 HTTP 状态码（[httpStatusOrNull]），不匹配错误文案、
-     * 不识别任何厂商或模型的异常类型；400 无法断言就是图片导致，所以只说「如果」。
-     */
-    private fun String.withImageRequestHint(error: Throwable, requestHadImages: Boolean): String {
-        if (!requestHadImages) return this
-        val hint = when (error.httpStatusOrNull()) {
-            400 -> IMAGE_REJECTED_HINT
-            413 -> IMAGE_PAYLOAD_TOO_LARGE_HINT
-            else -> return this
-        }
-        return if (isBlank()) hint else "${trimEnd()}\n$hint"
-    }
+    /** 见 [ImageRequestErrorHint]：只按「本轮是否带图 + HTTP 状态码」追加提示。 */
+    private fun String.withImageRequestHint(error: Throwable, requestHadImages: Boolean): String =
+        ImageRequestErrorHint.append(this, error, requestHadImages)
 
     /**
      * RP 辅助请求失败的用户可读原因。
@@ -3253,10 +3240,6 @@ class ChatRepositoryImpl(
 
         /** 纯图片消息新建会话时的默认标题。 */
         const val IMAGE_ONLY_TITLE = "图片"
-        const val IMAGE_REJECTED_HINT =
-            "如果问题与图片有关，可能是当前模型或服务不接受图片输入，可切换到支持图片的模型或新开会话。"
-        const val IMAGE_PAYLOAD_TOO_LARGE_HINT =
-            "请求体过大：历史图片每轮都会重发，请减少本条图片或新开会话。"
 
         /** 单条消息内允许的工具调用轮数上限，防止模型反复调用打转。 */
         const val MAX_TOOL_ROUNDS = 3
